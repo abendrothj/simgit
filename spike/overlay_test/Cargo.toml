@@ -1,0 +1,12 @@
+[package]
+name    = "overlay_test"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "overlay_test"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace  = true
+sha2.workspace    = true

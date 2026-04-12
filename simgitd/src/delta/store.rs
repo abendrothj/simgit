@@ -1,0 +1,206 @@
+//! Content-addressed delta store: one directory per session.
+//!
+//! Layout:
+//!   <state_dir>/deltas/<session-id>/
+//!     objects/<aa>/<bbbbb…>   SHA-256 blob files (first 2 hex chars as bucket)
+//!     manifest.json           { writes: {path: hash}, deletes: [path], renames: [[from,to]] }
+
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DeltaManifest {
+    /// base commit OID (hex) this delta was forked from.
+    pub base_commit: String,
+    /// path → SHA-256 hex of new content
+    pub writes:  HashMap<PathBuf, String>,
+    /// paths deleted in this session
+    pub deletes: HashSet<PathBuf>,
+    /// renames: (from, to)
+    pub renames: Vec<(PathBuf, PathBuf)>,
+}
+
+pub struct DeltaStore {
+    root: PathBuf,
+}
+
+impl DeltaStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    fn session_dir(&self, session_id: Uuid) -> PathBuf {
+        self.root.join(session_id.to_string())
+    }
+
+    fn objects_dir(&self, session_id: Uuid) -> PathBuf {
+        self.session_dir(session_id).join("objects")
+    }
+
+    fn manifest_path(&self, session_id: Uuid) -> PathBuf {
+        self.session_dir(session_id).join("manifest.json")
+    }
+
+    /// Initialise the directory structure for a new session.
+    pub fn init_session(&self, session_id: Uuid, base_commit: &str) -> Result<()> {
+        let dir = self.session_dir(session_id);
+        std::fs::create_dir_all(self.objects_dir(session_id))
+            .with_context(|| format!("create objects dir for session {session_id}"))?;
+
+        let manifest = DeltaManifest { base_commit: base_commit.to_owned(), ..Default::default() };
+        self.write_manifest(session_id, &manifest)
+    }
+
+    // ── Blob write ────────────────────────────────────────────────────────
+
+    /// Write `content` into the delta store for `session_id` at `path`.
+    /// Returns the SHA-256 hex of the content.
+    pub fn write_blob(&self, session_id: Uuid, path: &Path, content: &[u8]) -> Result<String> {
+        // Compute content hash for deduplication and integrity.
+        let hash = hex::encode(Sha256::digest(content));
+
+        // Bucket by first 2 hex chars.
+        let bucket = &hash[..2];
+        let blob_dir = self.objects_dir(session_id).join(bucket);
+        std::fs::create_dir_all(&blob_dir)?;
+
+        let blob_path = blob_dir.join(&hash[2..]);
+        if !blob_path.exists() {
+            // Write-then-rename for atomicity.
+            let tmp = blob_path.with_extension("tmp");
+            {
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(content)?;
+                f.sync_data()?;
+            }
+            std::fs::rename(&tmp, &blob_path)?;
+        }
+
+        // Update manifest.
+        let mut manifest = self.load_manifest(session_id)?;
+        // Remove from deletes if it was previously deleted.
+        manifest.deletes.remove(path);
+        manifest.writes.insert(path.to_owned(), hash.clone());
+        self.write_manifest(session_id, &manifest)?;
+
+        Ok(hash)
+    }
+
+    // ── Blob read ─────────────────────────────────────────────────────────
+
+    /// Read the delta blob for `path` in `session_id`, if any.
+    pub fn read_blob(&self, session_id: Uuid, path: &Path) -> Result<Option<Vec<u8>>> {
+        let manifest = self.load_manifest(session_id)?;
+
+        if manifest.deletes.contains(path) {
+            // File was deleted in this session — signal that to the caller.
+            return Ok(None);
+        }
+
+        let hash = match manifest.writes.get(path) {
+            Some(h) => h.clone(),
+            None    => return Ok(None), // not in this delta; fall through to git
+        };
+
+        let blob_path = self.objects_dir(session_id).join(&hash[..2]).join(&hash[2..]);
+        let data = std::fs::read(&blob_path)
+            .with_context(|| format!("read blob {hash} for session {session_id}"))?;
+
+        // Integrity check: reject blobs whose content doesn't match filename.
+        let actual = hex::encode(Sha256::digest(&data));
+        if actual != hash {
+            anyhow::bail!(
+                "blob integrity failure for session {session_id}, path {}: expected {hash}, got {actual}",
+                path.display()
+            );
+        }
+
+        Ok(Some(data))
+    }
+
+    // ── Delete marker ─────────────────────────────────────────────────────
+
+    pub fn mark_deleted(&self, session_id: Uuid, path: &Path) -> Result<()> {
+        let mut manifest = self.load_manifest(session_id)?;
+        manifest.writes.remove(path);
+        manifest.deletes.insert(path.to_owned());
+        self.write_manifest(session_id, &manifest)
+    }
+
+    // ── Rename ────────────────────────────────────────────────────────────
+
+    pub fn record_rename(&self, session_id: Uuid, from: &Path, to: &Path) -> Result<()> {
+        let mut manifest = self.load_manifest(session_id)?;
+        // Move write entry from old path to new path.
+        if let Some(hash) = manifest.writes.remove(from) {
+            manifest.writes.insert(to.to_owned(), hash);
+        }
+        manifest.renames.push((from.to_owned(), to.to_owned()));
+        self.write_manifest(session_id, &manifest)
+    }
+
+    // ── Manifest helpers ──────────────────────────────────────────────────
+
+    pub fn load_manifest(&self, session_id: Uuid) -> Result<DeltaManifest> {
+        let p = self.manifest_path(session_id);
+        if !p.exists() {
+            return Ok(DeltaManifest::default());
+        }
+        let data = std::fs::read(&p)?;
+        serde_json::from_slice(&data).with_context(|| format!("parse manifest for {session_id}"))
+    }
+
+    fn write_manifest(&self, session_id: Uuid, manifest: &DeltaManifest) -> Result<()> {
+        let p = self.manifest_path(session_id);
+        let tmp = p.with_extension("tmp");
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            serde_json::to_writer(&mut f, manifest)?;
+            f.sync_data()?;
+        }
+        std::fs::rename(&tmp, &p)?;
+        Ok(())
+    }
+
+    /// Remove all delta data for a session (post-commit cleanup).
+    pub fn purge_session(&self, session_id: Uuid) -> Result<()> {
+        let dir = self.session_dir(session_id);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+        Ok(())
+    }
+
+    /// List all sessions that have a delta directory (used for crash recovery).
+    pub fn list_sessions(&self) -> Result<Vec<Uuid>> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if let Ok(id) = entry.file_name().to_string_lossy().parse::<Uuid>() {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+}
+
+// Need hex encoding — add a tiny helper rather than pulling a new crate.
+// (hex crate is a transitive dep of sha2/digest anyway.)
+mod hex {
+    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
+        bytes.as_ref().iter().fold(String::new(), |mut s, b| {
+            s.push_str(&format!("{b:02x}"));
+            s
+        })
+    }
+}

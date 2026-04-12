@@ -1,0 +1,20 @@
+[package]
+name        = "simgit-sdk"
+description = "simgit Rust SDK — typed client over the daemon control socket"
+version.workspace     = true
+edition.workspace     = true
+license.workspace     = true
+
+[lib]
+name = "simgit_sdk"
+path = "src/lib.rs"
+
+[dependencies]
+tokio.workspace       = true
+serde.workspace       = true
+serde_json.workspace  = true
+uuid.workspace        = true
+chrono.workspace      = true
+anyhow.workspace      = true
+thiserror.workspace   = true
+libc.workspace        = true

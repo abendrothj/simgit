@@ -1,0 +1,743 @@
+# simgit — Implementation Plan
+# "A Borrow Checker for Filesystems"
+# Simultaneous Git: Virtual Overlay for Multi-Agent Codebases
+# ============================================================
+
+## 1. Problem Statement
+
+Modern multi-agent coding pipelines (e.g., 10–100 autonomous coding agents
+working on the same repository) have no safe concurrency primitive at the
+filesystem level. Git branches solve logical isolation, but they require disk
+copies (worktrees), drift apart from HEAD quickly, and give agents no
+awareness of what their siblings are doing. The result is:
+
+  - Race conditions (two agents overwriting the same file)
+  - Wasted disk space (N worktrees × repo size)
+  - Context blindness (Agent A cannot see Agent B's in-flight changes)
+  - Merge chaos (rebasing many diverged branches)
+
+simgit solves this by implementing Rust-style ownership semantics
+(shared-immutable reads, exclusive-mutable writes) at the VFS layer, making
+conflict detection instantaneous rather than post-hoc.
+
+
+## 2. Core Concepts
+
+  PRIMARY VIEW
+    A read-only projection of the current HEAD commit. Every agent sees this
+    as the authoritative baseline. Zero additional disk space.
+
+  AGENT SESSION
+    A lightweight context bound to a Task ID. Carries a delta layer (the
+    "mutable borrow"). Created in microseconds; consumes space only for the
+    files that were actually written.
+
+  DELTA LAYER (Copy-on-Write)
+    When an agent writes file F, the VFS captures the new content in the
+    agent's private delta store instead of touching the real file. Reads of
+    F within that session transparently return the delta version. Reads by
+    other agents still see the original.
+
+  BORROW REGISTRY
+    A kernel-side (or daemon-side) table: { path → (readers[], writer?) }.
+    Enforces the invariant: at most one writer per path at any time.
+    "Compile-time" (i.e., at open() time) errors surface to the agent
+    before any mutation happens.
+
+  FLATTEN / COMMIT
+    When an agent session ends successfully, the daemon applies its delta
+    layer to a new git branch in one atomic operation. No merge is needed
+    unless two agents touched overlapping paths — in which case human or
+    automated review is required.
+
+
+## 3. System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Agent Processes                              │
+│   (Language Servers, Copilot agents, CI bots, human editors)        │
+└───────────────┬──────────────────────────────────────────┬──────────┘
+                │  read/write via normal POSIX calls        │
+                ▼                                           ▼
+┌─────────────────────────┐              ┌─────────────────────────────┐
+│   /vdev/<session-id>/   │  … N mounts  │   /vdev/<session-id>/       │
+│   (FUSE Mount Point)    │              │   (FUSE Mount Point)        │
+└───────────┬─────────────┘              └──────────────┬──────────────┘
+            │ FUSE kernel protocol                       │
+            ▼                                            ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                       simgit Daemon  (simgitd)                        │
+│                                                                       │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌────────────────────┐   │
+│  │   VFS Router    │  │  Borrow Checker  │  │   Delta Store      │   │
+│  │  (read/write    │  │  (lock table +   │  │  (content-addr.    │   │
+│  │   dispatch)     │  │   conflict det.) │  │   delta blobs)     │   │
+│  └────────┬────────┘  └────────┬────────┘  └────────┬───────────┘   │
+│           │                    │                     │               │
+│           └────────────────────┴─────────────────────┘               │
+│                                │                                      │
+│  ┌─────────────────────────────▼──────────────────────────────────┐  │
+│  │                    Session Registry (SQLite)                    │  │
+│  │  session_id | task_id | status | acquired_locks | delta_refs   │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                │                                      │
+│  ┌─────────────────────────────▼──────────────────────────────────┐  │
+│  │                    Git Integration Layer                        │  │
+│  │              (gitoxide / libgit2 bindings)                      │  │
+│  │    read blob → serve to VFS     flatten delta → new branch      │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────┘
+                                │
+                    Unix domain socket  (JSON-RPC 2.0)
+                                │
+         ┌──────────────────────▼─────────────────────┐
+         │              simgit CLI  (sg)               │
+         │  sg session new   sg lock status            │
+         │  sg commit        sg diff <session>         │
+         └────────────────────────────────────────────┘
+```
+
+
+## 4. Component Specifications
+
+### 4.1  simgitd — The Daemon
+
+Language: Rust
+Binary: simgitd
+
+Responsibilities:
+  - Bootstrap and own every FUSE mount at /vdev/<session-id>
+  - Maintain the Borrow Registry in SQLite (WAL mode, in-memory cache)
+  - Manage the Delta Store (content-addressed, append-only)
+  - Serve the control-plane socket at /run/simgit/control.sock
+  - Handle session lifecycle (create, commit, abort, gc)
+
+Startup sequence:
+  1. Open / create the SQLite database at $SIMGIT_STATE_DIR/state.db
+  2. Load the target git repo path from config
+  3. Re-mount any sessions that were live before a previous crash (crash recovery)
+  4. Listen on control socket
+
+Threading model:
+  - One Tokio async runtime
+  - FUSE I/O threads: spawned per-mount (fuser::spawn_mount)
+  - Borrow Checker runs on a dedicated synchronous thread to avoid
+    async-lock inversion; all other components communicate via channels
+
+
+### 4.2  VFS Router
+
+For every FUSE syscall (lookup, open, read, write, getattr, readdir, …):
+
+  READ path:
+    1. Check Delta Store for session-local version of inode.
+    2. If found → serve delta blob.
+    3. If not found → serve blob from git object store (via gitoxide).
+    4. Record the path in the session's read-set.
+
+  WRITE path:
+    1. Call Borrow Checker: acquire_write(session_id, path).
+       - If another session holds write lock → return EBUSY with
+         structured error payload (session_id of holder, task description).
+       - If session already holds lock → proceed.
+    2. Write new content into Delta Store keyed by (session_id, inode_hash).
+    3. Update inode metadata (mtime, size) in session's metadata overlay.
+
+  RENAME / DELETE:
+    Treated as write operations on both source and destination paths.
+    Both must be acquirable before the operation proceeds.
+
+  READDIR:
+    Merge entries from git tree with any new files in the session's delta,
+    minus any deleted files recorded in the session's tombstone list.
+
+
+### 4.3  Borrow Checker
+
+Data model (held in SQLite + hot in-process HashMap):
+
+  locks table:
+    path TEXT PRIMARY KEY,
+    writer_session TEXT,          -- NULL if no writer
+    reader_sessions TEXT,         -- JSON array of session IDs
+    acquired_at INTEGER,          -- Unix timestamp
+    ttl_seconds INTEGER           -- 0 = no TTL
+
+Rules:
+  acquire_read(session, path):
+    - Allowed always (even if a writer exists — readers see the
+      pre-mutation baseline, not the in-flight delta).
+    - Recorded in reader_sessions for observability.
+
+  acquire_write(session, path):
+    - ALLOWED  if writer_session IS NULL.
+    - BLOCKED  if writer_session IS NOT NULL AND writer_session != session.
+       Returns: BorrowError { holder: SessionInfo, path, since: timestamp }
+    - RE-ENTRANT if writer_session == session (same agent writing again).
+
+  release(session):
+    - Removes all locks held by session from the table.
+    - Called automatically on session commit or abort.
+
+  TTL enforcement:
+    - A background task sweeps locks older than their TTL and releases them,
+      then marks the session as STALE. Prevents deadlocks from crashed agents.
+
+Conflict notification (future):
+    - On acquire_write conflict, optionally broadcast a notification to the
+      holding session via its event stream so it can expedite its commit.
+
+
+### 4.4  Delta Store
+
+Layout on disk:
+  $SIMGIT_STATE_DIR/
+    deltas/
+      <session-id>/
+        objects/          -- content-addressed blobs (SHA-256)
+          ab/cdef1234…    -- first 2 hex chars as bucket
+        manifest.json     -- { path → blob_hash, deleted: [path], renames: [...] }
+        meta.json         -- { inode_id → { size, mtime, mode } }
+
+Write:
+  1. Compute SHA-256 of new file content.
+  2. If blob already exists (deduplication), skip write.
+  3. Write blob to objects/ bucket.
+  4. Update manifest.json atomically (write-then-rename).
+
+Read:
+  1. Look up path in manifest.json.
+  2. If found, open objects/<hash> and stream to FUSE.
+  3. If not found, fall through to git object store.
+
+Compaction:
+  After a session commits, its delta dir is either:
+    - Promoted to a git branch (objects imported into git pack) and deleted.
+    - Retained as an archive for audit/replay.
+
+
+### 4.5  Git Integration Layer
+
+Crate: gitoxide (gix) — pure Rust, no libgit2 dependency.
+
+Operations required:
+
+  read_blob(repo, commit_ish, path) → Bytes
+    Used by VFS Router for baseline reads.
+    Walks the tree object from HEAD (or session's base commit).
+    Result cached in an LRU (max 512 MB) to avoid repeated object lookups.
+
+  create_branch(repo, base_commit, branch_name, delta) → Commit
+    Flatten operation:
+    1. Start with the tree from base_commit.
+    2. Apply delta manifest: add new blobs, remove tombstones, apply renames.
+    3. Build new tree objects bottom-up.
+    4. Create a commit pointing at the new tree.
+    5. Write the commit to the branch ref.
+    This is a pure in-memory Merkle tree manipulation — no working directory
+    needed, no checkout.
+
+  three_way_merge(base, ours, theirs) → Result<Tree, MergeConflict>
+    Used when two sessions touched overlapping files and an automated merge
+    is attempted (optional, gated by config).
+
+Caching strategy:
+  - Blob LRU keyed by (OID): evict on memory pressure.
+  - Tree LRU keyed by (commit, dir_path): size-limited.
+
+
+### 4.6  Session Registry (SQLite)
+
+Schema:
+
+  sessions:
+    id           TEXT PRIMARY KEY,   -- UUIDv7
+    task_id      TEXT NOT NULL,       -- provided by caller (agent task name)
+    agent_label  TEXT,                -- human-readable agent description
+    base_commit  TEXT NOT NULL,       -- git OID at session creation
+    created_at   INTEGER NOT NULL,
+    status       TEXT NOT NULL,       -- ACTIVE | COMMITTED | ABORTED | STALE
+    mount_path   TEXT NOT NULL,       -- /vdev/<id>
+    branch_name  TEXT                 -- set after successful commit
+
+  locks: (see 4.3)
+
+  read_log:
+    session_id   TEXT,
+    path         TEXT,
+    accessed_at  INTEGER
+    -- Used for contextual awareness queries: "which agents read auth.ts?"
+
+WAL mode is enabled. All writes go through a single writer connection.
+Reads use a separate connection pool (up to 8).
+
+
+### 4.7  Control Plane (JSON-RPC 2.0 over Unix socket)
+
+Endpoint: /run/simgit/control.sock
+
+Methods:
+
+  session.create
+    params: { task_id, agent_label?, base_commit? }
+    result: { session_id, mount_path }
+
+  session.commit
+    params: { session_id, branch_name?, message? }
+    result: { commit_oid, branch }
+
+  session.abort
+    params: { session_id }
+    result: { ok: true }
+
+  session.list
+    params: { status? }
+    result: [ SessionInfo ]
+
+  session.diff
+    params: { session_id }
+    result: { unified_diff: string, changed_paths: [string] }
+
+  lock.list
+    params: { path? }
+    result: [ LockInfo ]
+
+  lock.wait
+    params: { path, timeout_ms? }
+    result: { acquired: bool }  -- long-poll until lock is free
+
+  event.subscribe
+    params: { session_id, events: ["lock_conflict", "peer_commit", ...] }
+    result: stream of ServerSentEvents (chunked HTTP over socket)
+
+
+### 4.8  CLI (sg)
+
+  sg init <repo-path>         Initialize simgit for a repo; start daemon.
+  sg status                   Show all active sessions and lock table.
+  sg new [--task <id>]        Create a new session; print mount path.
+  sg commit [--branch <n>]    Flatten current session's delta to a branch.
+  sg abort                    Discard current session's delta.
+  sg diff [<session-id>]      Show unified diff of in-flight delta.
+  sg lock ls                  List all current locks.
+  sg lock wait <path>         Block until a path's write lock is free.
+  sg peer ls                  Show all peer sessions and their changed files.
+  sg gc                       Clean up STALE sessions older than 24h.
+  sg daemon stop              Gracefully unmount all and exit.
+
+
+## 4.9  Architecture Decision Record (ADR-001)
+
+The following decisions were locked before implementation began:
+
+  Decision                  Choice                         Rationale
+  ------------------------  -----------------------------  ----------------------------------------
+  Primary OS target         Linux + macOS from day one     Multi-platform requirement
+  macOS VFS backend         NFS-loopback (embedded NFSv3   No macFUSE kernel extension required;
+                              server inside simgitd)         ships to all macOS users without
+                                                             System Settings approval.
+  Agent interface           Both: sg CLI + SDK wrapping    CLI (sg new → path) for zero-dependency
+                              the same daemon               agents; SDK (Rust + Python) for typed
+                                                             integration. One daemon, two surfaces.
+  Write-lock granularity    Whole file                     Simpler, correct, fast. Sub-file locks
+                                                             deferred to future work.
+  Conflict at commit        Auto three-way merge;          Best-effort automation; hard conflicts
+                              block on true conflicts        require human/agent review.
+  Peer visibility           Optional per-session flag      Default: full isolation. Agents opt in
+                              (--peers)                      to real-time peer delta reads.
+  Git backend               gitoxide (gix)                 Pure Rust, no C FFI, no libgit2 dep.
+  Multi-user model          User-scoped daemon instances   Each Unix UID gets its own simgitd;
+                                                             state lives under $XDG_STATE_HOME.
+
+
+## 5. Technology Stack
+
+  Component           Crate / Tool           Rationale
+  ------------------  ---------------------  --------------------------------
+  FUSE layer          fuser 0.17             Pure Rust FUSE; no C glue needed
+  Async runtime       tokio (multi-thread)   Industry standard; good perf
+  Git operations      gix (gitoxide)         Pure Rust; no libgit2 FFI
+  State database      rusqlite + WAL         Embedded; zero-dependency deploy
+  IPC serialization   serde_json + jsonrpc   Simple; language-agnostic
+  CLI                 clap v4                Derive macros; good UX defaults
+  Hashing (delta)     sha2 crate             SHA-256 for blob addressing
+  LRU cache           lru crate              Simple, well-tested
+  Logging             tracing + tracing-sub  Structured; compatible with otel
+  Config              toml + serde           Simple repo-level config file
+  Testing             cargo nextest          Faster parallel test execution
+
+macOS backend (NFS-loopback):
+  simgitd embeds a minimal NFSv3 server (nfs crate or hand-rolled XDR/RPC
+  over a loopback TCP socket). Each agent session is a distinct NFS export.
+  The OS mounts it via the standard mount_nfs(8) facility — no kernel
+  extension, no System Settings approval. The NFS layer implements the same
+  router/borrow-checker/delta-store logic as the FUSE backend; a trait
+  object (VfsBackend) abstracts the difference so the core logic is shared.
+
+  Trait:
+    pub trait VfsBackend: Send + Sync {
+        fn mount(&self, session: &Session) -> Result<PathBuf>;
+        fn unmount(&self, session: &Session) -> Result<()>;
+    }
+    // impl: FuseBackend (Linux), NfsLoopbackBackend (macOS)
+
+  Backend selected at startup:
+    #[cfg(target_os = "macos")]  let backend = NfsLoopbackBackend::new(...);
+    #[cfg(target_os = "linux")]  let backend = FuseBackend::new(...);
+
+Linux note:
+  Linux OverlayFS (in-kernel) is a potential optimization for Phase 6.
+  Rather than implementing CoW in userspace, simgitd could configure
+  overlayfs mount options programmatically (via mount(2)) for lower-layer
+  = git working tree, upper-layer = delta dir. This removes the FUSE
+  overhead for read-heavy workloads. Requires root or user namespaces.
+
+
+## 6. Phased Implementation Roadmap
+
+Each phase ends with a shippable, testable artifact.
+
+─────────────────────────────────────────────────────────────────
+PHASE 0 — Foundation & Spike                           [ 2 weeks ]
+─────────────────────────────────────────────────────────────────
+Goals:
+  - Validate that fuser can serve a passthrough FS on both Linux and macOS.
+  - Validate that gix can read arbitrary blobs from a git object store
+    without checking out a working directory.
+  - Decide on NFS vs. FUSE for macOS.
+
+Deliverables:
+  - spike/fuse_passthrough: a fuser-based FS that mirrors a local dir.
+  - spike/git_reader: reads and prints any file at any commit via gix.
+  - spike/overlay_test: writes go to a temp dir; reads fall back to base dir.
+  - Decision record: vfs_backend_choice.md
+
+Exit criteria:
+  - All three spikes run without panics on Linux and macOS.
+  - Read throughput of git_reader ≥ 80% of direct disk read (LRU warm).
+
+─────────────────────────────────────────────────────────────────
+PHASE 1 — Read-Only VFS                                [ 3 weeks ]
+─────────────────────────────────────────────────────────────────
+Goals:
+  - Mount a git repo at /vdev/primary with full read-only POSIX semantics.
+  - All files visible at HEAD; directory tree matches git tree.
+  - Symlinks, permissions, and binary files handled correctly.
+
+Deliverables:
+  - simgitd binary: init, mount primary, unmount.
+  - sg init / sg daemon stop commands.
+  - Test suite: git-hosted test repos at various scales (1k, 10k, 100k files).
+
+Exit criteria:
+  - `ls -laR /vdev/primary` matches `git ls-tree -r --name-only HEAD`.
+  - `diff -r /vdev/primary <worktree>` produces zero output.
+  - Read throughput: sequential read ≥ 200 MB/s on warm LRU.
+
+─────────────────────────────────────────────────────────────────
+PHASE 2 — Session Creation & Write Interception        [ 4 weeks ]
+─────────────────────────────────────────────────────────────────
+Goals:
+  - `sg new` creates a session; returns a mount path /vdev/<session-id>.
+  - Writes to the session mount are captured in the Delta Store.
+  - Reads return delta version if present, else git baseline.
+  - Session metadata persisted in SQLite; survives daemon restart.
+
+Deliverables:
+  - session.create / session.abort RPC methods.
+  - Delta Store implementation (content-addressed blobs + manifest).
+  - READDIR merge (git tree + delta additions − tombstones).
+  - Crash recovery: daemon re-attaches delta dirs on startup.
+
+Exit criteria:
+  - Write file F in session S1; `cat /vdev/S1/F` returns new content.
+  - `cat /vdev/primary/F` still returns original content.
+  - Kill -9 simgitd; restart; session S1 and its deltas are intact.
+  - sg diff S1 produces correct unified diff.
+
+─────────────────────────────────────────────────────────────────
+PHASE 3 — Borrow Checker & Conflict Detection          [ 3 weeks ]
+─────────────────────────────────────────────────────────────────
+Goals:
+  - Enforce exclusive-write / shared-read ownership rules.
+  - open(O_WRONLY) on a locked file returns EBUSY with structured error.
+  - lock.list exposes the full lock table.
+  - TTL-based lock expiry for crashed sessions.
+
+Deliverables:
+  - Borrow Registry (SQLite-backed + in-memory HashMap).
+  - lock.list / lock.wait RPC methods.
+  - BorrowError type propagated from daemon to CLI and SDK.
+  - TTL sweeper background task.
+
+Exit criteria:
+  - Two concurrent agents attempting to write the same file: second gets
+    BorrowError containing first agent's task_id. First succeeds normally.
+  - After first agent commits, second can acquire write lock within 10ms.
+  - Simulated crash (SIGKILL agent + TTL expiry): lock released within TTL.
+  - Zero false positives: two agents writing different files never block.
+
+─────────────────────────────────────────────────────────────────
+PHASE 4 — Commit / Flatten to Git Branch               [ 3 weeks ]
+─────────────────────────────────────────────────────────────────
+Goals:
+  - `sg commit` atomically applies a session's delta to a new git branch.
+  - No working directory required; pure object-store manipulation via gix.
+  - Branch is immediately fetchable by any git client.
+
+Deliverables:
+  - session.commit RPC method.
+  - Git flatten algorithm (tree rewrite + blob import + commit creation).
+  - Conflict detection for overlapping session paths (pre-commit check).
+  - Optional: three-way auto-merge for non-conflicting overlapping paths.
+
+Exit criteria:
+  - `sg commit --branch feat/agent-a` → branch visible in `git branch -a`.
+  - `git diff HEAD feat/agent-a` matches `sg diff <session-id>` exactly.
+  - Two sessions touching non-overlapping files both commit successfully.
+  - Two sessions touching the same file: conflict reported; neither commits
+    until resolved (or auto-merge succeeds).
+
+─────────────────────────────────────────────────────────────────
+PHASE 5 — CLI Polish & Agent SDK                       [ 3 weeks ]
+─────────────────────────────────────────────────────────────────
+Goals:
+  - Polished sg CLI with shell completion and structured output (--json).
+  - Thin SDK (Rust crate + Python bindings via PyO3) for programmatic use.
+  - Integration test harness that spawns N simulated agents concurrently.
+
+Deliverables:
+  - simgit-sdk crate (wraps control socket with typed Rust API).
+  - simgit-py Python package (PyO3 bindings).
+  - Agent integration guide (how to point an LLM-based agent at simgit).
+  - Concurrency test: 50 agents, random file access, zero data loss.
+
+Exit criteria:
+  - Python: `import simgit; s = simgit.Session.new(task_id="x"); s.commit()`.
+  - 50-agent stress test completes without panics or deadlocks.
+  - CLI `sg status --json` is parseable by jq.
+
+─────────────────────────────────────────────────────────────────
+PHASE 6 — Contextual Awareness (Peer Visibility)       [ 4 weeks ]
+─────────────────────────────────────────────────────────────────
+Goals:
+  - Agents can observe each other's in-flight changes in real time.
+  - /vdev/<session-id>/.simgit/peers/ exposes synthetic read-only views
+    of other active sessions' deltas (optional mount-in-mount).
+  - event.subscribe streams lock_conflict and peer_commit events.
+
+Deliverables:
+  - Peer snapshot: read-only virtual dir showing another session's delta.
+  - Event stream (SSE over Unix socket).
+  - sg peer ls and sg peer diff <other-session-id> commands.
+
+Exit criteria:
+  - Agent A writes file F; Agent B reads /vdev/B/.simgit/peers/A/F and
+    sees Agent A's version without acquiring a lock.
+  - Agent A commits; Agent B's event stream receives peer_commit within 50ms.
+
+─────────────────────────────────────────────────────────────────
+PHASE 7 — Hardening, Observability & Packaging         [ ongoing ]
+─────────────────────────────────────────────────────────────────
+  - OpenTelemetry traces for every FUSE op and RPC call.
+  - Prometheus metrics endpoint (/metrics on localhost:9100).
+  - Systemd unit file and launchd plist.
+  - Docker image with FUSE device passthrough.
+  - Fuzzing (cargo-fuzz) targeting the FUSE op handlers and delta manifest parser.
+  - Security audit: path traversal prevention, symlink attack mitigation.
+
+
+## 7. Key Data Structures
+
+### BorrowError (returned as structured error, not a panic)
+```rust
+pub struct BorrowError {
+    pub path: PathBuf,
+    pub holder: SessionInfo,   // who holds the write lock
+    pub acquired_at: SystemTime,
+    pub ttl: Option<Duration>,
+}
+
+pub struct SessionInfo {
+    pub session_id: Uuid,
+    pub task_id: String,
+    pub agent_label: Option<String>,
+}
+```
+
+### DeltaManifest
+```rust
+pub struct DeltaManifest {
+    pub base_commit: git2::Oid,    // or gix ObjectId
+    pub writes:   HashMap<PathBuf, BlobHash>,   // path → content hash
+    pub deletes:  HashSet<PathBuf>,
+    pub renames:  Vec<(PathBuf, PathBuf)>,       // (from, to)
+}
+```
+
+### SessionRecord (SQLite row mapped to Rust)
+```rust
+pub struct Session {
+    pub id:           Uuid,
+    pub task_id:      String,
+    pub agent_label:  Option<String>,
+    pub base_commit:  String,        // git OID hex
+    pub created_at:   DateTime<Utc>,
+    pub status:       SessionStatus,
+    pub mount_path:   PathBuf,
+    pub branch_name:  Option<String>,
+}
+
+pub enum SessionStatus { Active, Committed, Aborted, Stale }
+```
+
+
+## 8. File / Directory Layout for the Repo
+
+```
+simgit/
+  Cargo.toml                  workspace manifest
+  simgitd/                    daemon crate
+    src/
+      main.rs
+      daemon.rs               startup, socket listener, signal handling
+      vfs/
+        mod.rs
+        router.rs             FUSE op dispatch (read path / write path)
+        git_backend.rs        gix blob reads, tree walks, LRU cache
+        delta_backend.rs      delta store reads/writes
+      borrow/
+        mod.rs
+        registry.rs           lock table logic
+        ttl_sweeper.rs        background expiry task
+      delta/
+        mod.rs
+        store.rs              blob write/read, manifest update
+        flatten.rs            delta → git branch (flatten algorithm)
+      session/
+        mod.rs
+        db.rs                 SQLite schema + queries
+        manager.rs            session lifecycle
+      rpc/
+        mod.rs
+        server.rs             JSON-RPC 2.0 handler
+        methods.rs            one fn per RPC method
+      events/
+        mod.rs
+        broker.rs             pub/sub for peer events
+  sg/                         CLI crate
+    src/
+      main.rs
+      commands/
+        init.rs  new.rs  commit.rs  abort.rs
+        diff.rs  status.rs  lock.rs  peer.rs  daemon.rs
+  simgit-sdk/                 Rust SDK crate
+    src/
+      lib.rs
+      client.rs               typed wrapper over control socket
+      session.rs
+  simgit-py/                  Python bindings crate (PyO3)
+    src/lib.rs
+    simgit/__init__.py
+  spike/                      Phase 0 explorations (not shipped)
+    fuse_passthrough/
+    git_reader/
+    overlay_test/
+  docs/
+    architecture.md
+    vfs_backend_choice.md     Phase 0 decision record
+    agent_integration.md
+    security.md
+  tests/
+    integration/              end-to-end tests spawning real simgitd
+    stress/                   50-agent concurrency harness
+```
+
+
+## 9. Security Considerations
+
+Path traversal
+  The VFS router normalizes every incoming path against the session's mount
+  root before any lookup. Paths containing ".." components after normalization
+  are rejected with EPERM.
+
+Symlink attacks
+  Symlinks within the git tree are followed only within the virtual root.
+  A symlink pointing outside /vdev/<session-id>/ is served as a broken link.
+
+Session isolation
+  Each session directory is accessible only to the UID that created it
+  (mode 700, FUSE allow_root=false). The control socket is mode 600, owned
+  by the simgit user/group.
+
+Delta store integrity
+  Blob filenames are SHA-256 hashes of content. Any blob whose filename does
+  not match its content hash is rejected on read (silent corruption detection).
+
+Denial of service
+  Max open sessions: configurable (default 256).
+  Max delta size per session: configurable (default 2 GB).
+  Max lock TTL: configurable (default 1 hour).
+  These limits are enforced at session.create and write time.
+
+Git object store reads
+  simgitd opens the git repo read-only. It never calls git write operations
+  on the base repo; all writes go to the delta store. The flatten/commit
+  operation creates new objects but does not modify existing ones (git's
+  immutable object model guarantees this).
+
+
+## 10. Risks & Mitigations
+
+  Risk                               Mitigation
+  --------------------------------   ------------------------------------------
+  macOS FUSE kernel ext requirement  Implement NFS-loopback backend as fallback;
+                                     select at init time with --vfs-backend flag.
+
+  FUSE performance overhead vs. disk Blob LRU cache in daemon; Phase 7 option
+                                     to use in-kernel OverlayFS on Linux.
+
+  Large binary files flooding delta  Per-session delta size limit (§9).
+  store                              Warn at 80% threshold; block at 100%.
+
+  Daemon crash loses active sessions SQLite WAL gives durability; FUSE mounts
+                                     are re-attached on restart (Phase 2).
+
+  gix API instability (pre-1.0)      Pin to a specific gix version; wrap in
+                                     an internal trait so the backend is
+                                     swappable if needed.
+
+  Agent holding write lock forever   TTL sweeper (Phase 3) forcibly releases
+                                     locks after configurable timeout.
+
+  Conflicting flattens               Pre-commit conflict check (Phase 4);
+                                     three-way auto-merge as best-effort;
+                                     human review required on true conflicts.
+
+
+## 11. Success Metrics
+
+  Metric                              Target
+  ----------------------------------  -------------------------
+  Session creation latency            < 5 ms
+  FUSE read throughput (warm cache)   ≥ 200 MB/s
+  FUSE write throughput               ≥ 100 MB/s
+  Lock acquire latency                < 1 ms
+  Flatten (commit) latency, 500 files < 500 ms
+  Max concurrent sessions             ≥ 256 on a 16-core host
+  Zero-copy session creation          0 MB disk (baseline only)
+  Borrow false-positive rate          0% (different-path writes)
+  Data loss on daemon SIGKILL         0 bytes (WAL + crash recovery)
+
+
+## 12. Open Questions / Future Work
+
+  - Should simgit manage the git remote push, or hand off to the agent?
+  - Signed commits: can the daemon sign on behalf of the agent's identity?
+  - Partial-file locking: line-range rather than whole-file ownership
+    (requires semantic diff + language-aware lock granularity).
+  - VS Code extension: show live borrow status in the editor gutter.
+  - Web UI: real-time dashboard of session activity and lock contention.
+  - Integration with GitHub Actions: simgit as a step in CI to run N
+    mutating jobs in parallel on one runner without worktrees.

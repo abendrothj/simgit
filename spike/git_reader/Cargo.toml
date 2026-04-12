@@ -1,0 +1,12 @@
+[package]
+name    = "git_reader"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "git_reader"
+path = "src/main.rs"
+
+[dependencies]
+gix.workspace     = true
+anyhow.workspace  = true
