@@ -61,7 +61,6 @@
 //! FUSE is Linux-native. macOS support uses NFS-loopback (see [nfs_backend]).
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -103,14 +102,10 @@ impl super::VfsBackendTrait for FuseBackend {
         let mount_path = session.mount_path.clone();
         std::fs::create_dir_all(&mount_path)?;
 
-        // Open the base repo.
-        let repo = Arc::new(gix::open(&self.cfg.repo_path)?);
-        
         let fs = SessionFs::new(
             session.session_id,
             Arc::clone(&self.cfg),
             session.base_commit.clone(),
-            repo,
         );
 
         let mut config = fuser::Config::default();
@@ -213,7 +208,6 @@ struct SessionFs {
     tree_cache:   Arc<TreeCache>,
     blob_cache:   Arc<BlobCache>,
     inode_map:    Arc<InodeMap>,
-    repo:         Arc<gix::Repository>,
 }
 
 impl SessionFs {
@@ -230,7 +224,7 @@ impl SessionFs {
     /// - `cfg`: Daemon configuration
     /// - `base_commit`: Git commit hash to serve as read-only tree (e.g., HEAD)
     /// - `repo`: Open git repository handle
-    fn new(session_id: Uuid, cfg: Arc<Config>, base_commit: String, repo: Arc<gix::Repository>) -> Self {
+    fn new(session_id: Uuid, cfg: Arc<Config>, base_commit: String) -> Self {
         Self {
             session_id,
             cfg,
@@ -238,7 +232,6 @@ impl SessionFs {
             tree_cache:   Arc::new(TreeCache::new(100)),
             blob_cache:   Arc::new(BlobCache::new(50, 10 * 1024 * 1024)), // 50 blobs, 10MB cap
             inode_map:    Arc::new(InodeMap::new()),
-            repo,
         }
     }
 }
@@ -259,8 +252,7 @@ impl Filesystem for SessionFs {
 
         // Root is always inode 1.
         if parent.0 == 1 {
-            // Get the root tree from base_commit.
-            let root_oid = match gix::ObjectId::from_hex(self.base_commit.as_bytes()) {
+            let tree_oid = match resolve_tree_oid(&self.cfg.repo_path, &self.base_commit) {
                 Ok(oid) => oid,
                 Err(_) => {
                     reply.error(Errno::EIO);
@@ -268,21 +260,7 @@ impl Filesystem for SessionFs {
                 }
             };
 
-            // Find the tree object (commit → tree).
-            let tree_oid = match self.repo.find_object(root_oid) {
-                Ok(obj) => match obj.try_into_commit() {
-                    Ok(commit) => commit.tree().ok().map(|t| t.0),
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            };
-
-            if tree_oid.is_none() {
-                reply.error(Errno::EIO);
-                return;
-            }
-
-            let tree_entries = match self.tree_cache.get(tree_oid.unwrap(), &self.repo) {
+            let tree_entries = match self.tree_cache.get(&tree_oid, &self.cfg.repo_path) {
                 Ok(e) => e,
                 Err(_) => {
                     reply.error(Errno::EIO);
@@ -294,7 +272,7 @@ impl Filesystem for SessionFs {
             for (idx, entry) in tree_entries.iter().enumerate() {
                 if entry.name == name_str {
                     let ino = self.inode_map.allocate();
-                    self.inode_map.insert(ino, tree_oid.unwrap(), idx);
+                    self.inode_map.insert(ino, tree_oid.clone(), idx);
 
                     let attr = FileAttr {
                         ino: INodeNo(ino),
@@ -355,7 +333,7 @@ impl Filesystem for SessionFs {
         }
 
         // List root tree entries.
-        let root_oid = match gix::ObjectId::from_hex(self.base_commit.as_bytes()) {
+        let tree_oid = match resolve_tree_oid(&self.cfg.repo_path, &self.base_commit) {
             Ok(oid) => oid,
             Err(_) => {
                 reply.error(Errno::EIO);
@@ -363,20 +341,7 @@ impl Filesystem for SessionFs {
             }
         };
 
-        let tree_oid = match self.repo.find_object(root_oid) {
-            Ok(obj) => match obj.try_into_commit() {
-                Ok(commit) => commit.tree().ok().map(|t| t.0),
-                Err(_) => None,
-            },
-            Err(_) => None,
-        };
-
-        if tree_oid.is_none() {
-            reply.error(Errno::EIO);
-            return;
-        }
-
-        let tree_entries = match self.tree_cache.get(tree_oid.unwrap(), &self.repo) {
+        let tree_entries = match self.tree_cache.get(&tree_oid, &self.cfg.repo_path) {
             Ok(e) => e,
             Err(_) => {
                 reply.error(Errno::EIO);
@@ -393,7 +358,7 @@ impl Filesystem for SessionFs {
         // Add git tree entries.
         for (idx, entry) in tree_entries.iter().enumerate() {
             let ino = self.inode_map.allocate();
-            self.inode_map.insert(ino, tree_oid.unwrap(), idx);
+            self.inode_map.insert(ino, tree_oid.clone(), idx);
 
             entries.push((
                 ino,
@@ -414,6 +379,22 @@ impl Filesystem for SessionFs {
         }
         reply.ok();
     }
+}
+
+fn resolve_tree_oid(repo_path: &std::path::Path, commitish: &str) -> Result<String> {
+    let rev = format!("{commitish}^{{tree}}");
+    let output = std::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["rev-parse", &rev])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!("git rev-parse failed for {rev}");
+    }
+    let oid = String::from_utf8(output.stdout)?.trim().to_owned();
+    if oid.is_empty() {
+        anyhow::bail!("empty tree oid for {rev}");
+    }
+    Ok(oid)
 }
 
 fn root_attr() -> FileAttr {

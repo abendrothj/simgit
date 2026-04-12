@@ -83,10 +83,18 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use std::time::Instant;
 use std::path::Path;
+
+/// Entry kind in a git tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    File,
+    Dir,
+    Symlink,
+}
 
 /// Maps git tree OID → file entries.
 ///
@@ -113,6 +121,9 @@ pub struct TreeEntry {
     pub name: String,
     pub mode: String, // "100644", "100755", "040000", "120000"
     pub oid:  String,
+    pub kind: EntryKind,
+    pub size: u64,
+    pub perm: u16,
 }
 
 /// LRU tree cache — holds parsed tree objects indexed by OID.
@@ -183,7 +194,7 @@ impl TreeCache {
         // Cache miss or expired — read from git via CLI.
         let output = std::process::Command::new("git")
             .current_dir(repo_path)
-            .args(&["ls-tree", tree_oid])
+            .args(["ls-tree", "-l", tree_oid])
             .output()
             .with_context(|| format!("exec git ls-tree {tree_oid}"))?;
 
@@ -195,19 +206,36 @@ impl TreeCache {
         let mut entries = Vec::new();
 
         for line in lines.lines() {
-            // Format: "100644 blob abc123def456...  filename"
-            let parts: Vec<&str> = line.split_whitespace().collect();
+            // Format: "100644 blob <oid> <size-or->\t<name>"
+            let Some((meta, name)) = line.split_once('\t') else {
+                continue;
+            };
+            let parts: Vec<&str> = meta.split_whitespace().collect();
             if parts.len() < 4 {
                 continue;
             }
             let mode = parts[0];
+            let obj_type = parts[1];
             let oid = parts[2];
-            let name = parts[3..].join(" "); // Filename might have spaces
+            let size = if parts[3] == "-" {
+                0
+            } else {
+                parts[3].parse::<u64>().unwrap_or(0)
+            };
+            let kind = match (mode, obj_type) {
+                ("040000", _) | (_, "tree") => EntryKind::Dir,
+                ("120000", _) => EntryKind::Symlink,
+                _ => EntryKind::File,
+            };
+            let perm = u16::from_str_radix(mode, 8).unwrap_or(0o644);
 
             entries.push(TreeEntry {
-                name,
+                name: name.to_owned(),
                 mode: mode.to_owned(),
                 oid:  oid.to_owned(),
+                kind,
+                size,
+                perm,
             });
         }
 
@@ -376,6 +404,107 @@ impl InodeMap {
 
     pub fn lookup(&self, ino: u64) -> Option<(String, usize)> {
         self.map.lock().unwrap().get(&ino).cloned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlobCache, EntryKind, TreeCache};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_repo_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("simgit-phase1-test-{}-{}", std::process::id(), nanos))
+    }
+
+    fn run_git(repo: &PathBuf, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .status()
+            .expect("git command should execute");
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn init_repo_with_file() -> PathBuf {
+        let repo = temp_repo_dir();
+        fs::create_dir_all(&repo).expect("create temp repo");
+
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.email", "tests@simgit.local"]);
+        run_git(&repo, &["config", "user.name", "simgit-tests"]);
+
+        fs::write(repo.join("hello.txt"), b"hello\n").expect("write file");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "init"]);
+
+        repo
+    }
+
+    fn head_tree_oid(repo: &PathBuf) -> String {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .expect("rev-parse should execute");
+        assert!(output.status.success(), "rev-parse failed");
+        String::from_utf8(output.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn tree_cache_parses_entry_fields() {
+        let repo = init_repo_with_file();
+        let tree_oid = head_tree_oid(&repo);
+
+        let cache = TreeCache::new(16);
+        let entries = cache.get(&tree_oid, &repo).expect("tree lookup should pass");
+        assert!(!entries.is_empty(), "root tree should contain committed file");
+
+        let hello = entries
+            .iter()
+            .find(|e| e.name == "hello.txt")
+            .expect("hello.txt should exist");
+        assert_eq!(hello.kind, EntryKind::File);
+        assert_eq!(hello.perm, 0o100644);
+        assert!(hello.size >= 6);
+        assert!(!hello.oid.is_empty());
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn blob_cache_reads_blob_content() {
+        let repo = init_repo_with_file();
+
+        let blob_oid_output = Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD:hello.txt"])
+            .output()
+            .expect("blob rev-parse should execute");
+        assert!(blob_oid_output.status.success(), "blob rev-parse failed");
+        let blob_oid = String::from_utf8(blob_oid_output.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned();
+
+        let cache = BlobCache::new(8, 1024 * 1024);
+        let bytes = cache.get(&blob_oid, &repo).expect("blob lookup should pass");
+        assert_eq!(bytes, b"hello\n");
+
+        // Second call should be cache-hit path and return identical content.
+        let bytes2 = cache.get(&blob_oid, &repo).expect("blob cache-hit should pass");
+        assert_eq!(bytes2, b"hello\n");
+
+        let _ = fs::remove_dir_all(&repo);
     }
 }
 

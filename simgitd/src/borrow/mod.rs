@@ -65,4 +65,3 @@ pub mod registry;
 pub mod ttl_sweeper;
 
 pub use registry::BorrowRegistry;
-pub use ttl_sweeper::TtlSweeper;
