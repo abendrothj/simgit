@@ -1,6 +1,6 @@
 //! Session lifecycle management.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use simgit_sdk::{SessionInfo, SessionStatus};
 
-use super::db::{Db, SessionRow};
+use super::db::{Db, LockRow, SessionRow};
 
 pub struct SessionManager {
     db:    Mutex<Db>,
@@ -25,6 +25,17 @@ impl SessionManager {
         let mgr = Self { db: Mutex::new(db), cache: Mutex::new(HashMap::new()) };
         mgr.warm_cache()?;
         Ok(mgr)
+    }
+
+    /// Create an in-memory `SessionManager` for unit tests.
+    ///
+    /// Backed by an in-memory SQLite database (`:memory:`), so there is no disk
+    /// I/O and the database is destroyed when the instance is dropped.
+    #[cfg(test)]
+    pub fn for_testing() -> std::sync::Arc<Self> {
+        use super::db::Db;
+        let db = Db::in_memory().expect("in-memory SQLite");
+        std::sync::Arc::new(Self { db: Mutex::new(db), cache: Mutex::new(HashMap::new()) })
     }
 
     fn warm_cache(&self) -> Result<()> {
@@ -149,6 +160,45 @@ impl SessionManager {
         self.list(Some(SessionStatus::Active))
     }
 
+    // ── Lock persistence ──────────────────────────────────────────────────
+
+    /// Persist (upsert) a lock entry to SQLite.
+    ///
+    /// Called by `BorrowRegistry` after every in-memory lock acquisition so that
+    /// the lock table survives daemon restarts.
+    pub fn persist_lock(
+        &self,
+        path:        &Path,
+        writer:      Option<Uuid>,
+        readers:     &HashSet<Uuid>,
+        acquired_at: chrono::DateTime<Utc>,
+        ttl_seconds: Option<u64>,
+    ) -> Result<()> {
+        let reader_ids: Vec<String> = readers.iter().map(|u| u.to_string()).collect();
+        let readers_json = serde_json::to_string(&reader_ids).context("serialize reader_sessions")?;
+        let writer_str = writer.map(|u| u.to_string());
+        self.db.lock().unwrap().upsert_lock(
+            &path.to_string_lossy(),
+            writer_str.as_deref(),
+            &readers_json,
+            acquired_at.timestamp(),
+            ttl_seconds,
+        )
+    }
+
+    /// Delete a lock row from SQLite (called when a path's lock entry is fully released).
+    pub fn remove_lock(&self, path: &Path) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .delete_lock(&path.to_string_lossy())
+    }
+
+    /// Load all persisted lock rows from SQLite (called on startup by `BorrowRegistry`).
+    pub fn load_all_locks(&self) -> Result<Vec<LockRow>> {
+        self.db.lock().unwrap().load_all_locks()
+    }
+
     // ── Crash recovery ────────────────────────────────────────────────────
 
     /// Re-attach VFS mounts for sessions that were ACTIVE before a crash.
@@ -165,7 +215,8 @@ impl SessionManager {
             match state.vfs.mount(&session).await {
                 Ok(_) => info!(id = %session.session_id, "re-mounted session"),
                 Err(e) => {
-                    warn!(id = %session.session_id, err = %e, "failed to re-mount; marking stale");
+                    warn!(id = %session.session_id, err = %e, "failed to re-mount; releasing locks and marking stale");
+                    state.borrows.release_session(session.session_id);
                     self.mark_stale(session.session_id)?;
                 }
             }
@@ -353,6 +404,79 @@ mod tests {
         assert!(info.mount_path.exists(), "recover should mount active session path");
 
         state.vfs.unmount_all().await;
+        let _ = std::fs::remove_file(&db_path);
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    /// Verify that write locks persisted to SQLite are restored into the
+    /// `BorrowRegistry` in-memory table when `restore_locks` is called.
+    #[tokio::test]
+    async fn borrow_locks_persist_and_restore_across_reopen() {
+        let db_path = temp_db_path();
+        let path = std::path::Path::new("/src/main.rs");
+
+        let session_id = {
+            let manager = Arc::new(SessionManager::open(&db_path).await.expect("open manager"));
+            let registry = crate::borrow::BorrowRegistry::new(Arc::clone(&manager));
+
+            let info = manager
+                .create(
+                    "lock-task".to_owned(),
+                    None,
+                    "HEAD".to_owned(),
+                    std::env::temp_dir().join("simgit-lock-mount"),
+                    false,
+                    8,
+                )
+                .expect("create session");
+
+            registry
+                .acquire_write(info.session_id, path, Some(3600))
+                .expect("acquire write lock");
+
+            // Verify the lock is visible in-memory.
+            assert!(!registry.is_write_free(path, uuid::Uuid::nil()));
+
+            info.session_id
+        };
+
+        // Re-open the manager and restore locks — simulating a daemon restart.
+        let manager2 = Arc::new(SessionManager::open(&db_path).await.expect("reopen manager"));
+        let registry2 = crate::borrow::BorrowRegistry::new(Arc::clone(&manager2));
+
+        // Before restore, the in-memory table should be empty.
+        assert!(
+            registry2.is_write_free(path, uuid::Uuid::nil()),
+            "lock should not be visible before restore"
+        );
+
+        registry2.restore_locks().expect("restore locks");
+
+        // After restore, the write lock must be re-enforced.
+        assert!(
+            !registry2.is_write_free(path, uuid::Uuid::nil()),
+            "lock should be visible after restore"
+        );
+
+        // The original session still owns the lock.
+        assert!(
+            registry2.is_write_free(path, session_id),
+            "original session should still be granted re-entrant access"
+        );
+
+        // Release and verify the lock disappears from SQLite.
+        registry2.release_session(session_id);
+        assert!(
+            registry2.is_write_free(path, uuid::Uuid::nil()),
+            "lock should be gone after release"
+        );
+
+        // Verify SQLite row is also removed.
+        let rows = manager2.load_all_locks().expect("load locks after release");
+        assert!(rows.is_empty(), "SQLite locks table should be empty after release");
+
         let _ = std::fs::remove_file(&db_path);
         if let Some(parent) = db_path.parent() {
             let _ = std::fs::remove_dir_all(parent);

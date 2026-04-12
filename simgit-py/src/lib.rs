@@ -8,15 +8,27 @@ fn py_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+/// Module-level Tokio runtime shared across all Python → Rust async calls.
+///
+/// Creating a new runtime per call adds ~1 ms overhead and GC pressure.
+/// A single cached runtime eliminates this cost. `OnceLock` guarantees
+/// thread-safe one-time initialization.
+static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
+    RUNTIME.get_or_try_init(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(py_err)
+    })
+}
+
 fn run_async<F, T>(fut: F) -> PyResult<T>
 where
     F: std::future::Future<Output = Result<T, simgit_sdk::SdkError>>,
 {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(py_err)?;
-    rt.block_on(fut).map_err(py_err)
+    runtime()?.block_on(fut).map_err(py_err)
 }
 
 fn session_info_dict(py: Python<'_>, info: &SessionInfo) -> PyResult<Py<PyDict>> {

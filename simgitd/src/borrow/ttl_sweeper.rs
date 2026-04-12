@@ -33,9 +33,9 @@ fn sweep(registry: &BorrowRegistry) {
             session = %session_id,
             acquired_at = %acquired_at,
             ttl_seconds = ttl,
-            "TTL expired — force-releasing write lock"
+            "TTL expired — force-releasing write lock and marking session STALE"
         );
-        registry.force_release(session_id);
+        registry.force_release_and_mark_stale(session_id);
     }
     info!("TTL sweep released {} stale write lock(s)", count);
 }

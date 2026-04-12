@@ -58,7 +58,7 @@
 //!
 //! - **Main task**: Waits for signals (blocks until shutdown)
 //! - **RPC task**: Listens on Unix socket, spawns handler tasks per request
-//! - **TTL sweeper task**: Background cleanup of expired locks (1s interval)
+//! - **TTL sweeper task**: Background cleanup of expired locks (30s interval)
 //! - **FUSE/NFS tasks** (per session): Spawned by VFS backend, die when mount unmounts
 //!
 //! # Graceful Shutdown
@@ -175,7 +175,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     // Initialise subsystems.
     let sessions = Arc::new(SessionManager::open(&db_path).await?);
     let borrows  = Arc::new(BorrowRegistry::new(Arc::clone(&sessions)));
-    let deltas   = Arc::new(DeltaStore::new(cfg.state_dir.join("deltas")));
+    // Restore borrow locks that were held when the daemon previously shut down or crashed.
+    borrows.restore_locks().context("restore borrow locks from SQLite")?;
+    let deltas   = Arc::new(DeltaStore::new_with_quota(cfg.state_dir.join("deltas"), cfg.max_delta_bytes));
     let events   = Arc::new(EventBroker::new());
     let vfs      = Arc::new(VfsManager::new(
         Arc::clone(&cfg),
