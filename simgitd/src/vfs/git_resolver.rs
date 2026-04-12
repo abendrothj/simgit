@@ -86,7 +86,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use std::time::Instant;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Entry kind in a git tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,16 +375,27 @@ impl BlobCache {
 
 /// Inode to {tree_oid, entry_index} mapping for path resolution.
 pub struct InodeMap {
-    // inode → (tree_oid, entry_index_in_tree)
-    map: Mutex<HashMap<u64, (String, usize)>>,
+    // inode → metadata for lookup/getattr/readdir/read/write routing.
+    map: Mutex<HashMap<u64, InodeEntry>>,
     next_ino: Mutex<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct InodeEntry {
+    tree_oid: String,
+    entry_idx: usize,
+    path: PathBuf,
 }
 
 impl InodeMap {
     pub fn new() -> Self {
         let mut m = HashMap::new();
         // inode 1 is always root
-        m.insert(1, (String::new(), 0));
+        m.insert(1, InodeEntry {
+            tree_oid: String::new(),
+            entry_idx: 0,
+            path: PathBuf::new(),
+        });
         Self {
             map: Mutex::new(m),
             next_ino: Mutex::new(2),
@@ -398,12 +409,24 @@ impl InodeMap {
         ino
     }
 
-    pub fn insert(&self, ino: u64, tree_oid: String, entry_idx: usize) {
-        self.map.lock().unwrap().insert(ino, (tree_oid, entry_idx));
+    pub fn insert(&self, ino: u64, tree_oid: String, entry_idx: usize, path: PathBuf) {
+        self.map.lock().unwrap().insert(ino, InodeEntry {
+            tree_oid,
+            entry_idx,
+            path,
+        });
     }
 
     pub fn lookup(&self, ino: u64) -> Option<(String, usize)> {
-        self.map.lock().unwrap().get(&ino).cloned()
+        self.map
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .map(|e| (e.tree_oid.clone(), e.entry_idx))
+    }
+
+    pub fn path_of(&self, ino: u64) -> Option<PathBuf> {
+        self.map.lock().unwrap().get(&ino).map(|e| e.path.clone())
     }
 }
 

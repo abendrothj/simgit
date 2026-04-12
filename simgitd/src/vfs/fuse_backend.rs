@@ -61,13 +61,14 @@
 //! FUSE is Linux-native. macOS support uses NFS-loopback (see [nfs_backend]).
 
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::Result;
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo,
-    LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
+    LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -277,10 +278,15 @@ impl Filesystem for SessionFs {
         };
 
         // Search for the named entry.
+        let parent_path = if parent.0 == 1 {
+            PathBuf::new()
+        } else {
+            self.inode_map.path_of(parent.0).unwrap_or_default()
+        };
         for (idx, entry) in tree_entries.iter().enumerate() {
             if entry.name == name_str {
                 let ino = self.inode_map.allocate();
-                self.inode_map.insert(ino, parent_tree_oid.clone(), idx);
+                self.inode_map.insert(ino, parent_tree_oid.clone(), idx, parent_path.join(&entry.name));
 
                 reply.entry(&TTL, &entry_attr(INodeNo(ino), entry), Generation(0));
                 return;
@@ -359,9 +365,14 @@ impl Filesystem for SessionFs {
         ];
 
         // Add git tree entries.
+        let parent_path = if ino.0 == 1 {
+            PathBuf::new()
+        } else {
+            self.inode_map.path_of(ino.0).unwrap_or_default()
+        };
         for (idx, entry) in tree_entries.iter().enumerate() {
             let ino = self.inode_map.allocate();
-            self.inode_map.insert(ino, tree_oid.clone(), idx);
+            self.inode_map.insert(ino, tree_oid.clone(), idx, parent_path.join(&entry.name));
 
             entries.push((
                 ino,
@@ -447,6 +458,38 @@ impl Filesystem for SessionFs {
         };
 
         reply.data(&target);
+    }
+
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if ino.0 == 1 {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+        let Some(entry) = lookup_entry_for_ino(ino.0, &self.cfg.repo_path, &self.tree_cache, &self.inode_map) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if entry.kind == super::git_resolver::EntryKind::Dir {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+        // Read-only handle, direct I/O disabled.
+        reply.opened(FileHandle(0), FopenFlags::empty());
+    }
+
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        match directory_tree_oid_for_ino(
+            ino.0,
+            &self.base_commit,
+            &self.cfg.repo_path,
+            &self.tree_cache,
+            &self.inode_map,
+        ) {
+            Ok(_) => reply.opened(FileHandle(0), FopenFlags::empty()),
+            Err(DirTreeError::NotDir) => reply.error(Errno::ENOTDIR),
+            Err(DirTreeError::NotFound) => reply.error(Errno::ENOENT),
+            Err(DirTreeError::Io) => reply.error(Errno::EIO),
+        }
     }
 }
 

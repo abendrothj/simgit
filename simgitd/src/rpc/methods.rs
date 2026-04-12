@@ -255,18 +255,16 @@ fn diff_bytes_for_path(path: &Path, old: Option<&[u8]>, new: Option<&[u8]>) -> R
     std::fs::write(&old_file, old.unwrap_or_default())?;
     std::fs::write(&new_file, new.unwrap_or_default())?;
 
-    let label_a = format!("a/{}", path.display());
-    let label_b = format!("b/{}", path.display());
     let out = std::process::Command::new("git")
         .args([
             "--no-pager",
             "diff",
             "--no-index",
             "--binary",
-            "--label",
-            &label_a,
-            "--label",
-            &label_b,
+            "--src-prefix",
+            "a/",
+            "--dst-prefix",
+            "b/",
             old_file.to_string_lossy().as_ref(),
             new_file.to_string_lossy().as_ref(),
         ])
@@ -277,7 +275,11 @@ fn diff_bytes_for_path(path: &Path, old: Option<&[u8]>, new: Option<&[u8]>) -> R
     // git diff --no-index exits with:
     // 0 = no differences, 1 = differences found, >1 = actual error.
     if out.status.code().unwrap_or(2) > 1 {
-        anyhow::bail!("git diff --no-index failed for {}", path.display());
+        anyhow::bail!(
+            "git diff --no-index failed for {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -347,4 +349,52 @@ fn resolve_head(repo: &std::path::Path) -> String {
         .ok()
         .and_then(|r| r.head_id().map(|id| id.to_string()).ok())
         .unwrap_or_else(|| "HEAD".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::diff_bytes_for_path;
+    use std::path::Path;
+
+    #[test]
+    fn unified_diff_for_modified_file_contains_hunk() {
+        let patch = diff_bytes_for_path(
+            Path::new("src/main.rs"),
+            Some(b"fn main() {}\n"),
+            Some(b"fn main() { println!(\"hi\"); }\n"),
+        )
+        .expect("diff generation should succeed");
+
+        assert!(patch.contains("diff --git"));
+        assert!(patch.contains("@@"));
+        assert!(patch.contains("+fn main() { println!(\"hi\"); }"));
+        assert!(patch.contains("-fn main() {}"));
+    }
+
+    #[test]
+    fn unified_diff_for_deleted_file_shows_removed_lines() {
+        let patch = diff_bytes_for_path(
+            Path::new("README.md"),
+            Some(b"line1\nline2\n"),
+            Some(&[]),
+        )
+        .expect("diff generation should succeed");
+
+        assert!(patch.contains("diff --git"));
+        assert!(patch.contains("-line1"));
+        assert!(patch.contains("-line2"));
+    }
+
+    #[test]
+    fn unified_diff_for_added_file_shows_added_lines() {
+        let patch = diff_bytes_for_path(
+            Path::new("new.txt"),
+            Some(&[]),
+            Some(b"hello\n"),
+        )
+        .expect("diff generation should succeed");
+
+        assert!(patch.contains("diff --git"));
+        assert!(patch.contains("+hello"));
+    }
 }
