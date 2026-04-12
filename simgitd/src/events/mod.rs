@@ -1,7 +1,66 @@
 //! Simple pub/sub event broker for real-time peer notifications.
 //!
-//! Subscribers call `subscribe()` to get a `tokio::sync::broadcast` receiver.
-//! Publishers call `publish()` to fan out an event to all current subscribers.
+//! # Overview
+//!
+//! The event broker allows agents to subscribe to real-time notifications
+//! from the daemon. Useful for coordinating multi-agent work:
+//!
+//! - **lock_acquired**: Session A acquired write lock on /path
+//! - **lock_released**: Session A released lock, path is now free
+//! - **peer_commit**: Session B committed changes to branch-name
+//! - **conflict**: Two sessions tried to write the same path
+//!
+//! # Implementation
+//!
+//! Uses `tokio::sync::broadcast` (multi-producer, multi-consumer):
+//!
+//! - **Publish**: O(1) per subscriber (send is async, never blocks)
+//! - **Subscribe**: O(1), returns a `BroadcastReceiver`
+//! - **Backpressure**: Events are buffered (default 100 in-flight)
+//! - **Drop on overflow**: Slow subscribers may miss events (acceptable for telemetry)
+//!
+//! # Subscribers
+//!
+//! Subscribers call `subscribe()` to get a `tokio::sync::broadcast` receiver,
+//! then `.recv()` to wait for events.
+//!
+//! # Publishers
+//!
+//! Publishers call `publish(session_id, event_type, data)` to broadcast.
+//! This is non-blocking; slow subscribers do not block the daemon.
+//!
+//! # Example
+//!
+//! ```ignore
+//! let broker = EventBroker::new();
+//!
+//! // Agent subscribes to peer commits
+//! let mut rx = broker.subscribe("peer_commit");
+//! tokio::spawn(async move {
+//!     while let Ok(event) = rx.recv().await {
+//!         eprintln!("Peer committed: {:?}", event);
+//!     }
+//! });
+//!
+//! // Daemon publishes events
+//! broker.publish(session_id, "peer_commit", serde_json::json!({
+//!     "session_id": session_id,
+//!     "branch": "feature-x",
+//!     "commit": "abc123...",
+//! }));
+//! ```
+//!
+//! # Event Format
+//!
+//! All events are JSON objects with at minimum:
+//! ```json
+//! {
+//!   "event_type": "peer_commit",
+//!   "session_id": "uuid",
+//!   "timestamp": "2026-04-12T12:34:56Z",
+//!   "<event-specific-data>": "..."
+//! }
+//! ```
 
 use std::collections::HashMap;
 use std::sync::Mutex;
