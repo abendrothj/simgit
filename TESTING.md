@@ -303,11 +303,18 @@ jobs:
 - Add full integration tests for read-only VFS
 - Add daemon startup/shutdown test harness
 - Add multi-agent concurrency tests
+- Current status:
+    - Unit-level VFS coverage is active for git tree traversal, nested lookup, read/readlink behavior, and diff helpers.
+    - Full end-to-end FUSE mount integration remains pending.
 
 ### Phase 2
 - Add delta store integrity tests
 - Add session persistence + recovery tests
 - Add RPC method tests (all 7 methods)
+- Current status:
+    - Delta-aware VFS unit tests cover write offset behavior and path utilities in `vfs::fuse_backend`.
+    - RPC diff regression tests for add/modify/delete are green.
+    - Next target is integration tests for `unlink`/`rename`/`create` flows through mounted sessions.
 
 ### Phase 3+
 - Add E2E multi-agent scenarios

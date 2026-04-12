@@ -54,7 +54,7 @@ Agent → /vdev/<session-id>/ → FUSE/NFS Mount → simgitd daemon
                                                └── Git Integration
 ```
 
-- **VFS Mount** (FUSE on Linux; NFS-loopback stub on macOS): Read-only git tree + delta CoW overlay
+- **VFS Mount** (FUSE on Linux; NFS-loopback stub on macOS): Git tree baseline with session delta CoW overlay
 - **Borrow Registry**: Tracks { path → (readers[], writer?) }, enforces write-exclusivity
 - **Delta Store**: Content-addressed delta blobs per session
 - **Session DB**: SQLite table { session_id, task_id, status, locks, delta_refs }
@@ -195,12 +195,19 @@ cargo test --workspace
 - File attribute serving
 - Inode caching + LRU eviction
 - Read-only blob serving from git
+- Status: ✅ Completed
 
 ### Phase 2: Session Delta Store (2 weeks)
 - Write capture (delta layer)
 - Manifest tracking (deletes, renames, writes)
 - Content-addressed blob storage
 - Atomic write-then-rename
+- Status: 🚧 In progress
+- Implemented so far:
+    - Existing-file `write` interception into session delta blobs
+    - `unlink` and `rename` capture via delta manifest tombstones/renames
+    - Tombstone-aware visibility in `lookup`, `readdir`, `getattr`, `open`, and `read`
+    - Outstanding in this phase: `create` interception and richer metadata updates for synthetic entries
 
 ### Phase 3: Borrow Checker (2 weeks)
 - Lock acquisition at session creation
@@ -251,7 +258,7 @@ cargo test -- --test-threads=1 --nocapture
 
 ## Security & Isolation
 
-- **Borrow Locks**: Enforced at open() time, preventing data races
+- **Borrow Locks**: Enforced on mutating file ops (`write`, `unlink`, `rename`) to prevent data races
 - **Delta Isolation**: Each session's writes are private until flatten
 - **Unix Socket ACL**: RPC socket is mode 0600 (user-only)
 - **Session Expiry**: 30-second TTL on locks; cleanup on daemon restart
