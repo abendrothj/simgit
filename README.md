@@ -132,7 +132,7 @@ simgit/
 │           ├── status.rs        # Show session state
 │           ├── diff.rs          # Diff session vs HEAD
 │           ├── lock.rs          # List/wait on locks
-│           ├── peer.rs          # Show peer sessions
+│           ├── peer.rs          # Peer commands (`peer ls`, `peer diff`)
 │           ├── gc.rs            # Garbage collect
 │           └── daemon.rs        # Daemon control
 │

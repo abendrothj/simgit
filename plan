@@ -425,7 +425,10 @@ Execution checkoff (updated 2026-04-12):
     - [x] initial `simgit-py` PyO3 bindings scaffold (`Client`, `Session.new`, `commit`, `abort`, `diff`)
     - [x] package/publish flow for Python wheel (`maturin` + `pyproject.toml`)
     - [x] agent integration guide and 50-agent stress harness scaffold (`docs/agent_integration.md`, `tests/stress/agent_harness.py`)
-  - [ ] Phase 6 pending
+  - [~] Phase 6 started
+    - [x] `sg peer ls` and `sg peer diff <other-session-id>` command surface
+    - [ ] event subscription stream surface (daemon + CLI)
+    - [ ] peer snapshot VFS (`.simgit/peers/<session-id>/`)
   - [~] Phase 7 started opportunistically (continuous docs/tests hardening)
 
 ─────────────────────────────────────────────────────────────────
