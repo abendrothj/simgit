@@ -317,6 +317,7 @@ jobs:
     - Delta store recovery tests validate session discovery via `delta::store::list_sessions`.
     - Session manager tests validate ACTIVE/COMMITTED persistence across reopen for crash recovery bootstrap.
     - Session recovery tests validate ACTIVE session mount re-attachment via the NFS-loopback backend.
+    - Linux-only ignored FUSE integration harness covers mount-level `create`/`unlink`/`rename` plus remount scenarios.
     - RPC diff regression tests for add/modify/delete are green.
     - Next target is integration tests for `unlink`/`rename`/`create` flows through mounted sessions.
 

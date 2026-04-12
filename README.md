@@ -210,7 +210,8 @@ cargo test --workspace
     - Tombstone-aware visibility in `lookup`, `readdir`, `getattr`, `open`, and `read`
     - Crash-recovery persistence tests for session metadata and delta directories
     - ACTIVE session mount re-attachment regression via NFS-loopback backend
-    - Outstanding in this phase: richer metadata updates and full FUSE mount re-attachment integration validation
+    - Linux FUSE integration harness added for create/unlink/rename and remount flows
+    - Outstanding in this phase: richer metadata updates and Linux-runtime execution of the FUSE harness
 
 ### Phase 3: Borrow Checker (2 weeks)
 - Lock acquisition at session creation

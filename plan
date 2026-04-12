@@ -409,7 +409,8 @@ Execution checkoff (updated 2026-04-12):
     - [x] tombstone-aware lookup/getattr/readdir/open/read visibility
     - [x] crash-recovery persistence validation for session metadata and delta directories
     - [x] mount re-attachment regression for ACTIVE sessions using NFS-loopback backend
-    - [ ] full FUSE mount re-attachment validation in Linux mount-level integration harness
+    - [x] Linux FUSE mount-level integration harness added (create/unlink/rename + remount scenarios)
+    - [ ] execute Linux FUSE integration harness in Linux environment and record runtime results
   - [~] Phase 3 in progress
     - [x] lock acquisition and TTL sweeper foundations
     - [x] EBUSY returns on mutating ops during active lock contention
