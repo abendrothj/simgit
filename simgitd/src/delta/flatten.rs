@@ -10,9 +10,9 @@
 //!   3. git add -A && git commit -m <message>
 //!   4. Capture commit OID; clean up temp worktree.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use thiserror::Error;
 use tracing::info;
 
 use crate::delta::store::DeltaManifest;
@@ -20,6 +20,28 @@ use crate::delta::store::DeltaManifest;
 pub struct FlattenResult {
     pub commit_oid:  String,
     pub branch_name: String,
+}
+
+#[derive(Debug, Error)]
+pub enum FlattenError {
+    #[error("io error during {step}: {source}")]
+    Io {
+        step: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("missing delta blob for {path} ({hash})")]
+    MissingBlob {
+        path: PathBuf,
+        hash: String,
+    },
+    #[error("git step `{step}` failed (status {status}): {stderr}")]
+    GitCommand {
+        step: &'static str,
+        status: i32,
+        stderr: String,
+        args: Vec<String>,
+    },
 }
 
 pub fn flatten(
@@ -30,17 +52,20 @@ pub fn flatten(
     session_id:       uuid::Uuid,
     branch_name:      &str,
     message:          &str,
-) -> Result<FlattenResult> {
+) -> Result<FlattenResult, FlattenError> {
     // ── 1. Create an isolated worktree for this flatten operation ─────────
     let wt_path = delta_store_root.join(format!("{session_id}-wt"));
-    std::fs::create_dir_all(&wt_path)?;
+    std::fs::create_dir_all(&wt_path).map_err(|source| FlattenError::Io {
+        step: "create_worktree_dir",
+        source,
+    })?;
 
     // Add a Git worktree for the base commit.
     run_git(repo_path, &[
         "worktree", "add", "--detach",
         &wt_path.to_string_lossy(),
         base_commit,
-    ])?;
+    ], "worktree_add")?;
 
     // ── 2. Apply the delta manifest ───────────────────────────────────────
     let objects_dir = delta_store_root.join(session_id.to_string()).join("objects");
@@ -50,7 +75,10 @@ pub fn flatten(
         let target = wt_path.join(del);
         if target.exists() {
             std::fs::remove_file(&target)
-                .with_context(|| format!("delete {}", del.display()))?;
+                .map_err(|source| FlattenError::Io {
+                    step: "apply_delete",
+                    source,
+                })?;
         }
     }
 
@@ -59,10 +87,16 @@ pub fn flatten(
         let src = wt_path.join(from);
         let dst = wt_path.join(to);
         if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|source| FlattenError::Io {
+                step: "apply_rename_create_parent",
+                source,
+            })?;
         }
         if src.exists() {
-            std::fs::rename(&src, &dst)?;
+            std::fs::rename(&src, &dst).map_err(|source| FlattenError::Io {
+                step: "apply_rename",
+                source,
+            })?;
         }
     }
 
@@ -70,27 +104,48 @@ pub fn flatten(
     for (rel_path, hash) in &manifest.writes {
         let bucket   = &hash[..2];
         let blob_path = objects_dir.join(bucket).join(&hash[2..]);
-        let content  = std::fs::read(&blob_path)
-            .with_context(|| format!("read delta blob for {}", rel_path.display()))?;
+        let content = std::fs::read(&blob_path).map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                FlattenError::MissingBlob {
+                    path: rel_path.clone(),
+                    hash: hash.clone(),
+                }
+            } else {
+                FlattenError::Io {
+                    step: "read_delta_blob",
+                    source,
+                }
+            }
+        })?;
         let dest = wt_path.join(rel_path);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|source| FlattenError::Io {
+                step: "apply_write_create_parent",
+                source,
+            })?;
         }
-        std::fs::write(&dest, &content)?;
+        std::fs::write(&dest, &content).map_err(|source| FlattenError::Io {
+            step: "apply_write",
+            source,
+        })?;
     }
 
     // ── 3. Stage and commit ───────────────────────────────────────────────
-    run_git(&wt_path, &["add", "-A"])?;
-    run_git(&wt_path, &["checkout", "-B", branch_name])?;
-    run_git(&wt_path, &["commit", "--allow-empty", "-m", message])?;
+    run_git(&wt_path, &["add", "-A"], "stage_changes")?;
+    run_git(&wt_path, &["checkout", "-B", branch_name], "checkout_branch")?;
+    run_git(&wt_path, &["commit", "--allow-empty", "-m", message], "git_commit")?;
 
     // Extract commit OID.
-    let commit_oid = run_git_output(&wt_path, &["rev-parse", "HEAD"])?
+    let commit_oid = run_git_output(&wt_path, &["rev-parse", "HEAD"], "resolve_head")?
         .trim()
         .to_owned();
 
     // ── 4. Clean up worktree ──────────────────────────────────────────────
-    run_git(repo_path, &["worktree", "remove", "--force", &wt_path.to_string_lossy()])
+    run_git(
+        repo_path,
+        &["worktree", "remove", "--force", &wt_path.to_string_lossy()],
+        "worktree_remove",
+    )
         .ok(); // best-effort; don't fail the commit if cleanup errors
 
     info!(commit = %commit_oid, branch = branch_name, "flatten complete");
@@ -99,30 +154,36 @@ pub fn flatten(
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn run_git(cwd: &Path, args: &[&str]) -> Result<()> {
-    let status = std::process::Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .status()
-        .with_context(|| format!("exec git {:?}", args))?;
-    if !status.success() {
-        anyhow::bail!("git {:?} failed with status {status}", args);
-    }
-    Ok(())
-}
-
-fn run_git_output(cwd: &Path, args: &[&str]) -> Result<String> {
+fn run_git(cwd: &Path, args: &[&str], step: &'static str) -> Result<(), FlattenError> {
     let out = std::process::Command::new("git")
         .current_dir(cwd)
         .args(args)
         .output()
-        .with_context(|| format!("exec git {:?}", args))?;
+        .map_err(|source| FlattenError::Io { step, source })?;
     if !out.status.success() {
-        anyhow::bail!(
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
+        return Err(FlattenError::GitCommand {
+            step,
+            status: out.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+        });
+    }
+    Ok(())
+}
+
+fn run_git_output(cwd: &Path, args: &[&str], step: &'static str) -> Result<String, FlattenError> {
+    let out = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .map_err(|source| FlattenError::Io { step, source })?;
+    if !out.status.success() {
+        return Err(FlattenError::GitCommand {
+            step,
+            status: out.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+        });
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

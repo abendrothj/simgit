@@ -330,6 +330,7 @@ jobs:
     - Phase 3 lock semantics are covered by borrow registry tests and lock wait/acquire RPC logic.
     - Phase 4 helper coverage includes changed-path and overlap detection for pre-commit conflict checks.
     - Phase 4 integration tests now cover commit overlap blocking and non-overlap commit success across active sessions.
+    - Phase 4 RPC coverage now validates per-path overlap operation details and flatten error taxonomy mapping.
 
 ## FAQ
 

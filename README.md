@@ -233,6 +233,8 @@ cargo test --workspace
 - Implemented highlights:
     - pre-commit overlap detection across active sessions in `session.commit`
     - multi-session commit tests for overlap-block and non-overlap success
+    - per-path conflict operation reporting (`ours_ops` / `peer_ops`) in overlap payloads
+    - structured flatten failure taxonomy (`missing_delta_blob`, `git_conflict`, `git_operation_failed`, `filesystem_io`)
 
 ### Phase 5: CLI & SDK (1 week)
 - All 9 `sg` subcommands

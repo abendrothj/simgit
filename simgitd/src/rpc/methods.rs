@@ -13,6 +13,7 @@ use simgit_sdk::{
 };
 
 use crate::daemon::AppState;
+use crate::delta::flatten::FlattenError;
 
 /// Dispatch a JSON-RPC method call. Returns `Ok(result)` or `Err(RpcError)`.
 pub async fn dispatch(
@@ -90,9 +91,10 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
 
     let info = state.sessions.get(session_id).ok_or_else(|| not_found(session_id))?;
     let manifest = state.deltas.load_manifest(session_id).map_err(internal)?;
+    let this_ops = changed_path_ops(&manifest);
 
     // Pre-commit conflict check against other active sessions.
-    let this_changed = changed_paths_set(&manifest);
+    let this_changed: BTreeSet<PathBuf> = this_ops.keys().cloned().collect();
     let mut conflicts = Vec::new();
     for peer in state.sessions.list(Some(SessionStatus::Active)) {
         if peer.session_id == session_id {
@@ -102,13 +104,25 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
             Ok(m) => m,
             Err(_) => continue,
         };
-        let peer_changed = changed_paths_set(&peer_manifest);
+        let peer_ops = changed_path_ops(&peer_manifest);
+        let peer_changed: BTreeSet<PathBuf> = peer_ops.keys().cloned().collect();
         let overlap = overlap_paths(&this_changed, &peer_changed);
         if !overlap.is_empty() {
+            let path_conflicts: Vec<_> = overlap
+                .iter()
+                .map(|path| {
+                    serde_json::json!({
+                        "path": path,
+                        "ours_ops": ops_for_path(&this_ops, path),
+                        "peer_ops": ops_for_path(&peer_ops, path),
+                    })
+                })
+                .collect();
             conflicts.push(serde_json::json!({
                 "session_id": peer.session_id,
                 "task_id": peer.task_id,
                 "paths": overlap,
+                "path_conflicts": path_conflicts,
             }));
         }
     }
@@ -118,6 +132,7 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
             message: "pre-commit conflict: overlapping active session paths".to_owned(),
             data: Some(serde_json::json!({
                 "session_id": session_id,
+                "kind": "active_session_overlap",
                 "conflicts": conflicts,
             })),
         });
@@ -132,11 +147,7 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
         session_id,
         &branch_name,
         &message,
-    ).map_err(|e| RpcError {
-        code:    ERR_MERGE_CONFLICT,
-        message: e.to_string(),
-        data:    None,
-    })?;
+    ).map_err(|e| flatten_error_to_rpc(e, session_id, &branch_name))?;
 
     // Release locks, update status.
     state.borrows.release_session(session_id);
@@ -289,6 +300,82 @@ fn changed_paths_set(manifest: &crate::delta::store::DeltaManifest) -> BTreeSet<
         out.insert(to.clone());
     }
     out
+}
+
+fn changed_path_ops(manifest: &crate::delta::store::DeltaManifest) -> std::collections::BTreeMap<PathBuf, BTreeSet<&'static str>> {
+    let mut out: std::collections::BTreeMap<PathBuf, BTreeSet<&'static str>> =
+        std::collections::BTreeMap::new();
+    for path in manifest.writes.keys() {
+        out.entry(path.clone()).or_default().insert("write");
+    }
+    for path in &manifest.deletes {
+        out.entry(path.clone()).or_default().insert("delete");
+    }
+    for (from, to) in &manifest.renames {
+        out.entry(from.clone()).or_default().insert("rename_from");
+        out.entry(to.clone()).or_default().insert("rename_to");
+    }
+    out
+}
+
+fn ops_for_path(
+    ops: &std::collections::BTreeMap<PathBuf, BTreeSet<&'static str>>,
+    path: &Path,
+) -> Vec<&'static str> {
+    ops.get(path)
+        .map(|set| set.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+fn flatten_error_to_rpc(e: FlattenError, session_id: Uuid, branch_name: &str) -> RpcError {
+    match e {
+        FlattenError::MissingBlob { path, hash } => RpcError {
+            code: -32603,
+            message: "flatten failed: missing delta blob".to_owned(),
+            data: Some(serde_json::json!({
+                "kind": "missing_delta_blob",
+                "session_id": session_id,
+                "branch_name": branch_name,
+                "path": path,
+                "hash": hash,
+            })),
+        },
+        FlattenError::GitCommand {
+            step,
+            status,
+            stderr,
+            args,
+        } => {
+            let (code, kind) = match step {
+                "checkout_branch" | "git_commit" => (ERR_MERGE_CONFLICT, "git_conflict"),
+                _ => (-32603, "git_operation_failed"),
+            };
+            RpcError {
+                code,
+                message: format!("flatten failed during {step}"),
+                data: Some(serde_json::json!({
+                    "kind": kind,
+                    "step": step,
+                    "status": status,
+                    "session_id": session_id,
+                    "branch_name": branch_name,
+                    "args": args,
+                    "stderr": stderr,
+                })),
+            }
+        }
+        FlattenError::Io { step, source } => RpcError {
+            code: -32603,
+            message: format!("flatten io failure during {step}"),
+            data: Some(serde_json::json!({
+                "kind": "filesystem_io",
+                "step": step,
+                "session_id": session_id,
+                "branch_name": branch_name,
+                "error": source.to_string(),
+            })),
+        },
+    }
 }
 
 fn overlap_paths(a: &BTreeSet<PathBuf>, b: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
@@ -452,10 +539,14 @@ fn resolve_head(repo: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{changed_paths_set, diff_bytes_for_path, overlap_paths};
+    use super::{
+        changed_path_ops, changed_paths_set, diff_bytes_for_path, flatten_error_to_rpc, ops_for_path,
+        overlap_paths,
+    };
     use super::session_commit;
     use crate::borrow::BorrowRegistry;
     use crate::config::{Config, VfsBackend};
+    use crate::delta::flatten::FlattenError;
     use crate::daemon::AppState;
     use crate::delta::store::DeltaManifest;
     use crate::delta::DeltaStore;
@@ -466,6 +557,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
 
     #[test]
     fn unified_diff_for_modified_file_contains_hunk() {
@@ -534,6 +626,48 @@ mod tests {
 
         let overlap = overlap_paths(&a, &b);
         assert_eq!(overlap, vec![std::path::PathBuf::from("y.txt")]);
+    }
+
+    #[test]
+    fn changed_path_ops_reports_operation_types_per_path() {
+        let mut m = DeltaManifest::default();
+        m.writes.insert("a.txt".into(), "hash1".into());
+        m.deletes.insert("a.txt".into());
+        m.renames.push(("a.txt".into(), "b.txt".into()));
+
+        let ops = changed_path_ops(&m);
+        assert_eq!(
+            ops_for_path(&ops, Path::new("a.txt")),
+            vec!["delete", "rename_from", "write"]
+        );
+        assert_eq!(ops_for_path(&ops, Path::new("b.txt")), vec!["rename_to"]);
+    }
+
+    #[test]
+    fn flatten_error_to_rpc_marks_git_commit_as_merge_conflict() {
+        let err = FlattenError::GitCommand {
+            step: "git_commit",
+            status: 1,
+            stderr: "conflict".to_owned(),
+            args: vec!["commit".to_owned()],
+        };
+        let rpc = flatten_error_to_rpc(err, Uuid::nil(), "feat/test");
+        assert_eq!(rpc.code, simgit_sdk::ERR_MERGE_CONFLICT);
+        let data = rpc.data.expect("data");
+        assert_eq!(data["kind"], "git_conflict");
+    }
+
+    #[test]
+    fn flatten_error_to_rpc_includes_missing_blob_details() {
+        let err = FlattenError::MissingBlob {
+            path: std::path::PathBuf::from("src/main.rs"),
+            hash: "abcdef".to_owned(),
+        };
+        let rpc = flatten_error_to_rpc(err, Uuid::nil(), "feat/test");
+        assert_eq!(rpc.code, -32603);
+        let data = rpc.data.expect("data");
+        assert_eq!(data["kind"], "missing_delta_blob");
+        assert_eq!(data["path"], "src/main.rs");
     }
 
     static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
