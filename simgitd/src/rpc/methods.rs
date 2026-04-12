@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{collections::BTreeSet, path::Path};
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -142,17 +143,22 @@ async fn session_diff(state: &Arc<AppState>, p: serde_json::Value) -> Result<ser
     let session_id = uuid_field(&p, "session_id")?;
     let manifest = state.deltas.load_manifest(session_id).map_err(internal)?;
 
-    let changed_paths: Vec<PathBuf> = manifest.writes.keys()
-        .chain(manifest.deletes.iter())
-        .cloned()
-        .collect();
+    let mut changed_set = BTreeSet::new();
+    changed_set.extend(manifest.writes.keys().cloned());
+    changed_set.extend(manifest.deletes.iter().cloned());
+    for (from, to) in &manifest.renames {
+        changed_set.insert(from.clone());
+        changed_set.insert(to.clone());
+    }
+    let changed_paths: Vec<PathBuf> = changed_set.into_iter().collect();
 
-    // Build a human-readable summary (full unified diff generation is Phase 5).
-    let unified_diff = changed_paths.iter()
-        .map(|p| format!("M {}", p.display()))
-        .chain(manifest.deletes.iter().map(|p| format!("D {}", p.display())))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let unified_diff = build_session_unified_diff(
+        &state.config.repo_path,
+        &state.config.state_dir.join("deltas"),
+        session_id,
+        &manifest.base_commit,
+        &manifest,
+    ).map_err(internal)?;
 
     let result = simgit_sdk::DiffResult {
         session_id,
@@ -160,6 +166,120 @@ async fn session_diff(state: &Arc<AppState>, p: serde_json::Value) -> Result<ser
         changed_paths,
     };
     serde_json::to_value(result).map_err(internal)
+}
+
+fn build_session_unified_diff(
+    repo_path: &Path,
+    delta_root: &Path,
+    session_id: Uuid,
+    base_commit: &str,
+    manifest: &crate::delta::store::DeltaManifest,
+) -> Result<String> {
+    let mut out = String::new();
+
+    // Writes: show base -> delta diff for each changed path.
+    let mut write_paths: Vec<_> = manifest.writes.keys().cloned().collect();
+    write_paths.sort();
+    for path in write_paths {
+        let old = read_base_blob(repo_path, base_commit, &path);
+        let new = read_delta_blob(delta_root, session_id, manifest, &path)?;
+        let patch = diff_bytes_for_path(&path, old.as_deref(), new.as_deref())?;
+        if !patch.is_empty() {
+            out.push_str(&patch);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+
+    // Deletes: show base -> empty diff.
+    let mut delete_paths: Vec<_> = manifest.deletes.iter().cloned().collect();
+    delete_paths.sort();
+    for path in delete_paths {
+        let old = read_base_blob(repo_path, base_commit, &path);
+        let patch = diff_bytes_for_path(&path, old.as_deref(), Some(&[]))?;
+        if !patch.is_empty() {
+            out.push_str(&patch);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+
+    // Renames: include explicit marker line for visibility.
+    for (from, to) in &manifest.renames {
+        out.push_str(&format!("rename {} -> {}\n", from.display(), to.display()));
+    }
+
+    Ok(out)
+}
+
+fn read_base_blob(repo_path: &Path, base_commit: &str, path: &Path) -> Option<Vec<u8>> {
+    let spec = format!("{}:{}", base_commit, path.to_string_lossy());
+    let out = std::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["show", &spec])
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(out.stdout)
+    } else {
+        None
+    }
+}
+
+fn read_delta_blob(
+    delta_root: &Path,
+    session_id: Uuid,
+    manifest: &crate::delta::store::DeltaManifest,
+    path: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let Some(hash) = manifest.writes.get(path) else {
+        return Ok(None);
+    };
+    let blob_path = delta_root
+        .join(session_id.to_string())
+        .join("objects")
+        .join(&hash[..2])
+        .join(&hash[2..]);
+    let bytes = std::fs::read(blob_path)?;
+    Ok(Some(bytes))
+}
+
+fn diff_bytes_for_path(path: &Path, old: Option<&[u8]>, new: Option<&[u8]>) -> Result<String> {
+    let tmp = std::env::temp_dir().join(format!("simgit-diff-{}-{}", std::process::id(), Uuid::now_v7()));
+    std::fs::create_dir_all(&tmp)?;
+    let old_file = tmp.join("old");
+    let new_file = tmp.join("new");
+
+    std::fs::write(&old_file, old.unwrap_or_default())?;
+    std::fs::write(&new_file, new.unwrap_or_default())?;
+
+    let label_a = format!("a/{}", path.display());
+    let label_b = format!("b/{}", path.display());
+    let out = std::process::Command::new("git")
+        .args([
+            "--no-pager",
+            "diff",
+            "--no-index",
+            "--binary",
+            "--label",
+            &label_a,
+            "--label",
+            &label_b,
+            old_file.to_string_lossy().as_ref(),
+            new_file.to_string_lossy().as_ref(),
+        ])
+        .output()?;
+
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // git diff --no-index exits with:
+    // 0 = no differences, 1 = differences found, >1 = actual error.
+    if out.status.code().unwrap_or(2) > 1 {
+        anyhow::bail!("git diff --no-index failed for {}", path.display());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 // ── lock.list ─────────────────────────────────────────────────────────────────
