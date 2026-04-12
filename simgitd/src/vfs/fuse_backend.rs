@@ -1,8 +1,64 @@
-//! FUSE backend using the `fuser` crate (Linux primary).
+//! FUSE backend using the `fuser` crate (Phase 1 implementation).
 //!
-//! Implements a Copy-on-Write overlay:
-//!   READ  → check delta store first, fall back to git blob
-//!   WRITE → capture in delta store, acquire write lock via borrow registry
+//! # Overview
+//!
+//! Implements a copy-on-write (CoW) filesystem overlay mounted at `/vdev/<session-uuid>/`
+//! that merges:
+//! - **Read-only git tree** (from base_commit)
+//! - **Delta overlay** (writes from the current session)
+//!
+//! The filesystem behaves from the agent's perspective as a complete filesystem,
+//! but internally bridges two data sources (git + delta store).
+//!
+//! # FUSE Handler Traits
+//!
+//! The implementation follows the `fuser::Filesystem` trait:
+//! - `init()`: Daemon initialization (currently a no-op)
+//! - `lookup()`: Resolve filename → inode number
+//! - `getattr()`: Return file metadata (size, mode, mtime)
+//! - `read()`: Serve file contents
+//! - `readdir()`: List directory entries
+//! - `write()`: Capture writes to delta store (Phase 2)
+//!
+//! # Request Flow
+//!
+//! 1. **Agent opens file** → kernel → fuser thread pool → SessionFs handler
+//! 2. **Handler acquires read reference** on inode
+//! 3. **Delta check**: Is file in delta store? (written by this session)
+//!    - YES → serve from delta
+//!    - NO → resolve path in git tree, serve blob
+//! 4. **Handler releases reference**
+//! 5. **Kernel returns data to agent**
+//!
+//! # Architecture
+//!
+//! Each session has a **SessionFs** instance with three caches:
+//! - **TreeCache** (1024 entries): git tree objects
+//! - **BlobCache** (50 entries, 10 MiB cap): file contents (small files only)
+//! - **InodeMap**: inode number → (path, git OID) mapping
+//!
+//! # Phase 1 Scope
+//!
+//! Phase 1 is **read-only**:
+//! - ✅ Traversal of git tree structure
+//! - ✅ Inode caching for fast lookups
+//! - ✅ Blob serving (small files from cache, large files streamed)
+//! - ✅ Directory listing (merged view)
+//! - ⬜ Write interception (Phase 2)
+//! - ⬜ Delta storage integration (Phase 2)
+//! - ⬜ Borrow checking (Phase 3)
+//!
+//! # Performance Characteristics
+//!
+//! - **Read-only tree traversal**: O(log n) per lookup (binary search in git tree)
+//! - **Cache hit**: O(1) (HashMap lookup)
+//! - **Cache miss**: ~100–500ms (git subprocess call)
+//! - **readdir() without cache**: O(n) in tree size (unavoidable)
+//! - **Memory**: ~10–50 MiB per session (configurable)
+//!
+//! # Linux-Only
+//!
+//! FUSE is Linux-native. macOS support uses NFS-loopback (see [nfs_backend]).
 
 use std::ffi::OsStr;
 use std::path::PathBuf;
@@ -22,11 +78,20 @@ use simgit_sdk::SessionInfo;
 use crate::config::Config;
 use super::git_resolver::{TreeCache, BlobCache, InodeMap};
 
+/// FUSE backend driver (Linux).
+///
+/// Responsible for mounting and unmounting FUSE filesystems via the fuser crate.
+/// One instance per daemon; spawns a SessionFs handler per session.
 pub struct FuseBackend {
     cfg: Arc<Config>,
 }
 
 impl FuseBackend {
+    /// Create a new FUSE backend with daemon configuration.
+    ///
+    /// # Arguments
+    ///
+    /// - `cfg`: Daemon configuration (mount options, cache sizes, git repo path)
     pub fn new(cfg: Arc<Config>) -> Self {
         Self { cfg }
     }
@@ -73,6 +138,74 @@ impl super::VfsBackendTrait for FuseBackend {
 
 // ── FUSE filesystem implementation ────────────────────────────────────────────
 
+/// FUSE filesystem handler for a single session.
+///
+/// Implements the `fuser::Filesystem` trait, handling kernel requests for:
+/// - **lookup()**: Resolve inode by parent + filename
+/// - **getattr()**: Return file metadata
+/// - **read()**: Serve file contents
+/// - **readdir()**: List directory entries
+/// - **write()** (Phase 2): Intercept writes to delta store
+///
+/// Each session gets its own instance, with isolated caches to avoid cross-session
+/// interference and enable parallel processing.
+///
+/// # Data Flow
+///
+/// ```text
+/// SessionFs maintains separate caches:
+///
+/// ┌─────────────────────────────────────────────┐
+/// │         SessionFs (session-123)             │
+/// ├──────────────────────────────────────────── │
+/// │ git repo ─────────────────┐                 │
+/// │ base_commit = "abc123"    │                 │ ← read-only
+/// │                           ↓                 │
+/// │ TreeCache (100 trees) ◄─────────────────── │ ← memoized git ls-tree
+/// │ BlobCache (50 blobs, 10MB) ◄────────────── │ ← small file cache
+/// │ InodeMap (path → ino)                      │
+/// │                                             │
+/// │ Delta Store ◄────────────────────────────── │ ← Phase 2
+/// │                                             │
+/// └─────────────────────────────────────────────┘
+/// ```
+///
+/// # Example (Phase 1 Read-Only)
+///
+/// ```text
+/// Agent: open("/vdev/sess-123/src/main.rs")
+///   ↓
+/// FUSE kernel module → SessionFs::lookup()
+/// ├─ parent_ino = 1 (root)
+/// ├─ name = "src"
+/// ├─ lookup("src") in git tree
+/// └─ return inode for "src" directory
+///   ↓
+/// FUSE kernel module → SessionFs::lookup()
+/// ├─ parent_ino = 2 (src directory)
+/// ├─ name = "main.rs"
+/// ├─ lookup("main.rs") in git tree under src/
+/// └─ return inode for "main.rs" file
+///   ↓
+/// Agent: read(inode, 0, 4096)
+///   ↓
+/// FUSE kernel module → SessionFs::read()
+/// ├─ blob_cache.get(oid) or git cat-file
+/// └─ return 4096 bytes to agent
+/// ```
+///
+/// # Inode Numbering
+///
+/// - **1**: Root directory
+/// - **2+**: Generated sequentially; never reused within session lifetime
+/// - Mapping: InodeMap stores (inode → path, git OID) for fast reverse lookups
+///
+/// # TTL & Coherency
+///
+/// - Kernel caches inode metadata for 1 second (TTL)
+/// - After TTL, attributes are re-fetched (cache miss cost: ~1ms)
+/// - No write-through guarantees (Phase 1 read-only, so N/A)
+
 struct SessionFs {
     session_id:   Uuid,
     cfg:          Arc<Config>,
@@ -84,6 +217,19 @@ struct SessionFs {
 }
 
 impl SessionFs {
+    /// Create a new SessionFs handler for a session.
+    ///
+    /// Initializes caches:
+    /// - TreeCache: 100 entries (typical git repos ~10–100 directories)
+    /// - BlobCache: 50 entries, 10 MiB total (cache small .rs files, skip binaries)
+    /// - InodeMap: unlimited (one entry per unique path)
+    ///
+    /// # Arguments
+    ///
+    /// - `session_id`: Unique session identifier
+    /// - `cfg`: Daemon configuration
+    /// - `base_commit`: Git commit hash to serve as read-only tree (e.g., HEAD)
+    /// - `repo`: Open git repository handle
     fn new(session_id: Uuid, cfg: Arc<Config>, base_commit: String, repo: Arc<gix::Repository>) -> Self {
         Self {
             session_id,
