@@ -407,6 +407,22 @@ impl Filesystem for SessionFs {
             return;
         }
 
+        if entry.kind == super::git_resolver::EntryKind::File {
+            match self.deltas.read_blob(self.session_id, &path) {
+                Ok(Some(delta_bytes)) => {
+                    let mut delta_entry = entry.clone();
+                    delta_entry.size = delta_bytes.len() as u64;
+                    reply.attr(&TTL, &entry_attr(ino, &delta_entry));
+                    return;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+        }
+
         reply.attr(&TTL, &entry_attr(ino, entry));
     }
 

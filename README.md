@@ -202,7 +202,7 @@ cargo test --workspace
 - Manifest tracking (deletes, renames, writes)
 - Content-addressed blob storage
 - Atomic write-then-rename
-- Status: 🚧 In progress
+- Status: ✅ Completed (code + local validation)
 - Implemented so far:
     - Existing-file `write` interception into session delta blobs
     - `create` interception for new files into session delta blobs
@@ -211,7 +211,8 @@ cargo test --workspace
     - Crash-recovery persistence tests for session metadata and delta directories
     - ACTIVE session mount re-attachment regression via NFS-loopback backend
     - Linux FUSE integration harness added for create/unlink/rename and remount flows
-    - Outstanding in this phase: richer metadata updates and Linux-runtime execution of the FUSE harness
+    - Delta-aware metadata updates for file size in `getattr`
+    - Remaining external validation: Linux-runtime execution of the FUSE harness
 
 ### Phase 3: Borrow Checker (2 weeks)
 - Lock acquisition at session creation

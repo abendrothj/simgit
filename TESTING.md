@@ -314,6 +314,7 @@ jobs:
 - Current status:
     - Delta-aware VFS unit tests cover write offset behavior and path utilities in `vfs::fuse_backend`.
     - Synthetic inode mapping tests cover delta-only file metadata flow in `vfs::git_resolver`.
+    - Delta-aware `getattr` metadata updates are implemented for session-modified files.
     - Delta store recovery tests validate session discovery via `delta::store::list_sessions`.
     - Session manager tests validate ACTIVE/COMMITTED persistence across reopen for crash recovery bootstrap.
     - Session recovery tests validate ACTIVE session mount re-attachment via the NFS-loopback backend.
