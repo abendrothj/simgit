@@ -208,7 +208,8 @@ cargo test --workspace
     - `create` interception for new files into session delta blobs
     - `unlink` and `rename` capture via delta manifest tombstones/renames
     - Tombstone-aware visibility in `lookup`, `readdir`, `getattr`, `open`, and `read`
-    - Outstanding in this phase: richer metadata updates and crash-recovery validation for delta sessions
+    - Crash-recovery persistence tests for session metadata and delta directories
+    - Outstanding in this phase: richer metadata updates and full mount re-attachment integration validation
 
 ### Phase 3: Borrow Checker (2 weeks)
 - Lock acquisition at session creation

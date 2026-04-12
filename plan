@@ -407,7 +407,8 @@ Execution checkoff (updated 2026-04-12):
     - [x] delta-backed unlink/rename handling
     - [x] delta-backed create syscall path (new files)
     - [x] tombstone-aware lookup/getattr/readdir/open/read visibility
-    - [ ] crash-recovery mount re-attachment validation for delta sessions
+    - [x] crash-recovery persistence validation for session metadata and delta directories
+    - [ ] end-to-end mount re-attachment validation (requires mount-level integration harness)
   - [~] Phase 3 in progress
     - [x] lock acquisition and TTL sweeper foundations
     - [x] EBUSY returns on mutating ops during active lock contention

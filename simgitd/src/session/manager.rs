@@ -197,3 +197,93 @@ fn row_to_info(row: &SessionRow) -> Result<SessionInfo> {
         peers_enabled: row.peers_enabled,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SessionManager;
+    use simgit_sdk::SessionStatus;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_db_path() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let seq = TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "simgit-session-test-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            seq
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("state.db")
+    }
+
+    #[tokio::test]
+    async fn session_manager_persists_active_session_across_reopen() {
+        let db_path = temp_db_path();
+
+        let created_session_id = {
+            let manager = SessionManager::open(&db_path).await.expect("open manager");
+            let info = manager
+                .create(
+                    "task-a".to_owned(),
+                    Some("agent-a".to_owned()),
+                    "HEAD".to_owned(),
+                    std::env::temp_dir().join("simgit-mount-a"),
+                    false,
+                    8,
+                )
+                .expect("create session");
+            info.session_id
+        };
+
+        let reopened = SessionManager::open(&db_path).await.expect("reopen manager");
+        let active = reopened.list(Some(SessionStatus::Active));
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].session_id, created_session_id);
+        assert_eq!(active[0].task_id, "task-a");
+
+        let _ = std::fs::remove_file(&db_path);
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_status_persists_across_reopen() {
+        let db_path = temp_db_path();
+
+        let session_id = {
+            let manager = SessionManager::open(&db_path).await.expect("open manager");
+            let info = manager
+                .create(
+                    "task-b".to_owned(),
+                    None,
+                    "HEAD".to_owned(),
+                    std::env::temp_dir().join("simgit-mount-b"),
+                    false,
+                    8,
+                )
+                .expect("create session");
+            manager
+                .mark_committed(info.session_id, "feat/test")
+                .expect("mark committed");
+            info.session_id
+        };
+
+        let reopened = SessionManager::open(&db_path).await.expect("reopen manager");
+        let info = reopened.get(session_id).expect("session exists");
+        assert_eq!(info.status, SessionStatus::Committed);
+        assert_eq!(info.branch_name.as_deref(), Some("feat/test"));
+
+        let _ = std::fs::remove_file(&db_path);
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+}

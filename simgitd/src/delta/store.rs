@@ -50,7 +50,6 @@ impl DeltaStore {
 
     /// Initialise the directory structure for a new session.
     pub fn init_session(&self, session_id: Uuid, base_commit: &str) -> Result<()> {
-        let dir = self.session_dir(session_id);
         std::fs::create_dir_all(self.objects_dir(session_id))
             .with_context(|| format!("create objects dir for session {session_id}"))?;
 
@@ -202,5 +201,88 @@ mod hex {
             s.push_str(&format!("{b:02x}"));
             s
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeltaStore;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
+
+    static TEST_ROOT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_delta_root() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let seq = TEST_ROOT_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "simgit-delta-test-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            seq
+        ))
+    }
+
+    #[test]
+    fn delta_store_write_delete_and_rename_flow() {
+        let root = temp_delta_root();
+        let store = DeltaStore::new(&root);
+        let session_id = Uuid::now_v7();
+        let old_path = Path::new("src/old.rs");
+        let new_path = Path::new("src/new.rs");
+
+        store.init_session(session_id, "HEAD").expect("init session");
+        store
+            .write_blob(session_id, old_path, b"hello")
+            .expect("write old path");
+        store
+            .record_rename(session_id, old_path, new_path)
+            .expect("rename path");
+        store
+            .mark_deleted(session_id, old_path)
+            .expect("delete old path");
+
+        let manifest = store.load_manifest(session_id).expect("load manifest");
+        assert!(manifest.writes.contains_key(new_path));
+        assert!(manifest.deletes.contains(old_path));
+        assert!(
+            manifest
+                .renames
+                .iter()
+                .any(|(from, to)| from == old_path && to == new_path)
+        );
+
+        let bytes = store
+            .read_blob(session_id, new_path)
+            .expect("read renamed path")
+            .expect("renamed path has bytes");
+        assert_eq!(bytes, b"hello");
+
+        let old = store.read_blob(session_id, old_path).expect("read old path");
+        assert!(old.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_sessions_reflects_delta_dirs_for_recovery() {
+        let root = temp_delta_root();
+        let store = DeltaStore::new(&root);
+        let s1 = Uuid::now_v7();
+        let s2 = Uuid::now_v7();
+
+        store.init_session(s1, "HEAD").expect("init s1");
+        store.init_session(s2, "HEAD").expect("init s2");
+
+        let sessions = store.list_sessions().expect("list sessions");
+        assert!(sessions.contains(&s1));
+        assert!(sessions.contains(&s2));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
