@@ -240,6 +240,10 @@ cargo test --workspace
 - All 9 `sg` subcommands
 - Rust SDK (for embedders)
 - Python SDK (for agents that don't link Rust)
+- Status: 🚧 In progress
+- Implemented highlights:
+    - workspace includes initial `simgit-py` PyO3 bindings crate
+    - Python API scaffold exposes `Client` + `Session.new/commit/abort/diff`
 
 ### Phase 6: Peer Visibility (1 week)
 - Opt-in `--peers` flag (show in-flight changes)

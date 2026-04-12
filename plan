@@ -421,7 +421,10 @@ Execution checkoff (updated 2026-04-12):
     - [x] pre-commit overlap detection across active sessions in `session.commit`
     - [x] multi-session integration coverage for overlap block + non-overlap success in `session.commit`
     - [x] deepen flatten conflict-path reporting and failure taxonomy
-  - [ ] Phase 5 pending
+  - [~] Phase 5 started
+    - [x] initial `simgit-py` PyO3 bindings scaffold (`Client`, `Session.new`, `commit`, `abort`, `diff`)
+    - [ ] package/publish flow for Python wheel (maturin/setuptools)
+    - [ ] agent integration guide and 50-agent stress harness
   - [ ] Phase 6 pending
   - [~] Phase 7 started opportunistically (continuous docs/tests hardening)
 

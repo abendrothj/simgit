@@ -1,0 +1,16 @@
+[package]
+name = "simgit-py"
+description = "Python bindings for simgit via PyO3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "simgit"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3", "abi3-py39"] }
+tokio.workspace = true
+uuid.workspace = true
+simgit-sdk.workspace = true
