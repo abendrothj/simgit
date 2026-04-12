@@ -82,9 +82,7 @@ pub fn flatten(
     // ── 3. Stage and commit ───────────────────────────────────────────────
     run_git(&wt_path, &["add", "-A"])?;
     run_git(&wt_path, &["checkout", "-B", branch_name])?;
-    let commit_out = run_git_output(&wt_path, &[
-        "commit", "--allow-empty", "-m", message,
-    ])?;
+    run_git(&wt_path, &["commit", "--allow-empty", "-m", message])?;
 
     // Extract commit OID.
     let commit_oid = run_git_output(&wt_path, &["rev-parse", "HEAD"])?

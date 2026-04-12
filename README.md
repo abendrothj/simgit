@@ -218,12 +218,19 @@ cargo test --workspace
 - TTL-based lock release (30s)
 - Conflict detection + reporting
 - Conflict queue (block until resolved)
+- Status: ✅ Completed (core lock/conflict semantics)
+- Implemented highlights:
+    - session-aware `lock.wait` conflict context
+    - structured conflict payload via `lock.acquire` RPC
 
 ### Phase 4: Flatten & Merge (2 weeks)
 - Convert delta → git tree/blob objects
 - Auto three-way merge
 - Create commit + update branch
 - Error handling (merge conflicts)
+- Status: 🚧 In progress
+- Implemented highlights:
+    - pre-commit overlap detection across active sessions in `session.commit`
 
 ### Phase 5: CLI & SDK (1 week)
 - All 9 `sg` subcommands

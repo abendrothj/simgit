@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use simgit_sdk::{
     RpcError, SessionStatus,
-    ERR_MERGE_CONFLICT, ERR_SESSION_NOT_FOUND,
+    ERR_BORROW_CONFLICT, ERR_MERGE_CONFLICT, ERR_QUOTA_EXCEEDED, ERR_SESSION_NOT_FOUND,
 };
 
 use crate::daemon::AppState;
@@ -26,6 +26,7 @@ pub async fn dispatch(
         "session.abort"  => session_abort(state, params).await,
         "session.list"   => session_list(state, params).await,
         "session.diff"   => session_diff(state, params).await,
+        "lock.acquire"   => lock_acquire(state, params).await,
         "lock.list"      => lock_list(state, params).await,
         "lock.wait"      => lock_wait(state, params).await,
         _                => Err(RpcError {
@@ -58,7 +59,14 @@ async fn session_create(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
         mount_path.clone(),
         peers,
         state.config.max_sessions,
-    ).map_err(internal)?;
+    ).map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("max sessions") {
+            RpcError { code: ERR_QUOTA_EXCEEDED, message: msg, data: None }
+        } else {
+            internal(msg)
+        }
+    })?;
 
     // Initialise delta store.
     state.deltas.init_session(info.session_id, &base_commit).map_err(internal)?;
@@ -82,6 +90,38 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
 
     let info = state.sessions.get(session_id).ok_or_else(|| not_found(session_id))?;
     let manifest = state.deltas.load_manifest(session_id).map_err(internal)?;
+
+    // Pre-commit conflict check against other active sessions.
+    let this_changed = changed_paths_set(&manifest);
+    let mut conflicts = Vec::new();
+    for peer in state.sessions.list(Some(SessionStatus::Active)) {
+        if peer.session_id == session_id {
+            continue;
+        }
+        let peer_manifest = match state.deltas.load_manifest(peer.session_id) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let peer_changed = changed_paths_set(&peer_manifest);
+        let overlap = overlap_paths(&this_changed, &peer_changed);
+        if !overlap.is_empty() {
+            conflicts.push(serde_json::json!({
+                "session_id": peer.session_id,
+                "task_id": peer.task_id,
+                "paths": overlap,
+            }));
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(RpcError {
+            code: ERR_MERGE_CONFLICT,
+            message: "pre-commit conflict: overlapping active session paths".to_owned(),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "conflicts": conflicts,
+            })),
+        });
+    }
 
     // Flatten delta to git branch.
     let result = crate::delta::flatten::flatten(
@@ -143,13 +183,7 @@ async fn session_diff(state: &Arc<AppState>, p: serde_json::Value) -> Result<ser
     let session_id = uuid_field(&p, "session_id")?;
     let manifest = state.deltas.load_manifest(session_id).map_err(internal)?;
 
-    let mut changed_set = BTreeSet::new();
-    changed_set.extend(manifest.writes.keys().cloned());
-    changed_set.extend(manifest.deletes.iter().cloned());
-    for (from, to) in &manifest.renames {
-        changed_set.insert(from.clone());
-        changed_set.insert(to.clone());
-    }
+    let changed_set = changed_paths_set(&manifest);
     let changed_paths: Vec<PathBuf> = changed_set.into_iter().collect();
 
     let unified_diff = build_session_unified_diff(
@@ -246,6 +280,21 @@ fn read_delta_blob(
     Ok(Some(bytes))
 }
 
+fn changed_paths_set(manifest: &crate::delta::store::DeltaManifest) -> BTreeSet<PathBuf> {
+    let mut out = BTreeSet::new();
+    out.extend(manifest.writes.keys().cloned());
+    out.extend(manifest.deletes.iter().cloned());
+    for (from, to) in &manifest.renames {
+        out.insert(from.clone());
+        out.insert(to.clone());
+    }
+    out
+}
+
+fn overlap_paths(a: &BTreeSet<PathBuf>, b: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+    a.intersection(b).cloned().collect()
+}
+
 fn diff_bytes_for_path(path: &Path, old: Option<&[u8]>, new: Option<&[u8]>) -> Result<String> {
     let tmp = std::env::temp_dir().join(format!("simgit-diff-{}-{}", std::process::id(), Uuid::now_v7()));
     std::fs::create_dir_all(&tmp)?;
@@ -282,6 +331,26 @@ fn diff_bytes_for_path(path: &Path, old: Option<&[u8]>, new: Option<&[u8]>) -> R
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+// ── lock.acquire ──────────────────────────────────────────────────────────────
+
+async fn lock_acquire(state: &Arc<AppState>, p: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+    let path = PathBuf::from(str_field(&p, "path")?);
+    let session_id = uuid_field(&p, "session_id")?;
+    let ttl_seconds = p["ttl_seconds"].as_u64().or(Some(state.config.lock_ttl_seconds));
+
+    match state.borrows.acquire_write(session_id, &path, ttl_seconds) {
+        Ok(()) => Ok(serde_json::json!({ "acquired": true })),
+        Err(e) => {
+            let payload = serde_json::to_value(&e).ok();
+            Err(RpcError {
+                code: ERR_BORROW_CONFLICT,
+                message: e.to_string(),
+                data: payload,
+            })
+        }
+    }
 }
 
 // ── lock.list ─────────────────────────────────────────────────────────────────
@@ -383,7 +452,8 @@ fn resolve_head(repo: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::diff_bytes_for_path;
+    use super::{changed_paths_set, diff_bytes_for_path, overlap_paths};
+    use crate::delta::store::DeltaManifest;
     use std::path::Path;
 
     #[test]
@@ -426,5 +496,32 @@ mod tests {
 
         assert!(patch.contains("diff --git"));
         assert!(patch.contains("+hello"));
+    }
+
+    #[test]
+    fn changed_paths_set_includes_writes_deletes_and_renames() {
+        let mut m = DeltaManifest::default();
+        m.writes.insert("a.txt".into(), "abc".into());
+        m.deletes.insert("b.txt".into());
+        m.renames.push(("c.txt".into(), "d.txt".into()));
+
+        let set = changed_paths_set(&m);
+        assert!(set.contains(Path::new("a.txt")));
+        assert!(set.contains(Path::new("b.txt")));
+        assert!(set.contains(Path::new("c.txt")));
+        assert!(set.contains(Path::new("d.txt")));
+    }
+
+    #[test]
+    fn overlap_paths_returns_intersection() {
+        let mut a = std::collections::BTreeSet::new();
+        let mut b = std::collections::BTreeSet::new();
+        a.insert(std::path::PathBuf::from("x.txt"));
+        a.insert(std::path::PathBuf::from("y.txt"));
+        b.insert(std::path::PathBuf::from("y.txt"));
+        b.insert(std::path::PathBuf::from("z.txt"));
+
+        let overlap = overlap_paths(&a, &b);
+        assert_eq!(overlap, vec![std::path::PathBuf::from("y.txt")]);
     }
 }

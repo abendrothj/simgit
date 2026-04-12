@@ -415,8 +415,11 @@ Execution checkoff (updated 2026-04-12):
     - [x] lock acquisition and TTL sweeper foundations
     - [x] EBUSY returns on mutating ops during active lock contention
     - [x] lock.list and session-aware lock.wait with holder context on timeout
-    - [ ] structured conflict payload propagation from VFS syscall path (kernel errno path still coarse)
-  - [ ] Phase 4 pending
+    - [x] structured BorrowError payload via `lock.acquire` RPC (VFS kernel errno path remains coarse by design)
+  - [x] Phase 3 completed (control-plane conflict semantics and lock observability)
+  - [~] Phase 4 in progress
+    - [x] pre-commit overlap detection across active sessions in `session.commit`
+    - [ ] broaden commit/flatten conflict tests to multi-session integration scenarios
   - [ ] Phase 5 pending
   - [ ] Phase 6 pending
   - [~] Phase 7 started opportunistically (continuous docs/tests hardening)

@@ -49,6 +49,7 @@
 //! - **session.commit** — Flatten and merge
 //! - **session.abort** — Discard changes
 //! - **session.diff** — Diff vs HEAD
+//! - **lock.acquire** — Attempt write-lock acquisition (structured BorrowError on conflict)
 //! - **lock.list** — Show all locks
 //! - **lock.wait** — Block until path is free
 //!
@@ -62,9 +63,10 @@
 //! - `-32603`: Internal error
 //!
 //! Custom codes:
-//! - `-32001`: Session not found
-//! - `-32002`: Borrow conflict (write lock held)
+//! - `-32001`: Borrow conflict (write lock held)
+//! - `-32002`: Session not found
 //! - `-32003`: Merge conflict
+//! - `-32004`: Quota/max-session exceeded
 //!
 //! # Example Workflow (via `sg` CLI)
 //!
