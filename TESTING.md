@@ -334,6 +334,8 @@ jobs:
     - Phase 5 bootstrap validation: `cargo check -p simgit-py` is green with ABI3 compatibility enabled.
     - Phase 5 packaging flow is configured via `simgit-py/pyproject.toml` (maturin backend).
     - Wheel build/publish commands are documented; runtime wheel build was not executed locally because `maturin` is not installed in this environment.
+    - Phase 5 stress harness scaffold (`tests/stress/agent_harness.py`) is syntax-validated via `python3 -m py_compile`.
+    - Full 50-agent runtime execution requires installed Python bindings and a running daemon-backed test repository.
 
 ## FAQ
 

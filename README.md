@@ -85,6 +85,12 @@ simgit/
 │       ├── error.rs             # BorrowError, RpcError codes
 │       └── client.rs            # Async JSON-RPC client
 │
+├── simgit-py/                    # Python bindings package (PyO3 + maturin)
+│   ├── pyproject.toml           # Python packaging metadata
+│   ├── README.md                # Build/publish instructions
+│   ├── simgit/__init__.py       # Python package entry
+│   └── src/lib.rs               # PyO3 bindings for Session/Client
+│
 ├── simgitd/                      # Main daemon
 │   └── src/
 │       ├── main.rs              # Entry point
@@ -139,7 +145,9 @@ simgit/
     ├── session_lifecycle.rs
     ├── borrow_checker.rs
     ├── delta_store.rs
-    └── e2e_multi_agent.rs
+    ├── e2e_multi_agent.rs
+    └── stress/
+        └── agent_harness.py     # 50-agent control-plane stress harness scaffold
 ```
 
 ## Testing Strategy
@@ -245,6 +253,7 @@ cargo test --workspace
     - workspace includes initial `simgit-py` PyO3 bindings crate
     - Python API scaffold exposes `Client` + `Session.new/commit/abort/diff`
     - Python packaging/publish flow wired with `maturin` (`simgit-py/pyproject.toml`)
+    - agent integration guide and 50-agent stress harness scaffold (`docs/agent_integration.md`, `tests/stress/agent_harness.py`)
 
 ### Phase 6: Peer Visibility (1 week)
 - Opt-in `--peers` flag (show in-flight changes)

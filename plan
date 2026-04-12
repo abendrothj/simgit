@@ -424,7 +424,7 @@ Execution checkoff (updated 2026-04-12):
   - [~] Phase 5 started
     - [x] initial `simgit-py` PyO3 bindings scaffold (`Client`, `Session.new`, `commit`, `abort`, `diff`)
     - [x] package/publish flow for Python wheel (`maturin` + `pyproject.toml`)
-    - [ ] agent integration guide and 50-agent stress harness
+    - [x] agent integration guide and 50-agent stress harness scaffold (`docs/agent_integration.md`, `tests/stress/agent_harness.py`)
   - [ ] Phase 6 pending
   - [~] Phase 7 started opportunistically (continuous docs/tests hardening)
 

@@ -1,0 +1,85 @@
+# Agent Integration Guide
+
+This guide shows how to integrate AI agent runners with simgit using either the Rust SDK or Python bindings.
+
+## Prerequisites
+
+- `simgitd` running and reachable through the control socket
+- Repository configured for simgit sessions
+- For Python flows: `simgit` package built from `simgit-py`
+
+## Integration Pattern
+
+A typical agent task lifecycle is:
+
+1. Create a session for task isolation.
+2. Perform file operations under the mounted session path.
+3. Inspect diff for auditability.
+4. Commit to a branch, or abort on failure.
+
+## Python Example
+
+```python
+import simgit
+
+session = simgit.Session.new(task_id="agent-task-123")
+info = session.info()
+print("mount:", info["mount_path"])
+
+# Agent writes under info["mount_path"] here.
+
+diff = session.diff()
+print("changed paths:", diff["changed_paths"])
+
+session.commit(branch_name="feat/agent-task-123", message="agent update")
+```
+
+## Rust Example
+
+```rust
+use simgit_sdk::Client;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = Client::from_env();
+
+    let session = client
+        .session_create("agent-task-123", Some("agent-1".into()), None, false)
+        .await?;
+
+    // Agent writes under session.mount_path.
+
+    let _diff = client.session_diff(session.session_id).await?;
+
+    client
+        .session_commit(
+            session.session_id,
+            Some("feat/agent-task-123".into()),
+            Some("agent update".into()),
+        )
+        .await?;
+
+    Ok(())
+}
+```
+
+## Concurrency Stress Harness
+
+A 50-agent stress harness scaffold is provided at:
+
+- `tests/stress/agent_harness.py`
+
+Usage:
+
+```bash
+python3 tests/stress/agent_harness.py --agents 50 --mode abort
+```
+
+Use `--mode commit` only when your mounted session paths are writable and your daemon is connected to a disposable test repository.
+
+## Operational Guidance
+
+- Prefer one session per autonomous task.
+- Use deterministic branch names (`feat/<task-id>`) for traceability.
+- On conflict errors, inspect payload details and retry with a refreshed session.
+- Keep stress runs on test repos; avoid production branches.
