@@ -13,6 +13,7 @@ use simgit_sdk::SessionInfo;
 use crate::config::{Config, VfsBackend};
 
 mod fuse_backend;
+mod git_resolver;
 mod nfs_backend;
 
 /// Trait implemented by both the FUSE and NFS-loopback backends.

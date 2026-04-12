@@ -20,6 +20,7 @@ use uuid::Uuid;
 use simgit_sdk::SessionInfo;
 
 use crate::config::Config;
+use super::git_resolver::{TreeCache, BlobCache, InodeMap};
 
 pub struct FuseBackend {
     cfg: Arc<Config>,
@@ -37,7 +38,15 @@ impl super::VfsBackendTrait for FuseBackend {
         let mount_path = session.mount_path.clone();
         std::fs::create_dir_all(&mount_path)?;
 
-        let fs = SessionFs::new(session.session_id, Arc::clone(&self.cfg));
+        // Open the base repo.
+        let repo = Arc::new(gix::open(&self.cfg.repo_path)?);
+        
+        let fs = SessionFs::new(
+            session.session_id,
+            Arc::clone(&self.cfg),
+            session.base_commit.clone(),
+            repo,
+        );
 
         let mut config = fuser::Config::default();
         config.mount_options = vec![
@@ -45,9 +54,9 @@ impl super::VfsBackendTrait for FuseBackend {
             MountOption::FSName(format!("simgit-{}", session.session_id)),
         ];
 
-        // Spawn mount in a background thread; AutoUnmount handles cleanup.
+        // Spawn mount in a background thread.
         let _guard = fuser::spawn_mount2(fs, &mount_path, &config)?;
-        std::mem::forget(_guard); // intentional: auto-unmount handles cleanup
+        std::mem::forget(_guard); // intentional: Keep mount alive
 
         Ok(())
     }
@@ -65,13 +74,26 @@ impl super::VfsBackendTrait for FuseBackend {
 // ── FUSE filesystem implementation ────────────────────────────────────────────
 
 struct SessionFs {
-    session_id: Uuid,
-    cfg:        Arc<Config>,
+    session_id:   Uuid,
+    cfg:          Arc<Config>,
+    base_commit:  String,
+    tree_cache:   Arc<TreeCache>,
+    blob_cache:   Arc<BlobCache>,
+    inode_map:    Arc<InodeMap>,
+    repo:         Arc<gix::Repository>,
 }
 
 impl SessionFs {
-    fn new(session_id: Uuid, cfg: Arc<Config>) -> Self {
-        Self { session_id, cfg }
+    fn new(session_id: Uuid, cfg: Arc<Config>, base_commit: String, repo: Arc<gix::Repository>) -> Self {
+        Self {
+            session_id,
+            cfg,
+            base_commit,
+            tree_cache:   Arc::new(TreeCache::new(100)),
+            blob_cache:   Arc::new(BlobCache::new(50, 10 * 1024 * 1024)), // 50 blobs, 10MB cap
+            inode_map:    Arc::new(InodeMap::new()),
+            repo,
+        }
     }
 }
 
@@ -79,16 +101,97 @@ const TTL: Duration = Duration::from_secs(1);
 
 impl Filesystem for SessionFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        debug!(session = %self.session_id, parent = parent.0, name = ?name, "lookup");
-        // Phase 1: stub — real implementation resolves git tree objects.
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+
+        debug!(session = %self.session_id, parent = parent.0, name = name_str, "lookup");
+
+        // Root is always inode 1.
+        if parent.0 == 1 {
+            // Get the root tree from base_commit.
+            let root_oid = match gix::ObjectId::from_hex(self.base_commit.as_bytes()) {
+                Ok(oid) => oid,
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+
+            // Find the tree object (commit → tree).
+            let tree_oid = match self.repo.find_object(root_oid) {
+                Ok(obj) => match obj.try_into_commit() {
+                    Ok(commit) => commit.tree().ok().map(|t| t.0),
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            };
+
+            if tree_oid.is_none() {
+                reply.error(Errno::EIO);
+                return;
+            }
+
+            let tree_entries = match self.tree_cache.get(tree_oid.unwrap(), &self.repo) {
+                Ok(e) => e,
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+
+            // Search for the named entry.
+            for (idx, entry) in tree_entries.iter().enumerate() {
+                if entry.name == name_str {
+                    let ino = self.inode_map.allocate();
+                    self.inode_map.insert(ino, tree_oid.unwrap(), idx);
+
+                    let attr = FileAttr {
+                        ino: INodeNo(ino),
+                        size: entry.size,
+                        blocks: (entry.size + 511) / 512,
+                        atime: UNIX_EPOCH,
+                        mtime: UNIX_EPOCH,
+                        ctime: UNIX_EPOCH,
+                        crtime: UNIX_EPOCH,
+                        kind: match entry.kind {
+                            super::git_resolver::EntryKind::File => FileType::RegularFile,
+                            super::git_resolver::EntryKind::Dir => FileType::Directory,
+                            super::git_resolver::EntryKind::Symlink => FileType::Symlink,
+                        },
+                        perm: entry.perm,
+                        nlink: 1,
+                        uid: unsafe { libc::getuid() },
+                        gid: unsafe { libc::getgid() },
+                        rdev: 0,
+                        flags: 0,
+                        blksize: 4096,
+                    };
+                    reply.entry(&TTL, &attr, Generation(0));
+                    return;
+                }
+            }
+
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        // For non-root lookups, we'd need to maintain a tree_oid per inode.
+        // For now, return ENOENT (Phase 1 limitation).
         reply.error(Errno::ENOENT);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino.0 == 1 {
+            // Root directory.
             reply.attr(&TTL, &root_attr());
             return;
         }
+
         reply.error(Errno::ENOENT);
     }
 
@@ -104,10 +207,60 @@ impl Filesystem for SessionFs {
             reply.error(Errno::ENOTDIR);
             return;
         }
-        let entries = vec![
-            (1u64, FileType::Directory, "."),
-            (1u64, FileType::Directory, ".."),
+
+        // List root tree entries.
+        let root_oid = match gix::ObjectId::from_hex(self.base_commit.as_bytes()) {
+            Ok(oid) => oid,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        let tree_oid = match self.repo.find_object(root_oid) {
+            Ok(obj) => match obj.try_into_commit() {
+                Ok(commit) => commit.tree().ok().map(|t| t.0),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+
+        if tree_oid.is_none() {
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        let tree_entries = match self.tree_cache.get(tree_oid.unwrap(), &self.repo) {
+            Ok(e) => e,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        // Always start with . and ..
+        let mut entries: Vec<(u64, FileType, String)> = vec![
+            (1u64, FileType::Directory, ".".to_owned()),
+            (1u64, FileType::Directory, "..".to_owned()),
         ];
+
+        // Add git tree entries.
+        for (idx, entry) in tree_entries.iter().enumerate() {
+            let ino = self.inode_map.allocate();
+            self.inode_map.insert(ino, tree_oid.unwrap(), idx);
+
+            entries.push((
+                ino,
+                match entry.kind {
+                    super::git_resolver::EntryKind::File => FileType::RegularFile,
+                    super::git_resolver::EntryKind::Dir => FileType::Directory,
+                    super::git_resolver::EntryKind::Symlink => FileType::Symlink,
+                },
+                entry.name.clone(),
+            ));
+        }
+
+        // Yield entries starting from offset.
         for (i, (ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
             if reply.add(INodeNo(*ino), (i + 1) as u64, *kind, name) {
                 break;
