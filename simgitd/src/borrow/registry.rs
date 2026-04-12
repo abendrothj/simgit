@@ -10,14 +10,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Result;
 use chrono::Utc;
+use serde_json;
+use tracing::warn;
 use uuid::Uuid;
 
 use simgit_sdk::{BorrowError, LockInfo, SessionInfo};
 
 use crate::session::SessionManager;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct LockEntry {
     writer:  Option<Uuid>,
     readers: HashSet<Uuid>,
@@ -42,12 +45,17 @@ impl BorrowRegistry {
     /// Record that `session` is reading `path`. Always succeeds.
     /// Readers see the pre-mutation baseline even if a writer holds the path.
     pub fn acquire_read(&self, session_id: Uuid, path: &Path) {
-        let mut locks = self.locks.lock().unwrap();
-        locks
-            .entry(path.to_owned())
-            .or_insert_with(|| LockEntry { acquired_at: Utc::now(), ..Default::default() })
-            .readers
-            .insert(session_id);
+        let (writer, readers, acquired_at, ttl_seconds) = {
+            let mut locks = self.locks.lock().unwrap();
+            let entry = locks
+                .entry(path.to_owned())
+                .or_insert_with(|| LockEntry { acquired_at: Utc::now(), ..Default::default() });
+            entry.readers.insert(session_id);
+            (entry.writer, entry.readers.clone(), entry.acquired_at, entry.ttl_seconds)
+        };
+        if let Err(e) = self.sessions.persist_lock(path, writer, &readers, acquired_at, ttl_seconds) {
+            warn!(path = %path.display(), err = %e, "failed to persist read lock to SQLite");
+        }
     }
 
     // ── Write acquisition ─────────────────────────────────────────────────
@@ -62,45 +70,68 @@ impl BorrowRegistry {
         path: &Path,
         ttl_seconds: Option<u64>,
     ) -> Result<(), BorrowError> {
-        let mut locks = self.locks.lock().unwrap();
-        let entry = locks
-            .entry(path.to_owned())
-            .or_insert_with(|| LockEntry { acquired_at: Utc::now(), ..Default::default() });
+        // Separate enum so we can drop the MutexGuard before calling into SessionManager.
+        enum Outcome {
+            Granted { readers: HashSet<Uuid>, acquired_at: chrono::DateTime<Utc>, ttl: Option<u64> },
+            Reentrant,
+            Conflict(BorrowError),
+        }
 
-        match &entry.writer {
-            None => {
-                // No current writer — grant the lock.
-                entry.writer       = Some(session_id);
-                entry.acquired_at  = Utc::now();
-                entry.ttl_seconds  = ttl_seconds;
-                Ok(())
-            }
-            Some(w) if *w == session_id => {
-                // Re-entrant: same session already owns it.
-                Ok(())
-            }
-            Some(holder_id) => {
-                // Conflict — build a structured error.
-                let holder_id = *holder_id;
-                let acquired_at = entry.acquired_at;
-                let ttl = entry.ttl_seconds.map(std::time::Duration::from_secs);
-                // We can't easily block on async from here; the holder info
-                // comes from the session manager's in-memory cache.
-                let holder = self.sessions.get_info_blocking(holder_id).unwrap_or_else(|| {
-                    SessionInfo {
-                        session_id:    holder_id,
-                        task_id:       "<unknown>".into(),
-                        agent_label:   None,
-                        base_commit:   String::new(),
-                        created_at:    Utc::now(),
-                        status:        simgit_sdk::SessionStatus::Active,
-                        mount_path:    PathBuf::new(),
-                        branch_name:   None,
-                        peers_enabled: false,
+        let outcome = {
+            let mut locks = self.locks.lock().unwrap();
+            let entry = locks
+                .entry(path.to_owned())
+                .or_insert_with(|| LockEntry { acquired_at: Utc::now(), ..Default::default() });
+
+            match &entry.writer {
+                None => {
+                    entry.writer       = Some(session_id);
+                    entry.acquired_at  = Utc::now();
+                    entry.ttl_seconds  = ttl_seconds;
+                    Outcome::Granted {
+                        readers:     entry.readers.clone(),
+                        acquired_at: entry.acquired_at,
+                        ttl:         ttl_seconds,
                     }
-                });
-                Err(BorrowError { path: path.to_owned(), holder, acquired_at, ttl })
+                }
+                Some(w) if *w == session_id => {
+                    // Re-entrant: same session already owns it.
+                    Outcome::Reentrant
+                }
+                Some(holder_id) => {
+                    // Conflict — build a structured error.
+                    let holder_id   = *holder_id;
+                    let acquired_at = entry.acquired_at;
+                    let ttl         = entry.ttl_seconds.map(std::time::Duration::from_secs);
+                    let holder = self.sessions.get_info_blocking(holder_id).unwrap_or_else(|| {
+                        SessionInfo {
+                            session_id:    holder_id,
+                            task_id:       "<unknown>".into(),
+                            agent_label:   None,
+                            base_commit:   String::new(),
+                            created_at:    Utc::now(),
+                            status:        simgit_sdk::SessionStatus::Active,
+                            mount_path:    PathBuf::new(),
+                            branch_name:   None,
+                            peers_enabled: false,
+                        }
+                    });
+                    Outcome::Conflict(BorrowError { path: path.to_owned(), holder, acquired_at, ttl })
+                }
             }
+        }; // MutexGuard on self.locks dropped here
+
+        match outcome {
+            Outcome::Granted { readers, acquired_at, ttl } => {
+                if let Err(e) = self.sessions.persist_lock(
+                    path, Some(session_id), &readers, acquired_at, ttl,
+                ) {
+                    warn!(path = %path.display(), err = %e, "failed to persist write lock to SQLite");
+                }
+                Ok(())
+            }
+            Outcome::Reentrant => Ok(()),
+            Outcome::Conflict(err) => Err(err),
         }
     }
 
@@ -109,15 +140,105 @@ impl BorrowRegistry {
     /// Release ALL locks (read and write) held by `session`.
     /// Called automatically at session commit or abort.
     pub fn release_session(&self, session_id: Uuid) {
-        let mut locks = self.locks.lock().unwrap();
-        locks.retain(|_, entry| {
-            entry.readers.remove(&session_id);
-            if entry.writer == Some(session_id) {
-                entry.writer = None;
+        // Phase 1: update in-memory state and collect what changed.
+        let (to_delete, to_update): (Vec<PathBuf>, Vec<(PathBuf, LockEntry)>) = {
+            let mut locks = self.locks.lock().unwrap();
+
+            let affected: Vec<PathBuf> = locks
+                .iter()
+                .filter(|(_, e)| {
+                    e.writer == Some(session_id) || e.readers.contains(&session_id)
+                })
+                .map(|(p, _)| p.clone())
+                .collect();
+
+            locks.retain(|_, entry| {
+                entry.readers.remove(&session_id);
+                if entry.writer == Some(session_id) {
+                    entry.writer = None;
+                }
+                // Drop entries that are now completely empty.
+                entry.writer.is_some() || !entry.readers.is_empty()
+            });
+
+            let mut to_delete = Vec::new();
+            let mut to_update = Vec::new();
+            for path in affected {
+                match locks.get(&path) {
+                    None        => to_delete.push(path),
+                    Some(entry) => to_update.push((path, entry.clone())),
+                }
             }
-            // Drop entries that are now completely empty.
-            entry.writer.is_some() || !entry.readers.is_empty()
-        });
+            (to_delete, to_update)
+        }; // MutexGuard on self.locks dropped here
+
+        // Phase 2: sync changes to SQLite.
+        for path in &to_delete {
+            if let Err(e) = self.sessions.remove_lock(path) {
+                warn!(path = %path.display(), err = %e, "failed to remove lock from SQLite");
+            }
+        }
+        for (path, entry) in &to_update {
+            if let Err(e) = self.sessions.persist_lock(
+                path,
+                entry.writer,
+                &entry.readers,
+                entry.acquired_at,
+                entry.ttl_seconds,
+            ) {
+                warn!(path = %path.display(), err = %e, "failed to update lock in SQLite");
+            }
+        }
+    }
+
+    // ── Startup recovery ──────────────────────────────────────────────────
+
+    /// Restore the in-memory lock table from SQLite.
+    ///
+    /// Must be called once during daemon startup, after `BorrowRegistry::new` and
+    /// before any lock operations, so that write locks held at the time of a
+    /// previous crash are re-enforced immediately.
+    pub fn restore_locks(&self) -> Result<()> {
+        let rows = self.sessions.load_all_locks()?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut locks = self.locks.lock().unwrap();
+        for row in &rows {
+            let path = PathBuf::from(&row.path);
+            let writer = row.writer_session.as_deref().and_then(|s| s.parse::<Uuid>().ok());
+            let readers: HashSet<Uuid> = match serde_json::from_str::<Vec<String>>(&row.reader_sessions_json) {
+                Ok(ids) => ids.iter().filter_map(|s| s.parse::<Uuid>().ok()).collect(),
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        err = %e,
+                        "malformed reader_sessions JSON in SQLite locks table — skipping readers for this path"
+                    );
+                    HashSet::new()
+                }
+            };
+            if writer.is_none() && readers.is_empty() {
+                continue;
+            }
+            let acquired_at = match chrono::DateTime::from_timestamp(row.acquired_at, 0) {
+                Some(ts) => ts,
+                None => {
+                    warn!(
+                        path = %path.display(),
+                        acquired_at = row.acquired_at,
+                        "invalid acquired_at timestamp in SQLite locks table — using current time"
+                    );
+                    Utc::now()
+                }
+            };
+            locks.insert(
+                path,
+                LockEntry { writer, readers, acquired_at, ttl_seconds: row.ttl_seconds },
+            );
+        }
+        tracing::info!("restored {} borrow lock(s) from SQLite", locks.len());
+        Ok(())
     }
 
     // ── Observability ─────────────────────────────────────────────────────

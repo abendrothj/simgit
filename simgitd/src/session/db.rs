@@ -139,6 +139,61 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Upsert a lock row (called on every `acquire_read` / `acquire_write`).
+    ///
+    /// `reader_sessions_json` must be a JSON array of UUID strings, e.g. `["uuid1","uuid2"]`.
+    pub fn upsert_lock(
+        &self,
+        path: &str,
+        writer_session: Option<&str>,
+        reader_sessions_json: &str,
+        acquired_at: i64,
+        ttl_seconds: Option<u64>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"INSERT INTO locks (path, writer_session, reader_sessions, acquired_at, ttl_seconds)
+               VALUES (?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(path) DO UPDATE SET
+                 writer_session  = excluded.writer_session,
+                 reader_sessions = excluded.reader_sessions,
+                 acquired_at     = excluded.acquired_at,
+                 ttl_seconds     = excluded.ttl_seconds"#,
+            params![
+                path,
+                writer_session,
+                reader_sessions_json,
+                acquired_at,
+                ttl_seconds.map(|t| t as i64),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete a lock row for `path` (called when the entry becomes empty after release).
+    pub fn delete_lock(&self, path: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM locks WHERE path=?1", params![path])?;
+        Ok(())
+    }
+
+    /// Load all persisted lock rows (called on daemon startup to restore in-memory state).
+    pub fn load_all_locks(&self) -> Result<Vec<LockRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, writer_session, reader_sessions, acquired_at, ttl_seconds FROM locks",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(LockRow {
+                    path:                 row.get(0)?,
+                    writer_session:       row.get(1)?,
+                    reader_sessions_json: row.get(2)?,
+                    acquired_at:          row.get(3)?,
+                    ttl_seconds:          row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 // ── Raw DB row ────────────────────────────────────────────────────────────────
@@ -168,4 +223,16 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
         branch_name:  row.get(7)?,
         peers_enabled: row.get::<_, i64>(8)? != 0,
     })
+}
+
+/// A single row from the `locks` table.
+#[derive(Debug, Clone)]
+pub struct LockRow {
+    pub path:                String,
+    pub writer_session:      Option<String>,
+    /// Raw JSON string from `reader_sessions` column (e.g. `["uuid1","uuid2"]`).
+    /// Callers should parse this with serde_json and handle errors explicitly.
+    pub reader_sessions_json: String,
+    pub acquired_at:          i64,
+    pub ttl_seconds:          Option<u64>,
 }

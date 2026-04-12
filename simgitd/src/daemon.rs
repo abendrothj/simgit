@@ -175,6 +175,8 @@ pub async fn run(cfg: Config) -> Result<()> {
     // Initialise subsystems.
     let sessions = Arc::new(SessionManager::open(&db_path).await?);
     let borrows  = Arc::new(BorrowRegistry::new(Arc::clone(&sessions)));
+    // Restore borrow locks that were held when the daemon previously shut down or crashed.
+    borrows.restore_locks().context("restore borrow locks from SQLite")?;
     let deltas   = Arc::new(DeltaStore::new(cfg.state_dir.join("deltas")));
     let events   = Arc::new(EventBroker::new());
     let vfs      = Arc::new(VfsManager::new(
