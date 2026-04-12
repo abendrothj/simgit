@@ -419,7 +419,8 @@ Execution checkoff (updated 2026-04-12):
   - [x] Phase 3 completed (control-plane conflict semantics and lock observability)
   - [~] Phase 4 in progress
     - [x] pre-commit overlap detection across active sessions in `session.commit`
-    - [ ] broaden commit/flatten conflict tests to multi-session integration scenarios
+    - [x] multi-session integration coverage for overlap block + non-overlap success in `session.commit`
+    - [ ] deepen flatten conflict-path reporting and failure taxonomy
   - [ ] Phase 5 pending
   - [ ] Phase 6 pending
   - [~] Phase 7 started opportunistically (continuous docs/tests hardening)

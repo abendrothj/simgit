@@ -453,8 +453,19 @@ fn resolve_head(repo: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{changed_paths_set, diff_bytes_for_path, overlap_paths};
+    use super::session_commit;
+    use crate::borrow::BorrowRegistry;
+    use crate::config::{Config, VfsBackend};
+    use crate::daemon::AppState;
     use crate::delta::store::DeltaManifest;
+    use crate::delta::DeltaStore;
+    use crate::events::EventBroker;
+    use crate::session::SessionManager;
+    use crate::vfs::VfsManager;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn unified_diff_for_modified_file_contains_hunk() {
@@ -523,5 +534,201 @@ mod tests {
 
         let overlap = overlap_paths(&a, &b);
         assert_eq!(overlap, vec![std::path::PathBuf::from("y.txt")]);
+    }
+
+    static TEST_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_state_root() -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let seq = TEST_STATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "simgit-rpc-commit-test-{}-{}-{}",
+            std::process::id(),
+            nanos,
+            seq
+        ))
+    }
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .status()
+            .expect("git command should execute");
+        assert!(status.success(), "git {:?} failed", args);
+    }
+
+    fn init_repo(root: &std::path::Path) -> std::path::PathBuf {
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.email", "tests@simgit.local"]);
+        run_git(&repo, &["config", "user.name", "simgit-tests"]);
+        std::fs::write(repo.join("README.md"), b"base\n").expect("write readme");
+        std::fs::write(repo.join("src.txt"), b"base-src\n").expect("write src");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "init"]);
+        repo
+    }
+
+    async fn build_state_for_commit_tests() -> (Arc<AppState>, std::path::PathBuf) {
+        let root = temp_state_root();
+        let repo = init_repo(&root);
+        let state_dir = root.join("state");
+        let mnt_dir = state_dir.join("mnt");
+        std::fs::create_dir_all(&mnt_dir).expect("create mnt");
+
+        let cfg = Arc::new(Config {
+            repo_path: repo.clone(),
+            state_dir: state_dir.clone(),
+            mnt_dir,
+            max_sessions: 8,
+            max_delta_bytes: 2 * 1024 * 1024,
+            lock_ttl_seconds: 3600,
+            vfs_backend: VfsBackend::NfsLoopback,
+        });
+
+        let db_path = state_dir.join("state.db");
+        let sessions = Arc::new(SessionManager::open(&db_path).await.expect("open sessions"));
+        let borrows = Arc::new(BorrowRegistry::new(Arc::clone(&sessions)));
+        let deltas = Arc::new(DeltaStore::new(state_dir.join("deltas")));
+        let events = Arc::new(EventBroker::new());
+        let vfs = Arc::new(VfsManager::new(
+            Arc::clone(&cfg),
+            Arc::clone(&deltas),
+            Arc::clone(&borrows),
+        ));
+
+        let state = Arc::new(AppState {
+            config: cfg,
+            sessions,
+            borrows,
+            deltas,
+            events,
+            vfs,
+        });
+        (state, root)
+    }
+
+    #[tokio::test]
+    async fn session_commit_blocks_on_overlap_with_active_peer() {
+        let (state, root) = build_state_for_commit_tests().await;
+
+        let s1 = state
+            .sessions
+            .create(
+                "task-1".to_owned(),
+                Some("agent-1".to_owned()),
+                "HEAD".to_owned(),
+                state.config.mnt_dir.join("s1"),
+                false,
+                8,
+            )
+            .expect("create s1");
+        state
+            .deltas
+            .init_session(s1.session_id, &s1.base_commit)
+            .expect("init s1 delta");
+        state
+            .deltas
+            .write_blob(s1.session_id, Path::new("README.md"), b"change-1\n")
+            .expect("write s1 blob");
+
+        let s2 = state
+            .sessions
+            .create(
+                "task-2".to_owned(),
+                Some("agent-2".to_owned()),
+                "HEAD".to_owned(),
+                state.config.mnt_dir.join("s2"),
+                false,
+                8,
+            )
+            .expect("create s2");
+        state
+            .deltas
+            .init_session(s2.session_id, &s2.base_commit)
+            .expect("init s2 delta");
+        state
+            .deltas
+            .write_blob(s2.session_id, Path::new("README.md"), b"change-2\n")
+            .expect("write s2 blob");
+
+        let res = session_commit(&state, serde_json::json!({
+            "session_id": s1.session_id,
+            "branch_name": "feat/overlap",
+            "message": "overlap",
+        }))
+        .await;
+
+        assert!(res.is_err(), "overlap commit should be blocked");
+        let err = res.expect_err("must fail");
+        assert_eq!(err.code, simgit_sdk::ERR_MERGE_CONFLICT);
+        let data = err.data.expect("conflict payload");
+        let conflicts = data["conflicts"].as_array().expect("conflicts array");
+        assert!(!conflicts.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_commit_succeeds_for_non_overlapping_paths() {
+        let (state, root) = build_state_for_commit_tests().await;
+
+        let s1 = state
+            .sessions
+            .create(
+                "task-a".to_owned(),
+                Some("agent-a".to_owned()),
+                "HEAD".to_owned(),
+                state.config.mnt_dir.join("sa"),
+                false,
+                8,
+            )
+            .expect("create s1");
+        state
+            .deltas
+            .init_session(s1.session_id, &s1.base_commit)
+            .expect("init s1 delta");
+        state
+            .deltas
+            .write_blob(s1.session_id, Path::new("README.md"), b"change-a\n")
+            .expect("write s1 blob");
+
+        let s2 = state
+            .sessions
+            .create(
+                "task-b".to_owned(),
+                Some("agent-b".to_owned()),
+                "HEAD".to_owned(),
+                state.config.mnt_dir.join("sb"),
+                false,
+                8,
+            )
+            .expect("create s2");
+        state
+            .deltas
+            .init_session(s2.session_id, &s2.base_commit)
+            .expect("init s2 delta");
+        state
+            .deltas
+            .write_blob(s2.session_id, Path::new("src.txt"), b"change-b\n")
+            .expect("write s2 blob");
+
+        let res = session_commit(&state, serde_json::json!({
+            "session_id": s1.session_id,
+            "branch_name": "feat/non-overlap",
+            "message": "non-overlap",
+        }))
+        .await;
+
+        assert!(res.is_ok(), "non-overlap commit should succeed");
+        let updated = state.sessions.get(s1.session_id).expect("s1 exists");
+        assert_eq!(updated.status, simgit_sdk::SessionStatus::Committed);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

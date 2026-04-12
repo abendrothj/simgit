@@ -232,6 +232,7 @@ cargo test --workspace
 - Status: 🚧 In progress
 - Implemented highlights:
     - pre-commit overlap detection across active sessions in `session.commit`
+    - multi-session commit tests for overlap-block and non-overlap success
 
 ### Phase 5: CLI & SDK (1 week)
 - All 9 `sg` subcommands
