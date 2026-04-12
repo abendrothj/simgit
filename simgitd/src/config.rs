@@ -1,6 +1,74 @@
+//! Daemon configuration — loaded from environment and defaults.
+//!
+//! # Overview
+//!
+//! Centralizes all daemon configuration options:
+//! - Repository location (git workspace to serve)
+//! - State directory (SQLite database, delta blobs, sockets)
+//! - Session limits and quotas
+//! - VFS backend selection (FUSE vs. NFS-loopback)
+//!
+//! # Configuration Sources
+//!
+//! Priority (high to low):
+//! 1. Environment variables (`SIMGIT_REPO`, `SIMGIT_STATE_DIR`)
+//! 2. XDG_STATE_HOME (`$XDG_STATE_HOME/simgit` on Linux)
+//! 3. Home directory (`~/.local/state/simgit` on Linux, macOS)
+//! 4. Hardcoded defaults (repo = cwd, max_sessions = 256, etc.)
+//!
+//! # Example
+//!
+//! ```bash
+//! export SIMGIT_REPO=/home/alice/myproject
+//! export SIMGIT_STATE_DIR=/var/lib/simgit
+//! simgitd
+//! ```
+//!
+//! # Directory Structure
+//!
+//! ```text\n//! $state_dir/\n//!   ├── db.sqlite         (sessions, locks, metadata)\n//!   ├── blobs/             (delta content-addressed storage)\n//!   │   └── <hash>/\n//!   ├── mnt/               (session mount points)\n//!   │   ├── <session-id>/\n//!   │   └── <session-id>/\n//!   └── simgitd.sock      (control socket)\n//! ```
+//!
+//! # Phase Roadmap
+//!
+//! - **Phase 0**: Environment variables + hardcoded defaults
+//! - **Phase 1**: Read `simgit.toml` from repo root (custom limits, git auth)
+//! - **Phase 2+**: Config file schema versioning, reload on SIGHUP
+//!
+//! # Security
+//!
+//! - `repo_path` must be readable by daemon user
+//! - `state_dir` must be writable and mode 0700 (prevent other users from accessing blobs/sockets)
+//! - `mnt_dir` is mode 0755 (per session mounts are 0700)
+
 use std::path::PathBuf;
 use anyhow::{Context, Result};
 
+/// Daemon configuration.
+///
+/// # Fields
+///
+/// - **repo_path**: Absolute path to git repository (canonicalized).
+///   Must be a valid git repo with `HEAD` commit resolvable.
+/// - **state_dir**: Daemon state directory (SQLite, blobs, sockets, mounts).
+///   Created on first run; should be mode 0700.
+/// - **mnt_dir**: Subdirectory of state_dir where agent mounts are created.
+///   Each session gets a subdirectory.
+/// - **max_sessions**: Maximum concurrent ACTIVE sessions (soft limit; enforced
+///   by RPC `session.create()` when capacity exceeded).
+/// - **max_delta_bytes**: Maximum bytes of delta writes per session (soft limit;
+///   enforced by delta store write path). Default 2 GiB.
+/// - **lock_ttl_seconds**: Default TTL for write locks (seconds). 0 = no TTL
+///   (locks never auto-expire). Default 3600 (1 hour).
+/// - **vfs_backend**: Backend VFS implementation (platform-specific selection).
+///
+/// # Example
+///
+/// ```ignore
+/// let cfg = Config::load()?;
+/// println!("Repo: {}", cfg.repo_path.display());
+/// println!("State: {}", cfg.state_dir.display());
+/// println!("VFS Backend: {:?}", cfg.vfs_backend);
+/// ```
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Absolute path to the git repository root.
@@ -28,15 +96,53 @@ pub struct Config {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VfsBackend {
-    /// FUSE (Linux) — uses `fuser` crate.
+    /// FUSE (Linux primary).
+    ///
+    /// Uses the `fuser` crate to handle filesystem requests.
+    /// Requires FUSE kernel module loaded (present on all Linux distros).
+    /// No kernel extension or user approval needed.
+    ///
+    /// See [crate::vfs::fuse_backend].
     Fuse,
-    /// NFS loopback (macOS) — embedded NFSv3 server, no kernel extension.
+
+    /// NFS-loopback (macOS Phase 0, stub; Phase 1+, full NFSv3 server).
+    ///
+    /// Phase 0: Creates plain directories (no kernel involvement).
+    /// Phase 1+: Embeds an NFSv3 RPC server to avoid macFUSE kernel extension.
+    ///
+    /// See [crate::vfs::nfs_backend].
     NfsLoopback,
 }
 
 impl Config {
     /// Load configuration from environment variables and defaults.
-    /// In a future phase this will also read a `simgit.toml` from the repo.
+    ///
+    /// # Environment Variables
+    ///
+    /// - `SIMGIT_REPO`: Path to git repository (defaults to cwd)
+    /// - `SIMGIT_STATE_DIR`: State directory (defaults to `$XDG_STATE_HOME/simgit`)
+    ///
+    /// # VFS Backend Selection
+    ///
+    /// Auto-detected by platform:
+    /// - Linux: FUSE
+    /// - macOS: NFS-loopback
+    /// - Other: FUSE (requires user configuration)
+    ///
+    /// # Returns
+    ///
+    /// Fully initialized `Config` struct with canonicalized paths.
+    ///
+    /// # Errors
+    ///
+    /// - Repository path not found or not readable
+    /// - Repository path is not a valid git repository
+    /// - Cannot determine state directory
+    ///
+    /// # Future
+    ///
+    /// Phase 1 will also read a `simgit.toml` config file from repo root,
+    /// allowing per-repo overrides (git auth, cache sizes, etc.).
     pub fn load() -> Result<Self> {
         let repo_path = std::env::var("SIMGIT_REPO")
             .map(PathBuf::from)
