@@ -177,7 +177,11 @@ pub async fn run(cfg: Config) -> Result<()> {
     let borrows  = Arc::new(BorrowRegistry::new(Arc::clone(&sessions)));
     let deltas   = Arc::new(DeltaStore::new(cfg.state_dir.join("deltas")));
     let events   = Arc::new(EventBroker::new());
-    let vfs      = Arc::new(VfsManager::new(Arc::clone(&cfg)));
+    let vfs      = Arc::new(VfsManager::new(
+        Arc::clone(&cfg),
+        Arc::clone(&deltas),
+        Arc::clone(&borrows),
+    ));
 
     let state = AppState { config: Arc::clone(&cfg), sessions, borrows, deltas, events, vfs };
 

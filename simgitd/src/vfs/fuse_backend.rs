@@ -68,7 +68,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use anyhow::Result;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyOpen, Request,
+    LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
+    ReplyOpen, ReplyWrite, Request, WriteFlags,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -76,6 +77,8 @@ use uuid::Uuid;
 use simgit_sdk::SessionInfo;
 
 use crate::config::Config;
+use crate::borrow::BorrowRegistry;
+use crate::delta::DeltaStore;
 use super::git_resolver::{TreeCache, BlobCache, InodeMap};
 
 /// FUSE backend driver (Linux).
@@ -84,6 +87,8 @@ use super::git_resolver::{TreeCache, BlobCache, InodeMap};
 /// One instance per daemon; spawns a SessionFs handler per session.
 pub struct FuseBackend {
     cfg: Arc<Config>,
+    deltas: Arc<DeltaStore>,
+    borrows: Arc<BorrowRegistry>,
 }
 
 impl FuseBackend {
@@ -92,8 +97,8 @@ impl FuseBackend {
     /// # Arguments
     ///
     /// - `cfg`: Daemon configuration (mount options, cache sizes, git repo path)
-    pub fn new(cfg: Arc<Config>) -> Self {
-        Self { cfg }
+    pub fn new(cfg: Arc<Config>, deltas: Arc<DeltaStore>, borrows: Arc<BorrowRegistry>) -> Self {
+        Self { cfg, deltas, borrows }
     }
 }
 
@@ -107,11 +112,12 @@ impl super::VfsBackendTrait for FuseBackend {
             session.session_id,
             Arc::clone(&self.cfg),
             session.base_commit.clone(),
+            Arc::clone(&self.deltas),
+            Arc::clone(&self.borrows),
         );
 
         let mut config = fuser::Config::default();
         config.mount_options = vec![
-            MountOption::RO,
             MountOption::FSName(format!("simgit-{}", session.session_id)),
         ];
 
@@ -206,6 +212,8 @@ struct SessionFs {
     session_id:   Uuid,
     cfg:          Arc<Config>,
     base_commit:  String,
+    deltas:       Arc<DeltaStore>,
+    borrows:      Arc<BorrowRegistry>,
     tree_cache:   Arc<TreeCache>,
     blob_cache:   Arc<BlobCache>,
     inode_map:    Arc<InodeMap>,
@@ -225,11 +233,19 @@ impl SessionFs {
     /// - `cfg`: Daemon configuration
     /// - `base_commit`: Git commit hash to serve as read-only tree (e.g., HEAD)
     /// - `repo`: Open git repository handle
-    fn new(session_id: Uuid, cfg: Arc<Config>, base_commit: String) -> Self {
+    fn new(
+        session_id: Uuid,
+        cfg: Arc<Config>,
+        base_commit: String,
+        deltas: Arc<DeltaStore>,
+        borrows: Arc<BorrowRegistry>,
+    ) -> Self {
         Self {
             session_id,
             cfg,
             base_commit,
+            deltas,
+            borrows,
             tree_cache:   Arc::new(TreeCache::new(100)),
             blob_cache:   Arc::new(BlobCache::new(50, 10 * 1024 * 1024)), // 50 blobs, 10MB cap
             inode_map:    Arc::new(InodeMap::new()),
@@ -421,11 +437,28 @@ impl Filesystem for SessionFs {
         }
 
         let offset = offset as usize;
-        let data = match self.blob_cache.get(&entry.oid, &self.cfg.repo_path) {
-            Ok(d) => d,
-            Err(_) => {
-                reply.error(Errno::EIO);
-                return;
+        let data = if let Some(path) = self.inode_map.path_of(ino.0) {
+            match self.deltas.read_blob(self.session_id, &path) {
+                Ok(Some(delta_bytes)) => delta_bytes,
+                Ok(None) => match self.blob_cache.get(&entry.oid, &self.cfg.repo_path) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                },
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            }
+        } else {
+            match self.blob_cache.get(&entry.oid, &self.cfg.repo_path) {
+                Ok(d) => d,
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
             }
         };
 
@@ -490,6 +523,71 @@ impl Filesystem for SessionFs {
             Err(DirTreeError::NotFound) => reply.error(Errno::ENOENT),
             Err(DirTreeError::Io) => reply.error(Errno::EIO),
         }
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        if ino.0 == 1 {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+
+        let Some(entry) = lookup_entry_for_ino(ino.0, &self.cfg.repo_path, &self.tree_cache, &self.inode_map) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if entry.kind == super::git_resolver::EntryKind::Dir {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+
+        let Some(path) = self.inode_map.path_of(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        if self
+            .borrows
+            .acquire_write(self.session_id, &path, Some(self.cfg.lock_ttl_seconds))
+            .is_err()
+        {
+            reply.error(Errno::EBUSY);
+            return;
+        }
+
+        let mut current = match self.deltas.read_blob(self.session_id, &path) {
+            Ok(Some(delta_bytes)) => delta_bytes,
+            Ok(None) => match self.blob_cache.get(&entry.oid, &self.cfg.repo_path) {
+                Ok(b) => b,
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            },
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        apply_write_at_offset(&mut current, offset as usize, data);
+
+        if self.deltas.write_blob(self.session_id, &path, &current).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        reply.written(data.len().min(u32::MAX as usize) as u32);
     }
 }
 
@@ -560,6 +658,17 @@ fn file_slice(data: &[u8], offset: usize, size: usize) -> &[u8] {
     &data[offset..end]
 }
 
+fn apply_write_at_offset(buf: &mut Vec<u8>, offset: usize, data: &[u8]) {
+    if buf.len() < offset {
+        buf.resize(offset, 0);
+    }
+    let end = offset.saturating_add(data.len());
+    if buf.len() < end {
+        buf.resize(end, 0);
+    }
+    buf[offset..end].copy_from_slice(data);
+}
+
 fn entry_kind_to_file_type(kind: super::git_resolver::EntryKind) -> FileType {
     match kind {
         super::git_resolver::EntryKind::File => FileType::RegularFile,
@@ -610,7 +719,7 @@ fn root_attr() -> FileAttr {
 
 #[cfg(test)]
 mod tests {
-    use super::file_slice;
+    use super::{apply_write_at_offset, file_slice};
 
     #[test]
     fn file_slice_within_bounds() {
@@ -628,5 +737,19 @@ mod tests {
     fn file_slice_truncates_to_end() {
         let data = b"abcdef";
         assert_eq!(file_slice(data, 4, 10), b"ef");
+    }
+
+    #[test]
+    fn apply_write_in_middle() {
+        let mut data = b"abcdef".to_vec();
+        apply_write_at_offset(&mut data, 2, b"ZZ");
+        assert_eq!(data, b"abZZef");
+    }
+
+    #[test]
+    fn apply_write_extends_with_zeros() {
+        let mut data = b"abc".to_vec();
+        apply_write_at_offset(&mut data, 5, b"xy");
+        assert_eq!(data, b"abc\0\0xy");
     }
 }

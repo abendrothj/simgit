@@ -103,6 +103,8 @@ use uuid::Uuid;
 use simgit_sdk::SessionInfo;
 
 use crate::config::{Config, VfsBackend};
+use crate::borrow::BorrowRegistry;
+use crate::delta::DeltaStore;
 
 mod fuse_backend;
 mod git_resolver;
@@ -186,9 +188,9 @@ impl VfsManager {
     /// # Panics
     ///
     /// None. Backend instantiation is always fallible via async mount calls.
-    pub fn new(cfg: Arc<Config>) -> Self {
+    pub fn new(cfg: Arc<Config>, deltas: Arc<DeltaStore>, borrows: Arc<BorrowRegistry>) -> Self {
         let backend: Box<dyn VfsBackendTrait> = match cfg.vfs_backend {
-            VfsBackend::Fuse        => Box::new(fuse_backend::FuseBackend::new(cfg)),
+            VfsBackend::Fuse        => Box::new(fuse_backend::FuseBackend::new(cfg, deltas, borrows)),
             VfsBackend::NfsLoopback => Box::new(nfs_backend::NfsLoopbackBackend::new(cfg)),
         };
         Self { backend, mounted: Mutex::new(HashMap::new()) }
