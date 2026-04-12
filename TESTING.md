@@ -313,6 +313,7 @@ jobs:
 - Add RPC method tests (all 7 methods)
 - Current status:
     - Delta-aware VFS unit tests cover write offset behavior and path utilities in `vfs::fuse_backend`.
+    - Synthetic inode mapping tests cover delta-only file metadata flow in `vfs::git_resolver`.
     - RPC diff regression tests for add/modify/delete are green.
     - Next target is integration tests for `unlink`/`rename`/`create` flows through mounted sessions.
 

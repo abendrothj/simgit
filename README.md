@@ -205,9 +205,10 @@ cargo test --workspace
 - Status: 🚧 In progress
 - Implemented so far:
     - Existing-file `write` interception into session delta blobs
+    - `create` interception for new files into session delta blobs
     - `unlink` and `rename` capture via delta manifest tombstones/renames
     - Tombstone-aware visibility in `lookup`, `readdir`, `getattr`, `open`, and `read`
-    - Outstanding in this phase: `create` interception and richer metadata updates for synthetic entries
+    - Outstanding in this phase: richer metadata updates and crash-recovery validation for delta sessions
 
 ### Phase 3: Borrow Checker (2 weeks)
 - Lock acquisition at session creation

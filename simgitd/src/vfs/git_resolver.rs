@@ -377,6 +377,7 @@ impl BlobCache {
 pub struct InodeMap {
     // inode → metadata for lookup/getattr/readdir/read/write routing.
     map: Mutex<HashMap<u64, InodeEntry>>,
+    delta_files: Mutex<HashMap<u64, DeltaInodeFile>>,
     next_ino: Mutex<u64>,
 }
 
@@ -385,6 +386,13 @@ struct InodeEntry {
     tree_oid: String,
     entry_idx: usize,
     path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeltaInodeFile {
+    pub path: PathBuf,
+    pub size: u64,
+    pub perm: u16,
 }
 
 impl InodeMap {
@@ -398,6 +406,7 @@ impl InodeMap {
         });
         Self {
             map: Mutex::new(m),
+            delta_files: Mutex::new(HashMap::new()),
             next_ino: Mutex::new(2),
         }
     }
@@ -410,11 +419,17 @@ impl InodeMap {
     }
 
     pub fn insert(&self, ino: u64, tree_oid: String, entry_idx: usize, path: PathBuf) {
+        self.delta_files.lock().unwrap().remove(&ino);
         self.map.lock().unwrap().insert(ino, InodeEntry {
             tree_oid,
             entry_idx,
             path,
         });
+    }
+
+    pub fn insert_delta_file(&self, ino: u64, path: PathBuf, size: u64, perm: u16) {
+        self.map.lock().unwrap().remove(&ino);
+        self.delta_files.lock().unwrap().insert(ino, DeltaInodeFile { path, size, perm });
     }
 
     pub fn lookup(&self, ino: u64) -> Option<(String, usize)> {
@@ -425,14 +440,27 @@ impl InodeMap {
             .map(|e| (e.tree_oid.clone(), e.entry_idx))
     }
 
+    pub fn delta_file_of(&self, ino: u64) -> Option<DeltaInodeFile> {
+        self.delta_files.lock().unwrap().get(&ino).cloned()
+    }
+
+    pub fn update_delta_size(&self, ino: u64, size: u64) {
+        if let Some(meta) = self.delta_files.lock().unwrap().get_mut(&ino) {
+            meta.size = size;
+        }
+    }
+
     pub fn path_of(&self, ino: u64) -> Option<PathBuf> {
-        self.map.lock().unwrap().get(&ino).map(|e| e.path.clone())
+        if let Some(p) = self.map.lock().unwrap().get(&ino).map(|e| e.path.clone()) {
+            return Some(p);
+        }
+        self.delta_files.lock().unwrap().get(&ino).map(|e| e.path.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobCache, EntryKind, TreeCache};
+    use super::{BlobCache, EntryKind, InodeMap, TreeCache};
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -624,6 +652,23 @@ mod tests {
         assert_eq!(bytes, binary);
 
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn inode_map_supports_delta_file_entries() {
+        let map = InodeMap::new();
+        let ino = map.allocate();
+        map.insert_delta_file(ino, PathBuf::from("new.txt"), 12, 0o100644);
+
+        let p = map.path_of(ino).expect("delta path should resolve");
+        assert_eq!(p, PathBuf::from("new.txt"));
+
+        let meta = map.delta_file_of(ino).expect("delta meta should exist");
+        assert_eq!(meta.size, 12);
+
+        map.update_delta_size(ino, 42);
+        let meta2 = map.delta_file_of(ino).expect("delta meta should still exist");
+        assert_eq!(meta2.size, 42);
     }
 }
 

@@ -64,6 +64,7 @@
 //! FUSE is Linux-native. macOS support uses NFS-loopback (see [nfs_backend]).
 
 use std::ffi::OsStr;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
@@ -72,7 +73,7 @@ use anyhow::Result;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
     LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, WriteFlags,
+    ReplyCreate, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, WriteFlags,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -324,6 +325,29 @@ impl Filesystem for SessionFs {
             }
         }
 
+        let full_path = parent_path.join(name_str);
+        if let Some(hash) = manifest.writes.get(&full_path) {
+            let size = self
+                .deltas
+                .read_blob(self.session_id, &full_path)
+                .ok()
+                .flatten()
+                .map(|b| b.len() as u64)
+                .unwrap_or(0);
+            let ino = self.inode_map.allocate();
+            self.inode_map.insert_delta_file(ino, full_path, size, 0o100644);
+            let entry = super::git_resolver::TreeEntry {
+                name: name_str.to_owned(),
+                mode: "100644".to_owned(),
+                oid: hash.clone(),
+                kind: super::git_resolver::EntryKind::File,
+                size,
+                perm: 0o100644,
+            };
+            reply.entry(&TTL, &entry_attr(INodeNo(ino), &entry), Generation(0));
+            return;
+        }
+
         reply.error(Errno::ENOENT);
     }
 
@@ -331,6 +355,28 @@ impl Filesystem for SessionFs {
         if ino.0 == 1 {
             // Root directory.
             reply.attr(&TTL, &root_attr());
+            return;
+        }
+
+        if let Some(meta) = self.inode_map.delta_file_of(ino.0) {
+            if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(true) {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            let entry = super::git_resolver::TreeEntry {
+                name: meta
+                    .path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                mode: "100644".to_owned(),
+                oid: String::new(),
+                kind: super::git_resolver::EntryKind::File,
+                size: meta.size,
+                perm: meta.perm,
+            };
+            reply.attr(&TTL, &entry_attr(ino, &entry));
             return;
         }
 
@@ -436,6 +482,30 @@ impl Filesystem for SessionFs {
             ));
         }
 
+        let mut seen_names: HashSet<String> = tree_entries.iter().map(|e| e.name.clone()).collect();
+        for path in manifest.writes.keys() {
+            if !path_starts_with_dir(path, &parent_path) {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if seen_names.contains(file_name) || manifest.deletes.contains(path) {
+                continue;
+            }
+            let size = self
+                .deltas
+                .read_blob(self.session_id, path)
+                .ok()
+                .flatten()
+                .map(|b| b.len() as u64)
+                .unwrap_or(0);
+            let ino = self.inode_map.allocate();
+            self.inode_map.insert_delta_file(ino, path.clone(), size, 0o100644);
+            entries.push((ino, FileType::RegularFile, file_name.to_owned()));
+            seen_names.insert(file_name.to_owned());
+        }
+
         // Yield entries starting from offset.
         for (i, (ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
             if reply.add(INodeNo(*ino), (i + 1) as u64, *kind, name) {
@@ -458,6 +528,27 @@ impl Filesystem for SessionFs {
     ) {
         if ino.0 == 1 {
             reply.error(Errno::EISDIR);
+            return;
+        }
+
+        if let Some(meta) = self.inode_map.delta_file_of(ino.0) {
+            if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(true) {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            let data = match self.deltas.read_blob(self.session_id, &meta.path) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+            let slice = file_slice(&data, offset as usize, size as usize);
+            reply.data(slice);
             return;
         }
 
@@ -532,6 +623,16 @@ impl Filesystem for SessionFs {
             reply.error(Errno::EISDIR);
             return;
         }
+
+        if let Some(meta) = self.inode_map.delta_file_of(ino.0) {
+            if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(true) {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            reply.opened(FileHandle(0), FopenFlags::empty());
+            return;
+        }
+
         let Some(entry) = lookup_entry_for_ino(ino.0, &self.cfg.repo_path, &self.tree_cache, &self.inode_map) else {
             reply.error(Errno::ENOENT);
             return;
@@ -567,6 +668,103 @@ impl Filesystem for SessionFs {
         }
     }
 
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let Some(name_str) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+
+        match directory_tree_oid_for_ino(
+            parent.0,
+            &self.base_commit,
+            &self.cfg.repo_path,
+            &self.tree_cache,
+            &self.inode_map,
+        ) {
+            Ok(_) => {}
+            Err(DirTreeError::NotDir) => {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+            Err(DirTreeError::NotFound) => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Err(DirTreeError::Io) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+
+        let Some(path) = full_child_path(parent.0, name_str, &self.inode_map) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        let manifest = match self.deltas.load_manifest(self.session_id) {
+            Ok(m) => m,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        if !manifest.deletes.contains(&path) && manifest.writes.contains_key(&path) {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+
+        if !manifest.deletes.contains(&path)
+            && git_entry_exists_in_parent(
+                &self.cfg.repo_path,
+                &self.tree_cache,
+                &self.base_commit,
+                &self.inode_map,
+                parent.0,
+                name_str,
+            )
+            .unwrap_or(false)
+        {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+
+        if self
+            .borrows
+            .acquire_write(self.session_id, &path, Some(self.cfg.lock_ttl_seconds))
+            .is_err()
+        {
+            reply.error(Errno::EBUSY);
+            return;
+        }
+
+        if self.deltas.write_blob(self.session_id, &path, &[]).is_err() {
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        let ino = self.inode_map.allocate();
+        let perm = ((mode as u16) & 0o7777) | 0o100000;
+        self.inode_map.insert_delta_file(ino, path.clone(), 0, perm);
+        let entry = super::git_resolver::TreeEntry {
+            name: name_str.to_owned(),
+            mode: format!("{:o}", perm),
+            oid: String::new(),
+            kind: super::git_resolver::EntryKind::File,
+            size: 0,
+            perm,
+        };
+        reply.created(&TTL, &entry_attr(INodeNo(ino), &entry), Generation(0), FileHandle(0), FopenFlags::empty());
+    }
+
     fn write(
         &self,
         _req: &Request,
@@ -581,6 +779,36 @@ impl Filesystem for SessionFs {
     ) {
         if ino.0 == 1 {
             reply.error(Errno::EISDIR);
+            return;
+        }
+
+        if let Some(meta) = self.inode_map.delta_file_of(ino.0) {
+            if self
+                .borrows
+                .acquire_write(self.session_id, &meta.path, Some(self.cfg.lock_ttl_seconds))
+                .is_err()
+            {
+                reply.error(Errno::EBUSY);
+                return;
+            }
+
+            let mut current = match self.deltas.read_blob(self.session_id, &meta.path) {
+                Ok(Some(delta_bytes)) => delta_bytes,
+                Ok(None) => Vec::new(),
+                Err(_) => {
+                    reply.error(Errno::EIO);
+                    return;
+                }
+            };
+
+            apply_write_at_offset(&mut current, offset as usize, data);
+
+            if self.deltas.write_blob(self.session_id, &meta.path, &current).is_err() {
+                reply.error(Errno::EIO);
+                return;
+            }
+            self.inode_map.update_delta_size(ino.0, current.len() as u64);
+            reply.written(data.len().min(u32::MAX as usize) as u32);
             return;
         }
 
@@ -628,6 +856,7 @@ impl Filesystem for SessionFs {
             reply.error(Errno::EIO);
             return;
         }
+        self.inode_map.update_delta_size(ino.0, current.len() as u64);
 
         reply.written(data.len().min(u32::MAX as usize) as u32);
     }
@@ -642,6 +871,16 @@ impl Filesystem for SessionFs {
             reply.error(Errno::ENOENT);
             return;
         };
+
+        let manifest = match self.deltas.load_manifest(self.session_id) {
+            Ok(m) => m,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        let mut exists_as_file = manifest.writes.contains_key(&path) && !manifest.deletes.contains(&path);
 
         let parent_tree_oid = match directory_tree_oid_for_ino(
             parent.0,
@@ -672,12 +911,18 @@ impl Filesystem for SessionFs {
                 return;
             }
         };
-        let Some(entry) = tree_entries.iter().find(|e| e.name == name_str) else {
+        if let Some(entry) = tree_entries.iter().find(|e| e.name == name_str) {
+            if entry.kind == super::git_resolver::EntryKind::Dir {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+            if !manifest.deletes.contains(&path) {
+                exists_as_file = true;
+            }
+        }
+
+        if !exists_as_file {
             reply.error(Errno::ENOENT);
-            return;
-        };
-        if entry.kind == super::git_resolver::EntryKind::Dir {
-            reply.error(Errno::EISDIR);
             return;
         }
 
@@ -758,12 +1003,25 @@ impl Filesystem for SessionFs {
                 return;
             }
         };
-        let Some(entry) = old_parent_entries.iter().find(|e| e.name == old_name) else {
-            reply.error(Errno::ENOENT);
-            return;
+        let manifest = match self.deltas.load_manifest(self.session_id) {
+            Ok(m) => m,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
         };
-        if entry.kind == super::git_resolver::EntryKind::Dir {
-            reply.error(Errno::EISDIR);
+
+        let git_entry = old_parent_entries.iter().find(|e| e.name == old_name);
+        if let Some(entry) = git_entry {
+            if entry.kind == super::git_resolver::EntryKind::Dir {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+        }
+        let exists_in_manifest = manifest.writes.contains_key(&old_path) && !manifest.deletes.contains(&old_path);
+        let exists_in_git = git_entry.is_some() && !manifest.deletes.contains(&old_path);
+        if !exists_in_manifest && !exists_in_git {
+            reply.error(Errno::ENOENT);
             return;
         }
 
@@ -808,10 +1066,16 @@ impl Filesystem for SessionFs {
 
         let source_data = match self.deltas.read_blob(self.session_id, &old_path) {
             Ok(Some(delta_bytes)) => delta_bytes,
-            Ok(None) => match self.blob_cache.get(&entry.oid, &self.cfg.repo_path) {
-                Ok(d) => d,
-                Err(_) => {
-                    reply.error(Errno::EIO);
+            Ok(None) => match git_entry {
+                Some(entry) => match self.blob_cache.get(&entry.oid, &self.cfg.repo_path) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        reply.error(Errno::EIO);
+                        return;
+                    }
+                },
+                None => {
+                    reply.error(Errno::ENOENT);
                     return;
                 }
             },
@@ -928,6 +1192,32 @@ fn delta_path_deleted(deltas: &DeltaStore, session_id: Uuid, path: &std::path::P
     Ok(manifest.deletes.contains(path))
 }
 
+fn path_starts_with_dir(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    if dir.as_os_str().is_empty() {
+        return path.components().count() == 1;
+    }
+    if !path.starts_with(dir) {
+        return false;
+    }
+    let Ok(rest) = path.strip_prefix(dir) else {
+        return false;
+    };
+    rest.components().count() == 1
+}
+
+fn git_entry_exists_in_parent(
+    repo_path: &std::path::Path,
+    tree_cache: &TreeCache,
+    base_commit: &str,
+    inode_map: &InodeMap,
+    parent_ino: u64,
+    name: &str,
+) -> std::result::Result<bool, DirTreeError> {
+    let parent_tree_oid = directory_tree_oid_for_ino(parent_ino, base_commit, repo_path, tree_cache, inode_map)?;
+    let entries = tree_cache.get(&parent_tree_oid, repo_path).map_err(|_| DirTreeError::Io)?;
+    Ok(entries.iter().any(|e| e.name == name))
+}
+
 fn entry_kind_to_file_type(kind: super::git_resolver::EntryKind) -> FileType {
     match kind {
         super::git_resolver::EntryKind::File => FileType::RegularFile,
@@ -978,7 +1268,7 @@ fn root_attr() -> FileAttr {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_write_at_offset, file_slice, full_child_path, InodeMap};
+    use super::{apply_write_at_offset, file_slice, full_child_path, path_starts_with_dir, InodeMap};
     use std::path::PathBuf;
 
     #[test]
@@ -1018,5 +1308,13 @@ mod tests {
         let map = InodeMap::new();
         let p = full_child_path(1, "a.txt", &map).expect("root child path");
         assert_eq!(p, PathBuf::from("a.txt"));
+    }
+
+    #[test]
+    fn path_starts_with_dir_only_direct_children() {
+        assert!(path_starts_with_dir(std::path::Path::new("a.txt"), std::path::Path::new("")));
+        assert!(!path_starts_with_dir(std::path::Path::new("src/main.rs"), std::path::Path::new("")));
+        assert!(path_starts_with_dir(std::path::Path::new("src/main.rs"), std::path::Path::new("src")));
+        assert!(!path_starts_with_dir(std::path::Path::new("src/nested/main.rs"), std::path::Path::new("src")));
     }
 }

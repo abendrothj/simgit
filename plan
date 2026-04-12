@@ -398,6 +398,25 @@ Linux note:
 
 Each phase ends with a shippable, testable artifact.
 
+Execution checkoff (updated 2026-04-12):
+  - [x] Phase 0 completed (spikes + backend decision)
+  - [x] Phase 1 completed for read-only serving (nested traversal, read/readlink, inode mapping)
+  - [~] Phase 2 in progress
+    - [x] session.create/session.abort wiring
+    - [x] delta-backed write interception for existing files
+    - [x] delta-backed unlink/rename handling
+    - [x] delta-backed create syscall path (new files)
+    - [x] tombstone-aware lookup/getattr/readdir/open/read visibility
+    - [ ] crash-recovery mount re-attachment validation for delta sessions
+  - [~] Phase 3 in progress
+    - [x] lock acquisition and TTL sweeper foundations
+    - [x] EBUSY returns on mutating ops during active lock contention
+    - [ ] lock.list/lock.wait full UX and structured conflict payload propagation in VFS path
+  - [ ] Phase 4 pending
+  - [ ] Phase 5 pending
+  - [ ] Phase 6 pending
+  - [~] Phase 7 started opportunistically (continuous docs/tests hardening)
+
 ─────────────────────────────────────────────────────────────────
 PHASE 0 — Foundation & Spike                           [ 2 weeks ]
 ─────────────────────────────────────────────────────────────────
