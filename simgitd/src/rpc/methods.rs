@@ -401,6 +401,16 @@ fn flatten_error_to_rpc(e: FlattenError, session_id: Uuid, branch_name: &str) ->
                 "error": source.to_string(),
             })),
         },
+        FlattenError::PathTraversal { path } => RpcError {
+            code: -32602,
+            message: format!("flatten rejected: unsafe path in delta manifest: {}", path.display()),
+            data: Some(serde_json::json!({
+                "kind": "path_traversal",
+                "session_id": session_id,
+                "branch_name": branch_name,
+                "path": path,
+            })),
+        },
     }
 }
 
@@ -430,9 +440,12 @@ fn diff_bytes_for_path(path: &Path, old: Option<&[u8]>, new: Option<&[u8]>) -> R
             old_file.to_string_lossy().as_ref(),
             new_file.to_string_lossy().as_ref(),
         ])
-        .output()?;
+        .output();
 
+    // Always clean up temp files, regardless of whether the command succeeded.
     let _ = std::fs::remove_dir_all(&tmp);
+
+    let out = out?;
 
     // git diff --no-index exits with:
     // 0 = no differences, 1 = differences found, >1 = actual error.

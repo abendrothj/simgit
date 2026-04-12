@@ -58,7 +58,7 @@
 //!
 //! - **Main task**: Waits for signals (blocks until shutdown)
 //! - **RPC task**: Listens on Unix socket, spawns handler tasks per request
-//! - **TTL sweeper task**: Background cleanup of expired locks (1s interval)
+//! - **TTL sweeper task**: Background cleanup of expired locks (30s interval)
 //! - **FUSE/NFS tasks** (per session): Spawned by VFS backend, die when mount unmounts
 //!
 //! # Graceful Shutdown

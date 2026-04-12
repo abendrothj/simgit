@@ -42,6 +42,27 @@ pub enum FlattenError {
         stderr: String,
         args: Vec<String>,
     },
+    #[error("path traversal rejected: manifest path '{path}' must be relative and must not contain '..' components")]
+    PathTraversal {
+        path: PathBuf,
+    },
+}
+
+/// Validate that `rel` is a safe relative path that cannot escape the base dir.
+///
+/// Rejects:
+/// - Absolute paths (e.g. `/etc/passwd`)
+/// - Paths containing `..` components (e.g. `../../secrets`)
+fn safe_join(base: &Path, rel: &Path) -> Result<PathBuf, FlattenError> {
+    if rel.is_absolute() {
+        return Err(FlattenError::PathTraversal { path: rel.to_owned() });
+    }
+    for component in rel.components() {
+        if component == std::path::Component::ParentDir {
+            return Err(FlattenError::PathTraversal { path: rel.to_owned() });
+        }
+    }
+    Ok(base.join(rel))
 }
 
 pub fn flatten(
@@ -72,7 +93,7 @@ pub fn flatten(
 
     // Deletes.
     for del in &manifest.deletes {
-        let target = wt_path.join(del);
+        let target = safe_join(&wt_path, del)?;
         if target.exists() {
             std::fs::remove_file(&target)
                 .map_err(|source| FlattenError::Io {
@@ -84,8 +105,8 @@ pub fn flatten(
 
     // Renames.
     for (from, to) in &manifest.renames {
-        let src = wt_path.join(from);
-        let dst = wt_path.join(to);
+        let src = safe_join(&wt_path, from)?;
+        let dst = safe_join(&wt_path, to)?;
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).map_err(|source| FlattenError::Io {
                 step: "apply_rename_create_parent",
@@ -117,7 +138,7 @@ pub fn flatten(
                 }
             }
         })?;
-        let dest = wt_path.join(rel_path);
+        let dest = safe_join(&wt_path, rel_path)?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|source| FlattenError::Io {
                 step: "apply_write_create_parent",
@@ -188,3 +209,54 @@ fn run_git_output(cwd: &Path, args: &[&str], step: &'static str) -> Result<Strin
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn safe_join_rejects_absolute_path() {
+        let base = Path::new("/worktree");
+        let result = safe_join(base, Path::new("/etc/passwd"));
+        assert!(
+            matches!(result, Err(FlattenError::PathTraversal { .. })),
+            "absolute paths must be rejected"
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_parent_dir_traversal() {
+        let base = Path::new("/worktree");
+        let result = safe_join(base, Path::new("../../etc/shadow"));
+        assert!(
+            matches!(result, Err(FlattenError::PathTraversal { .. })),
+            "parent-dir traversal must be rejected"
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_embedded_parent_dir() {
+        let base = Path::new("/worktree");
+        let result = safe_join(base, Path::new("foo/../../../etc/passwd"));
+        assert!(
+            matches!(result, Err(FlattenError::PathTraversal { .. })),
+            "embedded parent-dir components must be rejected"
+        );
+    }
+
+    #[test]
+    fn safe_join_accepts_normal_relative_path() {
+        let base = Path::new("/worktree");
+        let result = safe_join(base, Path::new("src/main.rs"));
+        assert!(result.is_ok(), "normal relative paths must be accepted");
+        assert_eq!(result.unwrap(), Path::new("/worktree/src/main.rs"));
+    }
+
+    #[test]
+    fn safe_join_accepts_nested_relative_path() {
+        let base = Path::new("/worktree");
+        let result = safe_join(base, Path::new("a/b/c/d.txt"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Path::new("/worktree/a/b/c/d.txt"));
+    }
+}

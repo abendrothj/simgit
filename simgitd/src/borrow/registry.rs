@@ -274,6 +274,22 @@ impl BorrowRegistry {
         self.release_session(session_id);
     }
 
+    /// Force-release all locks held by `session` and mark the session as STALE.
+    ///
+    /// Called by the TTL sweeper when a session's write lock has exceeded its TTL.
+    /// Combines lock release with a status transition so the session does not remain
+    /// visible as ACTIVE after its locks have been forcibly revoked.
+    pub fn force_release_and_mark_stale(&self, session_id: Uuid) {
+        self.release_session(session_id);
+        if let Err(e) = self.sessions.mark_stale(session_id) {
+            warn!(
+                session = %session_id,
+                err = %e,
+                "TTL sweeper: failed to mark expired session as STALE"
+            );
+        }
+    }
+
     /// Iterate over (path, writer_session, acquired_at, ttl_seconds) for
     /// TTL enforcement.
     pub fn stale_writers(&self) -> Vec<(PathBuf, Uuid, chrono::DateTime<Utc>, u64)> {

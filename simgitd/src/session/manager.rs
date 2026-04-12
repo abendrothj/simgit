@@ -204,7 +204,8 @@ impl SessionManager {
             match state.vfs.mount(&session).await {
                 Ok(_) => info!(id = %session.session_id, "re-mounted session"),
                 Err(e) => {
-                    warn!(id = %session.session_id, err = %e, "failed to re-mount; marking stale");
+                    warn!(id = %session.session_id, err = %e, "failed to re-mount; releasing locks and marking stale");
+                    state.borrows.release_session(session.session_id);
                     self.mark_stale(session.session_id)?;
                 }
             }

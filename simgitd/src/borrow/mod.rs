@@ -56,7 +56,10 @@
 //! # Implementation Notes
 //!
 //! - The lock table is in-memory (HashMap), protected by a Mutex.
-//! - SQLite persistence is handled by the [`crate::session::Session`] module separately.
+//! - Every lock acquisition and release is durably persisted to SQLite so that
+//!   the lock table survives daemon crashes and restarts.
+//! - `BorrowRegistry::restore_locks()` must be called once on startup to
+//!   reload the persisted state into the in-memory map.
 //! - This in-memory map is the fast-path for all lock operations.
 //! - No async/await in lock operations; all are synchronous (millisecond-level blocking tolerance).
 //! - Path canonicalization is the caller's responsibility (VFS layer).
