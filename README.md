@@ -244,6 +244,7 @@ cargo test --workspace
 - Implemented highlights:
     - workspace includes initial `simgit-py` PyO3 bindings crate
     - Python API scaffold exposes `Client` + `Session.new/commit/abort/diff`
+    - Python packaging/publish flow wired with `maturin` (`simgit-py/pyproject.toml`)
 
 ### Phase 6: Peer Visibility (1 week)
 - Opt-in `--peers` flag (show in-flight changes)

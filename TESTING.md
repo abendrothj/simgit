@@ -332,6 +332,8 @@ jobs:
     - Phase 4 integration tests now cover commit overlap blocking and non-overlap commit success across active sessions.
     - Phase 4 RPC coverage now validates per-path overlap operation details and flatten error taxonomy mapping.
     - Phase 5 bootstrap validation: `cargo check -p simgit-py` is green with ABI3 compatibility enabled.
+    - Phase 5 packaging flow is configured via `simgit-py/pyproject.toml` (maturin backend).
+    - Wheel build/publish commands are documented; runtime wheel build was not executed locally because `maturin` is not installed in this environment.
 
 ## FAQ
 
