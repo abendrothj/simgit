@@ -365,6 +365,8 @@ mod tests {
             max_delta_bytes: 2 * 1024 * 1024,
             lock_ttl_seconds: 3600,
             vfs_backend: VfsBackend::NfsLoopback,
+            metrics_enabled: false,
+            metrics_addr: "127.0.0.1:0".to_owned(),
         });
 
         let sessions = Arc::new(SessionManager::open(&db_path).await.expect("open manager"));
@@ -383,6 +385,7 @@ mod tests {
             deltas,
             events,
             vfs,
+            metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics")),
         };
 
         let info = sessions

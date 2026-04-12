@@ -27,6 +27,8 @@ thiserror.workspace   = true
 simgit-sdk.workspace  = true
 async-trait.workspace = true
 libc.workspace        = true
+prometheus            = "0.13"
+axum                  = "0.7"
 
 # NFS-loopback support (macOS primary, optional on Linux)
 [target.'cfg(target_os = "macos")'.dependencies]

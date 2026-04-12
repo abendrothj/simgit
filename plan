@@ -432,6 +432,8 @@ Execution checkoff (updated 2026-04-12):
     - [x] peer snapshot VFS (`.simgit/peers/<session-id>/`, read-only FUSE view)
   - [~] Phase 7 started opportunistically (continuous docs/tests hardening)
     - [x] service packaging artifacts: systemd unit + launchd plist
+    - [x] embedded Prometheus endpoint with configurable bind (`SIMGIT_METRICS_ENABLED`, `SIMGIT_METRICS_ADDR`)
+    - [x] RPC/server instrumentation for request volume/latency, lock conflicts, session lifecycle counters, and active gauges
 
 ─────────────────────────────────────────────────────────────────
 PHASE 0 — Foundation & Spike                           [ 2 weeks ]

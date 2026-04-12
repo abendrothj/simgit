@@ -342,6 +342,7 @@ jobs:
     - Phase 6 peer snapshot VFS path parsing is unit-tested in `vfs::fuse_backend::tests`.
     - Linux-only FUSE integration tests remain unexecuted on this macOS host (`cargo test -p simgitd linux_integration_tests -- --ignored` runs 0 tests).
     - Linux FUSE integration tests are now wired to CI in `.github/workflows/fuse-linux-integration.yml` (manual + nightly); job skips when `/dev/fuse` is unavailable on runner.
+    - Phase 7 metrics instrumentation compiles and is covered by daemon regression suite (`cargo test -p simgitd`).
 
 ## FAQ
 

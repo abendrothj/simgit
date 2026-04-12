@@ -1742,6 +1742,8 @@ mod linux_integration_tests {
             max_delta_bytes: 2 * 1024 * 1024,
             lock_ttl_seconds: 3600,
             vfs_backend: VfsBackend::Fuse,
+            metrics_enabled: false,
+            metrics_addr: "127.0.0.1:0".to_owned(),
         });
 
         let db_path = state_dir.join("state.db");
@@ -1803,6 +1805,8 @@ mod linux_integration_tests {
             max_delta_bytes: 2 * 1024 * 1024,
             lock_ttl_seconds: 3600,
             vfs_backend: VfsBackend::Fuse,
+            metrics_enabled: false,
+            metrics_addr: "127.0.0.1:0".to_owned(),
         });
 
         let db_path = state_dir.join("state.db");

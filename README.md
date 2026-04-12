@@ -44,6 +44,26 @@ sg commit <session-id> --branch feature-x --message "Added feature X"
 sg abort <session-id>
 ```
 
+## Observability
+
+simgitd can expose Prometheus metrics over an embedded HTTP endpoint.
+
+```bash
+# Enabled by default
+export SIMGIT_METRICS_ENABLED=1
+export SIMGIT_METRICS_ADDR=127.0.0.1:9100
+simgitd
+
+# Scrape endpoint
+curl -s http://127.0.0.1:9100/metrics
+```
+
+Current metrics include:
+- RPC request volume (`simgit_rpc_requests_total`) and latency (`simgit_rpc_duration_seconds`)
+- Session lifecycle counters (`simgit_session_creates_total`, `simgit_session_commits_total`, `simgit_session_aborts_total`)
+- Lock conflict counter (`simgit_lock_conflicts_total`)
+- Active gauges (`simgit_active_sessions`, `simgit_active_locks`)
+
 ## Architecture
 
 ```

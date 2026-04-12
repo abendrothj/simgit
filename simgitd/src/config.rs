@@ -92,6 +92,12 @@ pub struct Config {
 
     /// VFS backend to use.
     pub vfs_backend: VfsBackend,
+
+    /// Enable embedded Prometheus endpoint.
+    pub metrics_enabled: bool,
+
+    /// Listen address for Prometheus metrics endpoint.
+    pub metrics_addr: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +177,11 @@ impl Config {
             max_delta_bytes: 2 * 1024 * 1024 * 1024,
             lock_ttl_seconds: 3600,
             vfs_backend,
+            metrics_enabled: std::env::var("SIMGIT_METRICS_ENABLED")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true),
+            metrics_addr: std::env::var("SIMGIT_METRICS_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:9100".to_owned()),
         })
     }
 }

@@ -6,6 +6,7 @@ mod session;
 mod rpc;
 mod events;
 mod config;
+mod metrics;
 
 use anyhow::Result;
 use tracing::info;

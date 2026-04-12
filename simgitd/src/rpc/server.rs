@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -70,7 +71,16 @@ async fn handle_connection(stream: UnixStream, state: Arc<AppState>) {
             }
             Ok(req) => {
                 let id = req.id;
-                match methods::dispatch(&state, &req.method, req.params).await {
+                let method = req.method;
+                let params = req.params;
+
+                state.metrics.set_active_counts(
+                    state.sessions.list_active().len(),
+                    state.borrows.list(None).len(),
+                );
+
+                let started = Instant::now();
+                let response = match methods::dispatch(&state, &method, params).await {
                     Ok(result) => RpcResponse {
                         jsonrpc: "2.0".into(),
                         id,
@@ -83,7 +93,23 @@ async fn handle_connection(stream: UnixStream, state: Arc<AppState>) {
                         result:  None,
                         error:   Some(rpc_err),
                     },
-                }
+                };
+
+                let success = response.error.is_none();
+                let error_code = response.error.as_ref().map(|e| e.code);
+                state.metrics.observe_rpc(
+                    &method,
+                    success,
+                    error_code,
+                    started.elapsed().as_secs_f64(),
+                );
+
+                state.metrics.set_active_counts(
+                    state.sessions.list_active().len(),
+                    state.borrows.list(None).len(),
+                );
+
+                response
             }
         };
 

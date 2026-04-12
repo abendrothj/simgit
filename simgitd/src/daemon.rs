@@ -80,6 +80,7 @@ use crate::borrow::BorrowRegistry;
 use crate::config::Config;
 use crate::delta::DeltaStore;
 use crate::events::EventBroker;
+use crate::metrics::Metrics;
 use crate::rpc::RpcServer;
 use crate::session::SessionManager;
 use crate::vfs::VfsManager;
@@ -124,6 +125,7 @@ pub struct AppState {
     pub deltas:   Arc<DeltaStore>,
     pub events:   Arc<EventBroker>,
     pub vfs:      Arc<VfsManager>,
+    pub metrics:  Arc<Metrics>,
 }
 
 /// Run the simgitd daemon until shutdown signal.
@@ -179,13 +181,22 @@ pub async fn run(cfg: Config) -> Result<()> {
     borrows.restore_locks().context("restore borrow locks from SQLite")?;
     let deltas   = Arc::new(DeltaStore::new_with_quota(cfg.state_dir.join("deltas"), cfg.max_delta_bytes));
     let events   = Arc::new(EventBroker::new());
+    let metrics  = Arc::new(Metrics::new()?);
     let vfs      = Arc::new(VfsManager::new(
         Arc::clone(&cfg),
         Arc::clone(&deltas),
         Arc::clone(&borrows),
     ));
 
-    let state = AppState { config: Arc::clone(&cfg), sessions, borrows, deltas, events, vfs };
+    let state = AppState {
+        config: Arc::clone(&cfg),
+        sessions,
+        borrows,
+        deltas,
+        events,
+        vfs,
+        metrics,
+    };
 
     // Recover any sessions that were ACTIVE before a previous crash.
     state.sessions.recover_active_sessions(&state).await?;
@@ -197,6 +208,18 @@ pub async fn run(cfg: Config) -> Result<()> {
     let rpc = RpcServer::new(state.clone());
     let socket_path = cfg.state_dir.join("control.sock");
     let rpc_handle = tokio::spawn(async move { rpc.serve(&socket_path).await });
+
+    let metrics_handle = if cfg.metrics_enabled {
+        let addr = cfg.metrics_addr.clone();
+        let metrics = Arc::clone(&state.metrics);
+        Some(tokio::spawn(async move {
+            if let Err(e) = crate::metrics::serve(metrics, &addr).await {
+                tracing::error!(err = %e, addr = %addr, "metrics server stopped");
+            }
+        }))
+    } else {
+        None
+    };
 
     info!("simgitd ready — socket at {}", cfg.state_dir.join("control.sock").display());
 
@@ -213,6 +236,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     // Graceful shutdown: unmount all active sessions.
     state.vfs.unmount_all().await;
     rpc_handle.abort();
+    if let Some(handle) = metrics_handle {
+        handle.abort();
+    }
 
     info!("simgitd stopped");
     Ok(())
