@@ -447,6 +447,22 @@ mod tests {
         repo
     }
 
+    fn init_repo_with_nested_tree() -> PathBuf {
+        let repo = temp_repo_dir();
+        fs::create_dir_all(repo.join("src")).expect("create nested dir");
+
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.email", "tests@simgit.local"]);
+        run_git(&repo, &["config", "user.name", "simgit-tests"]);
+
+        fs::write(repo.join("src/main.rs"), b"fn main() {}\n").expect("write nested file");
+        fs::write(repo.join("README.md"), b"nested test\n").expect("write root file");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "nested"]);
+
+        repo
+    }
+
     fn head_tree_oid(repo: &PathBuf) -> String {
         let output = Command::new("git")
             .current_dir(repo)
@@ -503,6 +519,45 @@ mod tests {
         // Second call should be cache-hit path and return identical content.
         let bytes2 = cache.get(&blob_oid, &repo).expect("blob cache-hit should pass");
         assert_eq!(bytes2, b"hello\n");
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn tree_cache_reports_directory_entries() {
+        let repo = init_repo_with_nested_tree();
+        let root_tree = head_tree_oid(&repo);
+
+        let cache = TreeCache::new(16);
+        let entries = cache.get(&root_tree, &repo).expect("root tree lookup should pass");
+
+        let src = entries.iter().find(|e| e.name == "src").expect("src dir should exist");
+        assert_eq!(src.kind, EntryKind::Dir);
+        assert!(!src.oid.is_empty());
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn tree_cache_supports_nested_lookup() {
+        let repo = init_repo_with_nested_tree();
+        let root_tree = head_tree_oid(&repo);
+
+        let cache = TreeCache::new(16);
+        let root_entries = cache.get(&root_tree, &repo).expect("root tree lookup should pass");
+        let src = root_entries
+            .iter()
+            .find(|e| e.name == "src")
+            .expect("src dir should exist");
+
+        let src_entries = cache.get(&src.oid, &repo).expect("nested tree lookup should pass");
+        let main = src_entries
+            .iter()
+            .find(|e| e.name == "main.rs")
+            .expect("main.rs should exist under src/");
+
+        assert_eq!(main.kind, EntryKind::File);
+        assert!(main.size > 0);
 
         let _ = fs::remove_dir_all(&repo);
     }

@@ -250,62 +250,43 @@ impl Filesystem for SessionFs {
 
         debug!(session = %self.session_id, parent = parent.0, name = name_str, "lookup");
 
-        // Root is always inode 1.
-        if parent.0 == 1 {
-            let tree_oid = match resolve_tree_oid(&self.cfg.repo_path, &self.base_commit) {
-                Ok(oid) => oid,
-                Err(_) => {
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-
-            let tree_entries = match self.tree_cache.get(&tree_oid, &self.cfg.repo_path) {
-                Ok(e) => e,
-                Err(_) => {
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-
-            // Search for the named entry.
-            for (idx, entry) in tree_entries.iter().enumerate() {
-                if entry.name == name_str {
-                    let ino = self.inode_map.allocate();
-                    self.inode_map.insert(ino, tree_oid.clone(), idx);
-
-                    let attr = FileAttr {
-                        ino: INodeNo(ino),
-                        size: entry.size,
-                        blocks: (entry.size + 511) / 512,
-                        atime: UNIX_EPOCH,
-                        mtime: UNIX_EPOCH,
-                        ctime: UNIX_EPOCH,
-                        crtime: UNIX_EPOCH,
-                        kind: match entry.kind {
-                            super::git_resolver::EntryKind::File => FileType::RegularFile,
-                            super::git_resolver::EntryKind::Dir => FileType::Directory,
-                            super::git_resolver::EntryKind::Symlink => FileType::Symlink,
-                        },
-                        perm: entry.perm,
-                        nlink: 1,
-                        uid: unsafe { libc::getuid() },
-                        gid: unsafe { libc::getgid() },
-                        rdev: 0,
-                        flags: 0,
-                        blksize: 4096,
-                    };
-                    reply.entry(&TTL, &attr, Generation(0));
-                    return;
-                }
+        let parent_tree_oid = match directory_tree_oid_for_ino(
+            parent.0,
+            &self.base_commit,
+            &self.cfg.repo_path,
+            &self.tree_cache,
+            &self.inode_map,
+        ) {
+            Ok(oid) => oid,
+            Err(DirTreeError::NotDir) => {
+                reply.error(Errno::ENOTDIR);
+                return;
             }
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
 
-            reply.error(Errno::ENOENT);
-            return;
+        let tree_entries = match self.tree_cache.get(&parent_tree_oid, &self.cfg.repo_path) {
+            Ok(e) => e,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        // Search for the named entry.
+        for (idx, entry) in tree_entries.iter().enumerate() {
+            if entry.name == name_str {
+                let ino = self.inode_map.allocate();
+                self.inode_map.insert(ino, parent_tree_oid.clone(), idx);
+
+                reply.entry(&TTL, &entry_attr(INodeNo(ino), entry), Generation(0));
+                return;
+            }
         }
 
-        // For non-root lookups, we'd need to maintain a tree_oid per inode.
-        // For now, return ENOENT (Phase 1 limitation).
         reply.error(Errno::ENOENT);
     }
 
@@ -316,7 +297,25 @@ impl Filesystem for SessionFs {
             return;
         }
 
-        reply.error(Errno::ENOENT);
+        let Some((tree_oid, entry_idx)) = self.inode_map.lookup(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        let tree_entries = match self.tree_cache.get(&tree_oid, &self.cfg.repo_path) {
+            Ok(e) => e,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        let Some(entry) = tree_entries.get(entry_idx) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        reply.attr(&TTL, &entry_attr(ino, entry));
     }
 
     fn readdir(
@@ -327,14 +326,18 @@ impl Filesystem for SessionFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        if ino.0 != 1 {
-            reply.error(Errno::ENOTDIR);
-            return;
-        }
-
-        // List root tree entries.
-        let tree_oid = match resolve_tree_oid(&self.cfg.repo_path, &self.base_commit) {
+        let tree_oid = match directory_tree_oid_for_ino(
+            ino.0,
+            &self.base_commit,
+            &self.cfg.repo_path,
+            &self.tree_cache,
+            &self.inode_map,
+        ) {
             Ok(oid) => oid,
+            Err(DirTreeError::NotDir) => {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
             Err(_) => {
                 reply.error(Errno::EIO);
                 return;
@@ -395,6 +398,66 @@ fn resolve_tree_oid(repo_path: &std::path::Path, commitish: &str) -> Result<Stri
         anyhow::bail!("empty tree oid for {rev}");
     }
     Ok(oid)
+}
+
+enum DirTreeError {
+    NotFound,
+    NotDir,
+    Io,
+}
+
+fn directory_tree_oid_for_ino(
+    ino: u64,
+    base_commit: &str,
+    repo_path: &std::path::Path,
+    tree_cache: &TreeCache,
+    inode_map: &InodeMap,
+) -> std::result::Result<String, DirTreeError> {
+    if ino == 1 {
+        return resolve_tree_oid(repo_path, base_commit).map_err(|_| DirTreeError::Io);
+    }
+
+    let Some((parent_tree_oid, entry_idx)) = inode_map.lookup(ino) else {
+        return Err(DirTreeError::NotFound);
+    };
+    let entries = tree_cache.get(&parent_tree_oid, repo_path).map_err(|_| DirTreeError::Io)?;
+    let Some(entry) = entries.get(entry_idx) else {
+        return Err(DirTreeError::NotFound);
+    };
+
+    if entry.kind != super::git_resolver::EntryKind::Dir {
+        return Err(DirTreeError::NotDir);
+    }
+
+    Ok(entry.oid.clone())
+}
+
+fn entry_kind_to_file_type(kind: super::git_resolver::EntryKind) -> FileType {
+    match kind {
+        super::git_resolver::EntryKind::File => FileType::RegularFile,
+        super::git_resolver::EntryKind::Dir => FileType::Directory,
+        super::git_resolver::EntryKind::Symlink => FileType::Symlink,
+    }
+}
+
+fn entry_attr(ino: INodeNo, entry: &super::git_resolver::TreeEntry) -> FileAttr {
+    FileAttr {
+        ino,
+        size: entry.size,
+        blocks: (entry.size + 511) / 512,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: entry_kind_to_file_type(entry.kind),
+        perm: entry.perm,
+        nlink: 1,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        rdev: 0,
+        flags: 0,
+        blksize: 4096,
+    }
 }
 
 fn root_attr() -> FileAttr {
