@@ -408,7 +408,8 @@ Execution checkoff (updated 2026-04-12):
     - [x] delta-backed create syscall path (new files)
     - [x] tombstone-aware lookup/getattr/readdir/open/read visibility
     - [x] crash-recovery persistence validation for session metadata and delta directories
-    - [ ] end-to-end mount re-attachment validation (requires mount-level integration harness)
+    - [x] mount re-attachment regression for ACTIVE sessions using NFS-loopback backend
+    - [ ] full FUSE mount re-attachment validation in Linux mount-level integration harness
   - [~] Phase 3 in progress
     - [x] lock acquisition and TTL sweeper foundations
     - [x] EBUSY returns on mutating ops during active lock contention

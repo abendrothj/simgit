@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -201,7 +201,14 @@ fn row_to_info(row: &SessionRow) -> Result<SessionInfo> {
 #[cfg(test)]
 mod tests {
     use super::SessionManager;
+    use crate::borrow::BorrowRegistry;
+    use crate::config::{Config, VfsBackend};
+    use crate::daemon::AppState;
+    use crate::delta::DeltaStore;
+    use crate::events::EventBroker;
+    use crate::vfs::VfsManager;
     use simgit_sdk::SessionStatus;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -281,6 +288,71 @@ mod tests {
         assert_eq!(info.status, SessionStatus::Committed);
         assert_eq!(info.branch_name.as_deref(), Some("feat/test"));
 
+        let _ = std::fs::remove_file(&db_path);
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_active_sessions_mounts_session_paths() {
+        let db_path = temp_db_path();
+        let state_root = db_path
+            .parent()
+            .expect("db has parent")
+            .join("state-root");
+        let mnt_dir = state_root.join("mnt");
+        let repo_path = state_root.join("repo");
+        std::fs::create_dir_all(&mnt_dir).expect("create mnt dir");
+        std::fs::create_dir_all(&repo_path).expect("create repo dir");
+
+        let cfg = Arc::new(Config {
+            repo_path: repo_path.clone(),
+            state_dir: state_root.clone(),
+            mnt_dir: mnt_dir.clone(),
+            max_sessions: 16,
+            max_delta_bytes: 2 * 1024 * 1024,
+            lock_ttl_seconds: 3600,
+            vfs_backend: VfsBackend::NfsLoopback,
+        });
+
+        let sessions = Arc::new(SessionManager::open(&db_path).await.expect("open manager"));
+        let borrows = Arc::new(BorrowRegistry::new(Arc::clone(&sessions)));
+        let deltas = Arc::new(DeltaStore::new(state_root.join("deltas")));
+        let events = Arc::new(EventBroker::new());
+        let vfs = Arc::new(VfsManager::new(
+            Arc::clone(&cfg),
+            Arc::clone(&deltas),
+            Arc::clone(&borrows),
+        ));
+        let state = AppState {
+            config: Arc::clone(&cfg),
+            sessions: Arc::clone(&sessions),
+            borrows,
+            deltas,
+            events,
+            vfs,
+        };
+
+        let info = sessions
+            .create(
+                "recover-task".to_owned(),
+                Some("recover-agent".to_owned()),
+                "HEAD".to_owned(),
+                mnt_dir.join("recover-session"),
+                false,
+                16,
+            )
+            .expect("create active session");
+
+        assert!(!info.mount_path.exists(), "mount path should not exist before recovery mount");
+        sessions
+            .recover_active_sessions(&state)
+            .await
+            .expect("recover active sessions");
+        assert!(info.mount_path.exists(), "recover should mount active session path");
+
+        state.vfs.unmount_all().await;
         let _ = std::fs::remove_file(&db_path);
         if let Some(parent) = db_path.parent() {
             let _ = std::fs::remove_dir_all(parent);

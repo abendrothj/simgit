@@ -209,7 +209,8 @@ cargo test --workspace
     - `unlink` and `rename` capture via delta manifest tombstones/renames
     - Tombstone-aware visibility in `lookup`, `readdir`, `getattr`, `open`, and `read`
     - Crash-recovery persistence tests for session metadata and delta directories
-    - Outstanding in this phase: richer metadata updates and full mount re-attachment integration validation
+    - ACTIVE session mount re-attachment regression via NFS-loopback backend
+    - Outstanding in this phase: richer metadata updates and full FUSE mount re-attachment integration validation
 
 ### Phase 3: Borrow Checker (2 weeks)
 - Lock acquisition at session creation
