@@ -57,6 +57,14 @@ impl Db {
         Ok(Self { conn })
     }
 
+    /// Open an in-memory SQLite database. Used by unit tests only.
+    #[cfg(test)]
+    pub fn in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("open in-memory SQLite")?;
+        conn.execute_batch(SCHEMA).context("apply schema")?;
+        Ok(Self { conn })
+    }
+
     /// Upsert a session row.
     pub fn upsert_session(
         &self,

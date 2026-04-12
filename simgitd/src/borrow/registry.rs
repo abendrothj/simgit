@@ -317,72 +317,129 @@ impl BorrowRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use crate::session::SessionManager;
 
-    /// Helper to generate test UUIDs (using nil UUID + incrementing for test isolation).
+    /// Helper to generate deterministic test UUIDs.
     fn test_uuid(idx: u8) -> Uuid {
         let mut bytes = [0u8; 16];
         bytes[0] = idx;
         Uuid::from_bytes(bytes)
     }
 
-    /// Create a mock SessionManager for tests by using the existing struct directly.
-    /// Tests only exercise the locking logic, not session lookup.
+    /// Create a `BorrowRegistry` backed by an in-memory SQLite database.
     fn mk_registry() -> BorrowRegistry {
-        // Since we can't easily construct SessionManager, we'll test the registry
-        // in isolation by mocking out the SessionManager reference.
-        // The registry's is_write_free, list, acquire_* methods don't actually use
-        // the SessionManager except in error handling, so this is acceptable.
-        //
-        // For full integration tests, see tests/ directory.
+        BorrowRegistry::new(SessionManager::for_testing())
+    }
 
-        // This is a temporary workaround until we add a test constructor.
-        // In production code, SessionManager is always valid when passed in.
-        panic!("This test approach requires a test SessionManager constructor");
+    // ── Core exclusive-write invariant ────────────────────────────────────
+
+    #[test]
+    fn exclusive_write_blocks_second_writer() {
+        let reg = mk_registry();
+        let s1 = test_uuid(1);
+        let s2 = test_uuid(2);
+        let path = Path::new("/src/main.rs");
+
+        reg.acquire_write(s1, path, None).expect("s1 should acquire write lock");
+
+        let err = reg
+            .acquire_write(s2, path, None)
+            .expect_err("s2 should be blocked by s1's write lock");
+
+        assert_eq!(err.holder.session_id, s1, "error must name the actual holder");
+        assert_eq!(err.path, path);
     }
 
     #[test]
-    fn test_acquire_write_succeeds_when_free() {
-        let path = Path::new("/test/file.txt");
-        
-        // Create a minimal lock table directly
-        let locks = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let session = test_uuid(1);
+    fn writer_reentrant_succeeds() {
+        let reg = mk_registry();
+        let s1 = test_uuid(1);
+        let path = Path::new("/src/lib.rs");
 
-        // Simulate acquire_write logic for testing
-        let mut table = locks.lock().unwrap();
-        let entry = table
-            .entry(path.to_owned())
-            .or_insert_with(|| LockEntry {
-                acquired_at: Utc::now(),
-                ..Default::default()
-            });
+        reg.acquire_write(s1, path, None).expect("first acquire");
+        reg.acquire_write(s1, path, None).expect("re-entrant acquire must succeed");
+    }
 
-        assert!(entry.writer.is_none(), "Path should be free initially");
-        entry.writer = Some(session);
+    // ── Readers ───────────────────────────────────────────────────────────
 
-        // Verify it was acquired
-        assert_eq!(entry.writer, Some(session), "Writer should be set");
+    #[test]
+    fn multiple_readers_coexist_on_same_path() {
+        let reg = mk_registry();
+        let r1 = test_uuid(1);
+        let r2 = test_uuid(2);
+        let r3 = test_uuid(3);
+        let path = Path::new("/docs/README.md");
+
+        reg.acquire_read(r1, path);
+        reg.acquire_read(r2, path);
+        reg.acquire_read(r3, path);
+
+        let locks = reg.list(None);
+        let lock = locks.iter().find(|l| l.path == path).expect("lock entry must exist");
+        assert!(lock.writer_session.is_none(), "no writer should exist");
+        assert!(lock.reader_sessions.contains(&r1));
+        assert!(lock.reader_sessions.contains(&r2));
+        assert!(lock.reader_sessions.contains(&r3));
+    }
+
+    // ── Release ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn release_session_frees_write_lock_for_next_writer() {
+        let reg = mk_registry();
+        let s1 = test_uuid(1);
+        let s2 = test_uuid(2);
+        let path = Path::new("/src/handler.rs");
+
+        reg.acquire_write(s1, path, None).expect("s1 acquires write lock");
+        assert!(!reg.is_write_free(path, s2), "path must be locked after s1 acquires");
+
+        reg.release_session(s1);
+        assert!(reg.is_write_free(path, s2), "path must be free after s1 releases");
+
+        reg.acquire_write(s2, path, None).expect("s2 must be able to acquire after s1 releases");
     }
 
     #[test]
-    fn test_lock_entry_default() {
+    fn release_session_removes_reader_from_lock_entry() {
+        let reg = mk_registry();
+        let r1 = test_uuid(1);
+        let r2 = test_uuid(2);
+        let path = Path::new("/api/routes.rs");
+
+        reg.acquire_read(r1, path);
+        reg.acquire_read(r2, path);
+        reg.release_session(r1);
+
+        let locks = reg.list(None);
+        let lock = locks.iter().find(|l| l.path == path).expect("lock entry must still exist for r2");
+        assert!(!lock.reader_sessions.contains(&r1), "r1 must be removed after release");
+        assert!(lock.reader_sessions.contains(&r2), "r2 must still be present");
+    }
+
+    #[test]
+    fn release_all_sessions_removes_lock_entry_entirely() {
+        let reg = mk_registry();
+        let s1 = test_uuid(1);
+        let path = Path::new("/src/only_writer.rs");
+
+        reg.acquire_write(s1, path, None).expect("acquire");
+        reg.release_session(s1);
+
+        let locks = reg.list(None);
+        assert!(
+            locks.iter().all(|l| l.path != path),
+            "lock entry must be removed when no readers or writers remain"
+        );
+    }
+
+    // ── TTL ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn lock_entry_default_is_empty() {
         let entry = LockEntry::default();
         assert!(entry.writer.is_none());
         assert!(entry.readers.is_empty());
-    }
-
-    #[test]
-    fn test_readers_can_coexist() {
-        let mut readers = std::collections::HashSet::new();
-        let r1 = test_uuid(1);
-        let r2 = test_uuid(2);
-
-        readers.insert(r1);
-        readers.insert(r2);
-
-        assert_eq!(readers.len(), 2, "Two readers should coexist");
-        assert!(readers.contains(&r1));
-        assert!(readers.contains(&r2));
+        assert!(entry.ttl_seconds.is_none());
     }
 }

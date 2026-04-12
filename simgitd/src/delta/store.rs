@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 use uuid::Uuid;
 
 use serde::{Deserialize, Serialize};
@@ -28,12 +29,64 @@ pub struct DeltaManifest {
 }
 
 pub struct DeltaStore {
-    root: PathBuf,
+    root:           PathBuf,
+    /// Maximum bytes of delta blobs per session. `u64::MAX` = unlimited.
+    max_delta_bytes: u64,
 }
 
 impl DeltaStore {
+    /// Create a store with no quota limit.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self { root: root.into(), max_delta_bytes: u64::MAX }
+    }
+
+    /// Create a store that enforces a per-session delta-size quota.
+    ///
+    /// `write_blob` will return an error when adding a new blob would push the
+    /// cumulative unique-blob size for the session over `max_delta_bytes`.
+    pub fn new_with_quota(root: impl Into<PathBuf>, max_delta_bytes: u64) -> Self {
+        Self { root: root.into(), max_delta_bytes }
+    }
+
+    /// Sum of all unique blob file sizes currently stored for `session_id`.
+    ///
+    /// On I/O errors (e.g. missing directory, permission denied), logs a warning
+    /// and treats the unreadable subtree as zero bytes so quota checks remain
+    /// conservative (they may allow a write that should be blocked) rather than
+    /// hard-failing an otherwise valid write operation.
+    fn session_bytes_used(&self, session_id: Uuid) -> u64 {
+        let objects_dir = self.objects_dir(session_id);
+        let buckets = match std::fs::read_dir(&objects_dir) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    session = %session_id,
+                    path = %objects_dir.display(),
+                    err = %e,
+                    "delta quota: could not read objects dir — treating used bytes as 0"
+                );
+                return 0;
+            }
+        };
+        buckets
+            .filter_map(|e| {
+                e.map_err(|err| {
+                    warn!(session = %session_id, err = %err, "delta quota: error reading bucket entry");
+                })
+                .ok()
+            })
+            .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            .flat_map(|bucket| std::fs::read_dir(bucket.path()).into_iter().flatten())
+            .filter_map(|e| {
+                e.map_err(|err| {
+                    warn!(session = %session_id, err = %err, "delta quota: error reading blob entry");
+                })
+                .ok()
+            })
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum()
     }
 
     fn session_dir(&self, session_id: Uuid) -> PathBuf {
@@ -61,6 +114,9 @@ impl DeltaStore {
 
     /// Write `content` into the delta store for `session_id` at `path`.
     /// Returns the SHA-256 hex of the content.
+    ///
+    /// Returns an error if adding this blob would push the session's total
+    /// unique-blob size over `max_delta_bytes`.
     pub fn write_blob(&self, session_id: Uuid, path: &Path, content: &[u8]) -> Result<String> {
         // Compute content hash for deduplication and integrity.
         let hash = hex::encode(Sha256::digest(content));
@@ -72,6 +128,27 @@ impl DeltaStore {
 
         let blob_path = blob_dir.join(&hash[2..]);
         if !blob_path.exists() {
+            // Quota check: only new (non-deduplicated) blobs consume space.
+            //
+            // This is a *soft* limit. There is a narrow TOCTOU window between the
+            // `session_bytes_used()` call and the actual write, so two concurrent
+            // writes to the *same* session could each pass the check and collectively
+            // slightly exceed the quota. In practice, the VFS write path is
+            // single-threaded per session, and any overshoot is bounded by one
+            // additional blob. Full serialization would require a per-session Mutex
+            // and is deferred to a future hardening pass.
+            if self.max_delta_bytes != u64::MAX {
+                let used = self.session_bytes_used(session_id);
+                let new_size = content.len() as u64;
+                if used.saturating_add(new_size) > self.max_delta_bytes {
+                    anyhow::bail!(
+                        "delta quota exceeded for session {session_id}: \
+                         {} bytes used + {} bytes new > {} bytes limit",
+                        used, new_size, self.max_delta_bytes
+                    );
+                }
+            }
+
             // Write-then-rename for atomicity.
             let tmp = blob_path.with_extension("tmp");
             {
@@ -282,6 +359,62 @@ mod tests {
         let sessions = store.list_sessions().expect("list sessions");
         assert!(sessions.contains(&s1));
         assert!(sessions.contains(&s2));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Quota enforcement ─────────────────────────────────────────────────
+
+    #[test]
+    fn write_blob_succeeds_within_quota() {
+        let root = temp_delta_root();
+        let store = DeltaStore::new_with_quota(&root, 1024);
+        let session_id = Uuid::now_v7();
+
+        store.init_session(session_id, "HEAD").expect("init");
+        store
+            .write_blob(session_id, Path::new("file.txt"), b"small content")
+            .expect("write should succeed within quota");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_blob_fails_when_quota_exceeded() {
+        let root = temp_delta_root();
+        // 10-byte quota; writing 20 bytes should fail.
+        let store = DeltaStore::new_with_quota(&root, 10);
+        let session_id = Uuid::now_v7();
+        let content = b"this is twenty bytes!";
+
+        store.init_session(session_id, "HEAD").expect("init");
+        let err = store
+            .write_blob(session_id, Path::new("big.txt"), content)
+            .expect_err("write should fail when quota exceeded");
+
+        assert!(err.to_string().contains("quota exceeded"), "error must mention quota exceeded");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_blob_dedup_does_not_recount_existing_blob() {
+        let root = temp_delta_root();
+        let content = b"dedup content";
+        // quota is slightly above content size — just enough for one blob.
+        let quota = content.len() as u64 + 5;
+        let store = DeltaStore::new_with_quota(&root, quota);
+        let session_id = Uuid::now_v7();
+
+        store.init_session(session_id, "HEAD").expect("init");
+        // First write — should succeed.
+        store
+            .write_blob(session_id, Path::new("a.txt"), content)
+            .expect("first write should succeed");
+        // Second write of same bytes (different path) — dedup: no new bytes on disk.
+        store
+            .write_blob(session_id, Path::new("b.txt"), content)
+            .expect("dedup write of same content should not be rejected by quota");
 
         let _ = std::fs::remove_dir_all(&root);
     }

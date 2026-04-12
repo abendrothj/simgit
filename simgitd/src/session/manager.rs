@@ -27,6 +27,17 @@ impl SessionManager {
         Ok(mgr)
     }
 
+    /// Create an in-memory `SessionManager` for unit tests.
+    ///
+    /// Backed by an in-memory SQLite database (`:memory:`), so there is no disk
+    /// I/O and the database is destroyed when the instance is dropped.
+    #[cfg(test)]
+    pub fn for_testing() -> std::sync::Arc<Self> {
+        use super::db::Db;
+        let db = Db::in_memory().expect("in-memory SQLite");
+        std::sync::Arc::new(Self { db: Mutex::new(db), cache: Mutex::new(HashMap::new()) })
+    }
+
     fn warm_cache(&self) -> Result<()> {
         let rows = self.db.lock().unwrap().load_all()?;
         let mut cache = self.cache.lock().unwrap();
