@@ -1,0 +1,43 @@
+name: Linux FUSE Integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+
+jobs:
+  linux-fuse-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fuse3 libfuse3-dev pkg-config
+
+      - name: Ensure FUSE device is available
+        id: fuse-check
+        run: |
+          if [ ! -e /dev/fuse ]; then
+            sudo modprobe fuse || true
+          fi
+          if [ ! -e /dev/fuse ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "FUSE device not available on this runner; skipping Linux mount integration tests."
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.fuse-check.outputs.available == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Linux ignored FUSE integration tests
+        if: steps.fuse-check.outputs.available == 'true'
+        env:
+          RUST_BACKTRACE: 1
+        run: |
+          cargo test -p simgitd linux_integration_tests -- --ignored --nocapture --test-threads=1

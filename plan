@@ -410,7 +410,8 @@ Execution checkoff (updated 2026-04-12):
     - [x] crash-recovery persistence validation for session metadata and delta directories
     - [x] mount re-attachment regression for ACTIVE sessions using NFS-loopback backend
     - [x] Linux FUSE mount-level integration harness added (create/unlink/rename + remount scenarios)
-    - [ ] execute Linux FUSE integration harness in Linux environment and record runtime results (environment-dependent validation; macOS host cannot run Linux-only test target)
+    - [x] CI workflow added for Linux ignored FUSE integration execution (`.github/workflows/fuse-linux-integration.yml`)
+    - [ ] execute Linux FUSE integration harness in Linux environment and record runtime results (environment-dependent validation; first green CI run pending)
     - [x] lock acquisition and TTL sweeper foundations
     - [x] EBUSY returns on mutating ops during active lock contention
     - [x] lock.list and session-aware lock.wait with holder context on timeout

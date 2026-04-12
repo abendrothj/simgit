@@ -277,6 +277,7 @@ cargo test --workspace
 - Documentation + README
 - Implemented highlights:
     - packaging artifacts for daemon service management on Linux/macOS (`deploy/systemd/simgitd.service`, `deploy/launchd/com.simgit.simgitd.plist`)
+    - Linux FUSE integration CI workflow (`.github/workflows/fuse-linux-integration.yml`, manual + nightly)
 
 ## Building & Running Tests
 
@@ -316,6 +317,8 @@ cargo test -- --test-threads=1 --nocapture
 ## Contributing
 
 Tests + docs required for all PRs. Run `cargo test --workspace && cargo doc --no-deps --open` before submitting.
+
+Linux-specific FUSE mount integration tests are wired in CI via `Linux FUSE Integration` workflow.
 
 ## License
 
