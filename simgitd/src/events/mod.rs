@@ -62,20 +62,24 @@
 //! }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 const CHANNEL_CAPACITY: usize = 64;
+const HISTORY_CAPACITY: usize = 256;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub source_session: Uuid,
     pub kind:           String,
     pub payload:        Value,
+    pub emitted_at:     DateTime<Utc>,
 }
 
 pub struct EventBroker {
@@ -83,6 +87,8 @@ pub struct EventBroker {
     channels: Mutex<HashMap<Uuid, broadcast::Sender<Event>>>,
     /// Global broadcast channel — all events go here too.
     global: broadcast::Sender<Event>,
+    /// Bounded in-memory event history for polling clients.
+    history: Mutex<VecDeque<Event>>,
 }
 
 impl EventBroker {
@@ -91,6 +97,7 @@ impl EventBroker {
         Self {
             channels: Mutex::new(HashMap::new()),
             global:   tx,
+            history:  Mutex::new(VecDeque::with_capacity(HISTORY_CAPACITY)),
         }
     }
 
@@ -100,7 +107,15 @@ impl EventBroker {
             source_session,
             kind:    kind.to_owned(),
             payload,
+            emitted_at: Utc::now(),
         };
+        {
+            let mut history = self.history.lock().unwrap();
+            history.push_back(event.clone());
+            while history.len() > HISTORY_CAPACITY {
+                history.pop_front();
+            }
+        }
         let _ = self.global.send(event.clone());
         let channels = self.channels.lock().unwrap();
         if let Some(tx) = channels.get(&source_session) {
@@ -120,5 +135,48 @@ impl EventBroker {
     /// Subscribe to all events across all sessions.
     pub fn subscribe_global(&self) -> broadcast::Receiver<Event> {
         self.global.subscribe()
+    }
+
+    /// Return recent events, optionally filtered by source session.
+    pub fn recent(&self, session_id: Option<Uuid>, limit: usize) -> Vec<Event> {
+        let history = self.history.lock().unwrap();
+        let mut events: Vec<Event> = history
+            .iter()
+            .rev()
+            .filter(|e| match session_id {
+                Some(sid) => e.source_session == sid,
+                None => true,
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        events.reverse();
+        events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventBroker;
+    use uuid::Uuid;
+
+    #[test]
+    fn recent_returns_ordered_events_and_filters_by_session() {
+        let broker = EventBroker::new();
+        let s1 = Uuid::now_v7();
+        let s2 = Uuid::now_v7();
+
+        broker.publish(s1, "lock_acquired", serde_json::json!({"path": "a.txt"}));
+        broker.publish(s2, "peer_commit", serde_json::json!({"branch": "feat/x"}));
+        broker.publish(s1, "lock_released", serde_json::json!({"path": "a.txt"}));
+
+        let all = broker.recent(None, 10);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].kind, "lock_acquired");
+        assert_eq!(all[2].kind, "lock_released");
+
+        let s1_only = broker.recent(Some(s1), 10);
+        assert_eq!(s1_only.len(), 2);
+        assert!(s1_only.iter().all(|e| e.source_session == s1));
     }
 }

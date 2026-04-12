@@ -201,4 +201,22 @@ impl Client {
             .await?;
         Ok(result["acquired"].as_bool().unwrap_or(false))
     }
+
+    /// List recent events, optionally filtered by source session.
+    pub async fn event_list(
+        &self,
+        session_id: Option<Uuid>,
+        limit: Option<usize>,
+    ) -> Result<Vec<PeerEvent>, SdkError> {
+        let result = self
+            .call(
+                "event.list",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "limit": limit,
+                }),
+            )
+            .await?;
+        Ok(serde_json::from_value(result)?)
+    }
 }

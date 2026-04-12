@@ -97,6 +97,19 @@ pub struct LockInfo {
     pub ttl_seconds: Option<u64>,
 }
 
+/// Event emitted by the daemon event broker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerEvent {
+    /// Session that emitted the event.
+    pub source_session: Uuid,
+    /// Event kind (`lock_conflict`, `peer_commit`, etc.).
+    pub kind: String,
+    /// Event-specific payload.
+    pub payload: serde_json::Value,
+    /// Event timestamp in UTC.
+    pub emitted_at: DateTime<Utc>,
+}
+
 // ── Borrow error ──────────────────────────────────────────────────────────────
 
 /// Error returned when a session cannot acquire write access to a path.

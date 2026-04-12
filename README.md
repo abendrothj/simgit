@@ -259,6 +259,10 @@ cargo test --workspace
 - Opt-in `--peers` flag (show in-flight changes)
 - Event broadcasts (lock_acquired, peer_commit)
 - Eventual consistency model
+- Status: 🚧 In progress
+- Implemented highlights:
+    - `sg peer diff <session-id>` for inspecting in-flight peer deltas
+    - `event.list` RPC + `sg peer events` for polling recent broker events
 
 ### Phase 7: Performance & Polish (2 weeks)
 - Persistent LRU blob cache

@@ -427,6 +427,7 @@ Execution checkoff (updated 2026-04-12):
     - [x] agent integration guide and 50-agent stress harness scaffold (`docs/agent_integration.md`, `tests/stress/agent_harness.py`)
   - [~] Phase 6 started
     - [x] `sg peer ls` and `sg peer diff <other-session-id>` command surface
+    - [x] event polling surface (`event.list` RPC + `sg peer events`)
     - [ ] event subscription stream surface (daemon + CLI)
     - [ ] peer snapshot VFS (`.simgit/peers/<session-id>/`)
   - [~] Phase 7 started opportunistically (continuous docs/tests hardening)

@@ -27,6 +27,7 @@ pub async fn dispatch(
         "session.abort"  => session_abort(state, params).await,
         "session.list"   => session_list(state, params).await,
         "session.diff"   => session_diff(state, params).await,
+        "event.list"     => event_list(state, params).await,
         "lock.acquire"   => lock_acquire(state, params).await,
         "lock.list"      => lock_list(state, params).await,
         "lock.wait"      => lock_wait(state, params).await,
@@ -211,6 +212,31 @@ async fn session_diff(state: &Arc<AppState>, p: serde_json::Value) -> Result<ser
         changed_paths,
     };
     serde_json::to_value(result).map_err(internal)
+}
+
+// ── event.list ───────────────────────────────────────────────────────────────
+
+async fn event_list(state: &Arc<AppState>, p: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+    let session_id = p
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            Uuid::parse_str(s).map_err(|e| RpcError {
+                code: -32602,
+                message: format!("invalid session_id: {e}"),
+                data: None,
+            })
+        })
+        .transpose()?;
+
+    let limit = p
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 500) as usize)
+        .unwrap_or(50);
+
+    let events = state.events.recent(session_id, limit);
+    serde_json::to_value(events).map_err(internal)
 }
 
 fn build_session_unified_diff(

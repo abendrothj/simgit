@@ -9,6 +9,8 @@ pub enum Peer {
     Ls(PeerLs),
     /// Show diff for another active session.
     Diff(PeerDiff),
+    /// List recent peer/global events.
+    Events(PeerEvents),
 }
 
 #[derive(Args)]
@@ -18,6 +20,17 @@ pub struct PeerLs {}
 pub struct PeerDiff {
     /// Session ID of the peer to inspect.
     pub session_id: Uuid,
+}
+
+#[derive(Args)]
+pub struct PeerEvents {
+    /// Optional session filter for emitted events.
+    #[arg(long)]
+    pub session_id: Option<Uuid>,
+
+    /// Max events to return (default 50, server max 500).
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 pub async fn run(cmd: Peer, client: &Client, json: bool) -> Result<()> {
@@ -55,6 +68,23 @@ pub async fn run(cmd: Peer, client: &Client, json: bool) -> Result<()> {
                     println!("\n(no diff output)");
                 } else {
                     println!("\n{}", diff.unified_diff);
+                }
+            }
+        }
+        Peer::Events(cmd) => {
+            let events = client.event_list(cmd.session_id, cmd.limit).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else {
+                println!("events ({})", events.len());
+                for e in events {
+                    println!(
+                        "{} | {} | {} | {}",
+                        e.emitted_at.to_rfc3339(),
+                        e.kind,
+                        e.source_session,
+                        e.payload
+                    );
                 }
             }
         }

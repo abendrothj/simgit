@@ -54,8 +54,9 @@
 //! - **diff** — Show unified diff of session changes (read-only)
 //! - **lock status** — List all write locks (by session/path/TTL)
 //! - **lock release** — Forcefully release a lock (admin only)
-//! - **peer list** — List sessions visible to a given session
-//! - **peer commit** — Send commit event to peer (signal coordination)
+//! - **peer ls** — List active peer sessions
+//! - **peer diff** — Show in-flight diff for a peer session
+//! - **peer events** — Poll recent peer/global events
 //! - **gc** — Delete STALE sessions older than 24h
 //! - **daemon start/stop/status** — Manage simgitd lifecycle
 //!

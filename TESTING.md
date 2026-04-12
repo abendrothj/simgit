@@ -337,6 +337,7 @@ jobs:
     - Phase 5 stress harness scaffold (`tests/stress/agent_harness.py`) is syntax-validated via `python3 -m py_compile`.
     - Full 50-agent runtime execution requires installed Python bindings and a running daemon-backed test repository.
     - Phase 6 CLI surface started with `sg peer diff <session-id>` (build-level validation in `cargo test -p sg`).
+    - Phase 6 event polling surface (`event.list` + `sg peer events`) is validated by daemon unit tests and crate builds.
 
 ## FAQ
 
