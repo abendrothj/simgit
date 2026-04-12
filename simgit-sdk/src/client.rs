@@ -219,4 +219,35 @@ impl Client {
             .await?;
         Ok(serde_json::from_value(result)?)
     }
+
+    /// Wait for the next event from a source session (or global stream).
+    ///
+    /// Returns `Ok(None)` on timeout.
+    pub async fn event_subscribe(
+        &self,
+        session_id: Option<Uuid>,
+        timeout_ms: Option<u64>,
+    ) -> Result<Option<PeerEvent>, SdkError> {
+        let result = self
+            .call(
+                "event.subscribe",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "timeout_ms": timeout_ms,
+                }),
+            )
+            .await?;
+
+        if result["timeout"].as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+        let event = result
+            .get("event")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if event.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_value(event)?))
+    }
 }

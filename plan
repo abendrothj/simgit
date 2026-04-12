@@ -410,27 +410,27 @@ Execution checkoff (updated 2026-04-12):
     - [x] crash-recovery persistence validation for session metadata and delta directories
     - [x] mount re-attachment regression for ACTIVE sessions using NFS-loopback backend
     - [x] Linux FUSE mount-level integration harness added (create/unlink/rename + remount scenarios)
-    - [ ] execute Linux FUSE integration harness in Linux environment and record runtime results (environment-dependent validation)
-  - [~] Phase 3 in progress
+    - [ ] execute Linux FUSE integration harness in Linux environment and record runtime results (environment-dependent validation; macOS host cannot run Linux-only test target)
     - [x] lock acquisition and TTL sweeper foundations
     - [x] EBUSY returns on mutating ops during active lock contention
     - [x] lock.list and session-aware lock.wait with holder context on timeout
     - [x] structured BorrowError payload via `lock.acquire` RPC (VFS kernel errno path remains coarse by design)
   - [x] Phase 3 completed (control-plane conflict semantics and lock observability)
-  - [~] Phase 4 in progress
+  - [x] Phase 4 completed
     - [x] pre-commit overlap detection across active sessions in `session.commit`
     - [x] multi-session integration coverage for overlap block + non-overlap success in `session.commit`
     - [x] deepen flatten conflict-path reporting and failure taxonomy
-  - [~] Phase 5 started
+  - [x] Phase 5 completed
     - [x] initial `simgit-py` PyO3 bindings scaffold (`Client`, `Session.new`, `commit`, `abort`, `diff`)
     - [x] package/publish flow for Python wheel (`maturin` + `pyproject.toml`)
     - [x] agent integration guide and 50-agent stress harness scaffold (`docs/agent_integration.md`, `tests/stress/agent_harness.py`)
-  - [~] Phase 6 started
+  - [x] Phase 6 completed
     - [x] `sg peer ls` and `sg peer diff <other-session-id>` command surface
     - [x] event polling surface (`event.list` RPC + `sg peer events`)
-    - [ ] event subscription stream surface (daemon + CLI)
-    - [ ] peer snapshot VFS (`.simgit/peers/<session-id>/`)
+    - [x] event subscription stream surface (daemon + CLI via `event.subscribe` + `sg peer events --stream`)
+    - [x] peer snapshot VFS (`.simgit/peers/<session-id>/`, read-only FUSE view)
   - [~] Phase 7 started opportunistically (continuous docs/tests hardening)
+    - [x] service packaging artifacts: systemd unit + launchd plist
 
 ─────────────────────────────────────────────────────────────────
 PHASE 0 — Foundation & Spike                           [ 2 weeks ]

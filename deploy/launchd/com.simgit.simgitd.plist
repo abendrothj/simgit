@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.simgit.simgitd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/simgitd</string>
+    <string>start</string>
+    <string>--repo-path</string>
+    <string>/Users/ja/Desktop/projects/simgit</string>
+    <string>--state-dir</string>
+    <string>/Users/ja/.local/state/simgit</string>
+    <string>--mnt-dir</string>
+    <string>/Users/ja/.local/state/simgit/mnt</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/ja/.local/state/simgit/simgitd.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/ja/.local/state/simgit/simgitd.stderr.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+</dict>
+</plist>

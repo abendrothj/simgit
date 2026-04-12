@@ -56,7 +56,7 @@
 //! - **lock release** — Forcefully release a lock (admin only)
 //! - **peer ls** — List active peer sessions
 //! - **peer diff** — Show in-flight diff for a peer session
-//! - **peer events** — Poll recent peer/global events
+//! - **peer events** — Poll recent peer/global events (`--stream` for long-poll stream)
 //! - **gc** — Delete STALE sessions older than 24h
 //! - **daemon start/stop/status** — Manage simgitd lifecycle
 //!

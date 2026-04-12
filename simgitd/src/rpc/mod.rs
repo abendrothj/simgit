@@ -50,6 +50,7 @@
 //! - **session.abort** — Discard changes
 //! - **session.diff** — Diff vs HEAD
 //! - **event.list** — Poll recent broker events
+//! - **event.subscribe** — Long-poll for the next broker event
 //! - **lock.acquire** — Attempt write-lock acquisition (structured BorrowError on conflict)
 //! - **lock.list** — Show all locks
 //! - **lock.wait** — Block until path is free

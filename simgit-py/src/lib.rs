@@ -16,12 +16,17 @@ fn py_err<E: std::fmt::Display>(e: E) -> PyErr {
 static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
 fn runtime() -> PyResult<&'static tokio::runtime::Runtime> {
-    RUNTIME.get_or_try_init(|| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(py_err)
-    })
+    if let Some(rt) = RUNTIME.get() {
+        return Ok(rt);
+    }
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(py_err)?;
+
+    let _ = RUNTIME.set(rt);
+    Ok(RUNTIME.get().expect("runtime must be initialized"))
 }
 
 fn run_async<F, T>(fut: F) -> PyResult<T>

@@ -1,0 +1,14 @@
+[Unit]
+Description=simgit daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/simgitd start --repo-path %h/projects/simgit --state-dir %h/.local/state/simgit --mnt-dir %h/.local/state/simgit/mnt
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+WorkingDirectory=%h/projects/simgit
+
+[Install]
+WantedBy=default.target

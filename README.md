@@ -139,6 +139,10 @@ simgit/
 ├── spike/                        # Phase 0 validation spikes
 │   ├── git_reader/              # gix blob/tree reading
 │   ├── overlay_test/            # CoW overlay simulation
+│
+├── deploy/                       # Runtime service definitions
+│   ├── systemd/simgitd.service  # Linux user service unit
+│   └── launchd/com.simgit.simgitd.plist # macOS launch agent
 │   └── fuse_passthrough/        # FUSE mount validation
 │
 └── tests/                        # Integration tests (Phase 1+)
@@ -259,16 +263,20 @@ cargo test --workspace
 - Opt-in `--peers` flag (show in-flight changes)
 - Event broadcasts (lock_acquired, peer_commit)
 - Eventual consistency model
-- Status: 🚧 In progress
+- Status: ✅ Completed
 - Implemented highlights:
     - `sg peer diff <session-id>` for inspecting in-flight peer deltas
     - `event.list` RPC + `sg peer events` for polling recent broker events
+    - `event.subscribe` RPC + `sg peer events --stream` for long-poll event streaming
+    - read-only peer snapshot VFS namespace at `.simgit/peers/<session-id>/` (FUSE backend)
 
 ### Phase 7: Performance & Polish (2 weeks)
 - Persistent LRU blob cache
 - Parallel multi-path reads
 - Benchmark + profile
 - Documentation + README
+- Implemented highlights:
+    - packaging artifacts for daemon service management on Linux/macOS (`deploy/systemd/simgitd.service`, `deploy/launchd/com.simgit.simgitd.plist`)
 
 ## Building & Running Tests
 

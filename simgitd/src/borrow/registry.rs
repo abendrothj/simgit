@@ -312,6 +312,11 @@ impl BorrowRegistry {
             })
             .collect()
     }
+
+    /// Return sessions currently marked ACTIVE.
+    pub fn active_sessions(&self) -> Vec<SessionInfo> {
+        self.sessions.list_active()
+    }
 }
 
 #[cfg(test)]

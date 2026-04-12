@@ -64,9 +64,11 @@
 //! FUSE is Linux-native. macOS support uses NFS-loopback (see [nfs_backend]).
 
 use std::ffi::OsStr;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -114,6 +116,7 @@ impl super::VfsBackendTrait for FuseBackend {
 
         let fs = SessionFs::new(
             session.session_id,
+            session.peers_enabled,
             Arc::clone(&self.cfg),
             session.base_commit.clone(),
             Arc::clone(&self.deltas),
@@ -214,6 +217,7 @@ impl super::VfsBackendTrait for FuseBackend {
 
 struct SessionFs {
     session_id:   Uuid,
+    peers_enabled: bool,
     cfg:          Arc<Config>,
     base_commit:  String,
     deltas:       Arc<DeltaStore>,
@@ -221,6 +225,9 @@ struct SessionFs {
     tree_cache:   Arc<TreeCache>,
     blob_cache:   Arc<BlobCache>,
     inode_map:    Arc<InodeMap>,
+    virtual_inos: Arc<Mutex<HashMap<u64, PathBuf>>>,
+    virtual_paths: Arc<Mutex<HashMap<PathBuf, u64>>>,
+    next_virtual_ino: Arc<AtomicU64>,
 }
 
 impl SessionFs {
@@ -239,6 +246,7 @@ impl SessionFs {
     /// - `repo`: Open git repository handle
     fn new(
         session_id: Uuid,
+        peers_enabled: bool,
         cfg: Arc<Config>,
         base_commit: String,
         deltas: Arc<DeltaStore>,
@@ -246,6 +254,7 @@ impl SessionFs {
     ) -> Self {
         Self {
             session_id,
+            peers_enabled,
             cfg,
             base_commit,
             deltas,
@@ -253,11 +262,86 @@ impl SessionFs {
             tree_cache:   Arc::new(TreeCache::new(100)),
             blob_cache:   Arc::new(BlobCache::new(50, 10 * 1024 * 1024)), // 50 blobs, 10MB cap
             inode_map:    Arc::new(InodeMap::new()),
+            virtual_inos: Arc::new(Mutex::new(HashMap::new())),
+            virtual_paths: Arc::new(Mutex::new(HashMap::new())),
+            next_virtual_ino: Arc::new(AtomicU64::new(1u64 << 62)),
+        }
+    }
+
+    fn ensure_virtual_ino(&self, path: &std::path::Path) -> u64 {
+        if let Some(ino) = self.virtual_paths.lock().unwrap().get(path).copied() {
+            return ino;
+        }
+        let ino = self.next_virtual_ino.fetch_add(1, Ordering::Relaxed);
+        self.virtual_inos.lock().unwrap().insert(ino, path.to_path_buf());
+        self.virtual_paths.lock().unwrap().insert(path.to_path_buf(), ino);
+        ino
+    }
+
+    fn virtual_path_of(&self, ino: u64) -> Option<PathBuf> {
+        self.virtual_inos.lock().unwrap().get(&ino).cloned()
+    }
+
+    fn active_peer_ids(&self) -> Vec<Uuid> {
+        if !self.peers_enabled {
+            return Vec::new();
+        }
+        let mut peers: Vec<Uuid> = self
+            .borrows
+            .active_sessions()
+            .into_iter()
+            .filter(|s| s.session_id != self.session_id)
+            .map(|s| s.session_id)
+            .collect();
+        peers.sort();
+        peers
+    }
+
+    fn peer_children(&self, peer_session: Uuid, dir: &std::path::Path) -> Vec<(String, bool)> {
+        let manifest = match self.deltas.load_manifest(peer_session) {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        let mut entries: HashMap<String, bool> = HashMap::new();
+        for path in manifest.writes.keys() {
+            if !dir.as_os_str().is_empty() && !path.starts_with(dir) {
+                continue;
+            }
+            let rel = if dir.as_os_str().is_empty() {
+                path.as_path()
+            } else {
+                match path.strip_prefix(dir) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                }
+            };
+            let mut comps = rel.components();
+            let Some(first) = comps.next() else {
+                continue;
+            };
+            let name = first.as_os_str().to_string_lossy().to_string();
+            let is_dir = comps.next().is_some();
+            entries
+                .entry(name)
+                .and_modify(|v| *v = *v || is_dir)
+                .or_insert(is_dir);
+        }
+        let mut out: Vec<(String, bool)> = entries.into_iter().collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    fn peer_file_bytes(&self, peer_session: Uuid, rel: &std::path::Path) -> Option<Vec<u8>> {
+        match self.deltas.read_blob(peer_session, rel) {
+            Ok(Some(b)) => Some(b),
+            _ => None,
         }
     }
 }
 
 const TTL: Duration = Duration::from_secs(1);
+const SIMGIT_META_DIR: &str = ".simgit";
+const SIMGIT_PEERS_DIR: &str = ".simgit/peers";
 
 impl Filesystem for SessionFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -270,6 +354,67 @@ impl Filesystem for SessionFs {
         };
 
         debug!(session = %self.session_id, parent = parent.0, name = name_str, "lookup");
+
+        if parent.0 == 1 && name_str == SIMGIT_META_DIR {
+            let ino = self.ensure_virtual_ino(std::path::Path::new(SIMGIT_META_DIR));
+            reply.entry(&TTL, &virtual_dir_attr(INodeNo(ino)), Generation(0));
+            return;
+        }
+
+        if let Some(parent_path) = self.virtual_path_of(parent.0) {
+            if parent_path == std::path::Path::new(SIMGIT_META_DIR) {
+                if name_str == "peers" {
+                    let ino = self.ensure_virtual_ino(std::path::Path::new(SIMGIT_PEERS_DIR));
+                    reply.entry(&TTL, &virtual_dir_attr(INodeNo(ino)), Generation(0));
+                    return;
+                }
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            if parent_path == std::path::Path::new(SIMGIT_PEERS_DIR) {
+                if !self.peers_enabled {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+                let Ok(peer_id) = Uuid::parse_str(name_str) else {
+                    reply.error(Errno::ENOENT);
+                    return;
+                };
+                if !self.active_peer_ids().contains(&peer_id) {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+                let child = std::path::Path::new(SIMGIT_PEERS_DIR).join(name_str);
+                let ino = self.ensure_virtual_ino(&child);
+                reply.entry(&TTL, &virtual_dir_attr(INodeNo(ino)), Generation(0));
+                return;
+            }
+            if let Some((peer_id, rel_dir)) = parse_virtual_peer_path(&parent_path) {
+                let children = self.peer_children(peer_id, &rel_dir);
+                if let Some((_, is_dir)) = children.iter().find(|(n, _)| n == name_str) {
+                    let child_rel = rel_dir.join(name_str);
+                    let full = std::path::Path::new(SIMGIT_PEERS_DIR)
+                        .join(peer_id.to_string())
+                        .join(&child_rel);
+                    let ino = self.ensure_virtual_ino(&full);
+                    if *is_dir {
+                        reply.entry(&TTL, &virtual_dir_attr(INodeNo(ino)), Generation(0));
+                    } else {
+                        let size = self
+                            .peer_file_bytes(peer_id, &child_rel)
+                            .map(|b| b.len() as u64)
+                            .unwrap_or(0);
+                        reply.entry(&TTL, &virtual_file_attr(INodeNo(ino), size), Generation(0));
+                    }
+                    return;
+                }
+                reply.error(Errno::ENOENT);
+                return;
+            }
+
+            reply.error(Errno::ENOENT);
+            return;
+        }
 
         let parent_tree_oid = match directory_tree_oid_for_ino(
             parent.0,
@@ -358,6 +503,31 @@ impl Filesystem for SessionFs {
             return;
         }
 
+        if let Some(path) = self.virtual_path_of(ino.0) {
+            if path == std::path::Path::new(SIMGIT_META_DIR)
+                || path == std::path::Path::new(SIMGIT_PEERS_DIR)
+            {
+                reply.attr(&TTL, &virtual_dir_attr(ino));
+                return;
+            }
+            if let Some((peer_id, rel)) = parse_virtual_peer_path(&path) {
+                if rel.as_os_str().is_empty() {
+                    reply.attr(&TTL, &virtual_dir_attr(ino));
+                    return;
+                }
+                if let Some(bytes) = self.peer_file_bytes(peer_id, &rel) {
+                    reply.attr(&TTL, &virtual_file_attr(ino, bytes.len() as u64));
+                    return;
+                }
+                if !self.peer_children(peer_id, &rel).is_empty() {
+                    reply.attr(&TTL, &virtual_dir_attr(ino));
+                    return;
+                }
+            }
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
         if let Some(meta) = self.inode_map.delta_file_of(ino.0) {
             if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(true) {
                 reply.error(Errno::ENOENT);
@@ -434,6 +604,49 @@ impl Filesystem for SessionFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        if ino.0 != 1 {
+            if let Some(path) = self.virtual_path_of(ino.0) {
+                let mut entries: Vec<(u64, FileType, String)> = vec![
+                    (ino.0, FileType::Directory, ".".to_owned()),
+                    (1, FileType::Directory, "..".to_owned()),
+                ];
+
+                if path == std::path::Path::new(SIMGIT_META_DIR) {
+                    let peers_ino = self.ensure_virtual_ino(std::path::Path::new(SIMGIT_PEERS_DIR));
+                    entries.push((peers_ino, FileType::Directory, "peers".to_owned()));
+                } else if path == std::path::Path::new(SIMGIT_PEERS_DIR) {
+                    if self.peers_enabled {
+                        for peer in self.active_peer_ids() {
+                            let p = std::path::Path::new(SIMGIT_PEERS_DIR).join(peer.to_string());
+                            let child_ino = self.ensure_virtual_ino(&p);
+                            entries.push((child_ino, FileType::Directory, peer.to_string()));
+                        }
+                    }
+                } else if let Some((peer_id, rel)) = parse_virtual_peer_path(&path) {
+                    for (name, is_dir) in self.peer_children(peer_id, &rel) {
+                        let child_rel = rel.join(&name);
+                        let full = std::path::Path::new(SIMGIT_PEERS_DIR)
+                            .join(peer_id.to_string())
+                            .join(child_rel);
+                        let child_ino = self.ensure_virtual_ino(&full);
+                        entries.push((
+                            child_ino,
+                            if is_dir { FileType::Directory } else { FileType::RegularFile },
+                            name,
+                        ));
+                    }
+                }
+
+                for (i, (entry_ino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
+                    if reply.add(INodeNo(*entry_ino), (i + 1) as u64, *kind, name) {
+                        break;
+                    }
+                }
+                reply.ok();
+                return;
+            }
+        }
+
         let tree_oid = match directory_tree_oid_for_ino(
             ino.0,
             &self.base_commit,
@@ -465,6 +678,10 @@ impl Filesystem for SessionFs {
             (1u64, FileType::Directory, ".".to_owned()),
             (1u64, FileType::Directory, "..".to_owned()),
         ];
+        if ino.0 == 1 {
+            let sm_ino = self.ensure_virtual_ino(std::path::Path::new(SIMGIT_META_DIR));
+            entries.push((sm_ino, FileType::Directory, SIMGIT_META_DIR.to_owned()));
+        }
 
         // Add git tree entries.
         let parent_path = if ino.0 == 1 {
@@ -543,6 +760,20 @@ impl Filesystem for SessionFs {
         reply: ReplyData,
     ) {
         if ino.0 == 1 {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+
+        if let Some(path) = self.virtual_path_of(ino.0) {
+            if let Some((peer_id, rel)) = parse_virtual_peer_path(&path) {
+                if let Some(bytes) = self.peer_file_bytes(peer_id, &rel) {
+                    let slice = file_slice(&bytes, offset as usize, size as usize);
+                    reply.data(slice);
+                    return;
+                }
+                reply.error(Errno::ENOENT);
+                return;
+            }
             reply.error(Errno::EISDIR);
             return;
         }
@@ -640,6 +871,17 @@ impl Filesystem for SessionFs {
             return;
         }
 
+        if let Some(path) = self.virtual_path_of(ino.0) {
+            if let Some((peer_id, rel)) = parse_virtual_peer_path(&path) {
+                if self.peer_file_bytes(peer_id, &rel).is_some() {
+                    reply.opened(FileHandle(0), FopenFlags::empty());
+                    return;
+                }
+            }
+            reply.error(Errno::EISDIR);
+            return;
+        }
+
         if let Some(meta) = self.inode_map.delta_file_of(ino.0) {
             if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(true) {
                 reply.error(Errno::ENOENT);
@@ -670,6 +912,11 @@ impl Filesystem for SessionFs {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if self.virtual_path_of(ino.0).is_some() {
+            reply.opened(FileHandle(0), FopenFlags::empty());
+            return;
+        }
+
         match directory_tree_oid_for_ino(
             ino.0,
             &self.base_commit,
@@ -1282,10 +1529,70 @@ fn root_attr() -> FileAttr {
     }
 }
 
+fn virtual_dir_attr(ino: INodeNo) -> FileAttr {
+    FileAttr {
+        ino,
+        size: 0,
+        blocks: 0,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::Directory,
+        perm: 0o555,
+        nlink: 2,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        rdev: 0,
+        flags: 0,
+        blksize: 512,
+    }
+}
+
+fn virtual_file_attr(ino: INodeNo, size: u64) -> FileAttr {
+    FileAttr {
+        ino,
+        size,
+        blocks: (size + 511) / 512,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::RegularFile,
+        perm: 0o444,
+        nlink: 1,
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+        rdev: 0,
+        flags: 0,
+        blksize: 4096,
+    }
+}
+
+fn parse_virtual_peer_path(path: &std::path::Path) -> Option<(Uuid, PathBuf)> {
+    let mut comps = path.components();
+    let c0 = comps.next()?.as_os_str().to_str()?;
+    let c1 = comps.next()?.as_os_str().to_str()?;
+    let c2 = comps.next()?.as_os_str().to_str()?;
+    if c0 != ".simgit" || c1 != "peers" {
+        return None;
+    }
+    let peer = Uuid::parse_str(c2).ok()?;
+    let mut rel = PathBuf::new();
+    for c in comps {
+        rel.push(c.as_os_str());
+    }
+    Some((peer, rel))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{apply_write_at_offset, file_slice, full_child_path, path_starts_with_dir, InodeMap};
+    use super::{
+        apply_write_at_offset, file_slice, full_child_path, parse_virtual_peer_path,
+        path_starts_with_dir, InodeMap,
+    };
     use std::path::PathBuf;
+    use uuid::Uuid;
 
     #[test]
     fn file_slice_within_bounds() {
@@ -1332,6 +1639,21 @@ mod tests {
         assert!(!path_starts_with_dir(std::path::Path::new("src/main.rs"), std::path::Path::new("")));
         assert!(path_starts_with_dir(std::path::Path::new("src/main.rs"), std::path::Path::new("src")));
         assert!(!path_starts_with_dir(std::path::Path::new("src/nested/main.rs"), std::path::Path::new("src")));
+    }
+
+    #[test]
+    fn parse_virtual_peer_path_extracts_peer_and_relative_path() {
+        let peer = Uuid::now_v7();
+        let path = PathBuf::from(format!(".simgit/peers/{}/src/main.rs", peer));
+        let parsed = parse_virtual_peer_path(&path).expect("should parse");
+        assert_eq!(parsed.0, peer);
+        assert_eq!(parsed.1, PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn parse_virtual_peer_path_rejects_non_virtual_prefix() {
+        let path = PathBuf::from("src/main.rs");
+        assert!(parse_virtual_peer_path(&path).is_none());
     }
 }
 
