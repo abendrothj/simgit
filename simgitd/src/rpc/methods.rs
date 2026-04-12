@@ -8,8 +8,8 @@ use anyhow::Result;
 use uuid::Uuid;
 
 use simgit_sdk::{
-    BorrowError, RpcError, SessionStatus,
-    ERR_BORROW_CONFLICT, ERR_MERGE_CONFLICT, ERR_SESSION_NOT_FOUND, ERR_QUOTA_EXCEEDED,
+    RpcError, SessionStatus,
+    ERR_MERGE_CONFLICT, ERR_SESSION_NOT_FOUND,
 };
 
 use crate::daemon::AppState;
@@ -297,17 +297,47 @@ async fn lock_list(state: &Arc<AppState>, p: serde_json::Value) -> Result<serde_
 async fn lock_wait(state: &Arc<AppState>, p: serde_json::Value) -> Result<serde_json::Value, RpcError> {
     let path       = PathBuf::from(str_field(&p, "path")?);
     let timeout_ms = p["timeout_ms"].as_u64().unwrap_or(5000);
-    let caller     = uuid::Uuid::nil(); // anonymous poll — no specific session
+    let caller     = p["session_id"]
+        .as_str()
+        .map(|s| s.parse::<Uuid>().map_err(|_| RpcError {
+            code:    -32602,
+            message: "invalid UUID for param: session_id".to_owned(),
+            data:    None,
+        }))
+        .transpose()?
+        .unwrap_or_else(uuid::Uuid::nil);
 
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_millis(timeout_ms);
+    let start = tokio::time::Instant::now();
+    let deadline = start + std::time::Duration::from_millis(timeout_ms);
 
     loop {
         if state.borrows.is_write_free(&path, caller) {
-            return Ok(serde_json::json!({ "acquired": true }));
+            return Ok(serde_json::json!({
+                "acquired": true,
+                "waited_ms": start.elapsed().as_millis() as u64,
+            }));
         }
         if tokio::time::Instant::now() >= deadline {
-            return Ok(serde_json::json!({ "acquired": false }));
+            let holder = state
+                .borrows
+                .list(Some(&path))
+                .into_iter()
+                .find(|l| l.path == path)
+                .and_then(|l| l.writer_session)
+                .and_then(|sid| state.sessions.get(sid))
+                .map(|info| serde_json::json!({
+                    "session_id": info.session_id,
+                    "task_id": info.task_id,
+                    "agent_label": info.agent_label,
+                    "created_at": info.created_at,
+                }));
+
+            return Ok(serde_json::json!({
+                "acquired": false,
+                "waited_ms": start.elapsed().as_millis() as u64,
+                "path": path,
+                "holder": holder,
+            }));
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }

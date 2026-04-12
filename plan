@@ -411,7 +411,8 @@ Execution checkoff (updated 2026-04-12):
   - [~] Phase 3 in progress
     - [x] lock acquisition and TTL sweeper foundations
     - [x] EBUSY returns on mutating ops during active lock contention
-    - [ ] lock.list/lock.wait full UX and structured conflict payload propagation in VFS path
+    - [x] lock.list and session-aware lock.wait with holder context on timeout
+    - [ ] structured conflict payload propagation from VFS syscall path (kernel errno path still coarse)
   - [ ] Phase 4 pending
   - [ ] Phase 5 pending
   - [ ] Phase 6 pending
