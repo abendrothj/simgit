@@ -1,41 +1,9 @@
 //! # sg — simgit Command-Line Interface
-/// Command-line arguments for the sg CLI.
-///
-/// # Global Options
-///
-/// - `--socket <PATH>`: Custom daemon socket path (defaults to `$XDG_RUNTIME_DIR/simgitd.sock`)
-/// - `--json`: Output in JSON format (for machine parsing)
-///
-/// # Subcommands
-///
-/// See [`Commands`] enum for available subcommands.
 //!
 //! A command-line tool for managing simgit agent sessions with borrow-checked filesystem semantics.
 //!
 //! ## Overview
 //!
-/// All available sg subcommands.
-///
-/// Each subcommand corresponds to an RPC method in simgitd:
-///
-/// - **Init** (`session.create` future; startup handshake)
-/// - **New** (`session.create`)
-/// - **Commit** (`session.commit` with `flatten=true`)
-/// - **Abort** (`session.abort`)
-/// - **Diff** (`session.diff`)
-/// - **Status** (`session.list` + `lock.list`)
-/// - **Lock** (nested: `lock.list`, `lock.release`)
-/// - **Peer** (nested: `session.list` with `peer_filter`)
-/// - **Gc** (custom: delete stale sessions)
-/// - **Daemon** (nested: `daemon.start`, `daemon.stop`, `daemon.status`)
-///
-/// # Example
-///
-/// ```bash
-/// sg new --branch feature-x         # Dispatch to Commands::New
-/// sg lock release <lock_id>         # Dispatch to Commands::Lock(Release)
-/// sg daemon start                   # Dispatch to Commands::Daemon(Start)
-/// ```
 //! `sg` is the primary user-facing interface to simgitd. It provides clients (AI agents, human users)
 //! with commands to:
 //! - **Create sessions** with borrow-checked write semantics
@@ -130,12 +98,22 @@
 //! - Streaming output (large diffs)
 //! - Authentication/authorization (Entra ID)
 //! - Custom output formats (CSV, YAML)
-//!
+
 mod commands;
 
 use clap::{Parser, Subcommand};
 use anyhow::Result;
 
+/// Command-line arguments for the sg CLI.
+///
+/// # Global Options
+///
+/// - `--socket <PATH>`: Custom daemon socket path (defaults to `$XDG_RUNTIME_DIR/simgitd.sock`)
+/// - `--json`: Output in JSON format (for machine parsing)
+///
+/// # Subcommands
+///
+/// See [`Commands`] enum for available subcommands.
 #[derive(Parser)]
 #[command(name = "sg", about = "simgit — borrow-checked filesystem sessions for AI agents")]
 struct Cli {
@@ -151,6 +129,28 @@ struct Cli {
     command: Commands,
 }
 
+/// All available sg subcommands.
+///
+/// Each subcommand corresponds to an RPC method in simgitd:
+///
+/// - **Init** (`session.create` future; startup handshake)
+/// - **New** (`session.create`)
+/// - **Commit** (`session.commit` with `flatten=true`)
+/// - **Abort** (`session.abort`)
+/// - **Diff** (`session.diff`)
+/// - **Status** (`session.list` + `lock.list`)
+/// - **Lock** (nested: `lock.list`, `lock.release`)
+/// - **Peer** (nested: `session.list` with `peer_filter`)
+/// - **Gc** (custom: delete stale sessions)
+/// - **Daemon** (nested: `daemon.start`, `daemon.stop`, `daemon.status`)
+///
+/// # Example
+///
+/// ```bash
+/// sg new --branch feature-x         # Dispatch to Commands::New
+/// sg lock release <lock_id>         # Dispatch to Commands::Lock(Release)
+/// sg daemon start                   # Dispatch to Commands::Daemon(Start)
+/// ```
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize simgit for a repository and start the daemon.
@@ -177,6 +177,7 @@ enum Commands {
     #[command(subcommand)]
     Daemon(commands::daemon::Daemon),
 }
+
 /// Entry point for the sg CLI.
 ///
 /// # Execution Flow
@@ -203,7 +204,6 @@ enum Commands {
 /// sg --socket /tmp/test.sock new --branch feature-x
 /// # Returns exit code 0 if successful, non-zero if failed
 /// ```
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();

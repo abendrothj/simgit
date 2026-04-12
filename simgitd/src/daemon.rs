@@ -84,15 +84,6 @@ use crate::rpc::RpcServer;
 use crate::session::SessionManager;
 use crate::vfs::VfsManager;
 
-/// Shared application state threaded through every subsystem.
-#[derive(Clone)]
-pub struct AppState {
-    pub config:   Arc<Config>,
-    pub sessions: Arc<SessionManager>,
-    pub borrows:  Arc<BorrowRegistry>,
-    pub deltas:   Arc<DeltaStore>,
-    pub events:   Arc<EventBroker>,
-    pub vfs:      Arc<VfsManager>,
 /// Shared application state distributed to all subsystems.
 ///
 /// All major components (sessions, borrows, deltas, events, VFS) maintain
@@ -125,11 +116,16 @@ pub struct AppState {
 /// state.events.publish(Event::PeerCommit { ... })?;
 /// state.vfs.mount(&session).await?;
 /// ```
+#[derive(Clone)]
+pub struct AppState {
+    pub config:   Arc<Config>,
+    pub sessions: Arc<SessionManager>,
+    pub borrows:  Arc<BorrowRegistry>,
+    pub deltas:   Arc<DeltaStore>,
+    pub events:   Arc<EventBroker>,
+    pub vfs:      Arc<VfsManager>,
 }
 
-pub async fn run(cfg: Config) -> Result<()> {
-    // Ensure state directories exist.
-    std::fs::create_dir_all(&cfg.state_dir)
 /// Run the simgitd daemon until shutdown signal.
 ///
 /// # Arguments
@@ -166,6 +162,9 @@ pub async fn run(cfg: Config) -> Result<()> {
 /// - **SIGINT** (Ctrl+C): Initiates graceful shutdown
 /// - **SIGTERM**: Initiates graceful shutdown
 /// - Unhandled **SIGKILL**: Process dies; sessions persist in DB for recovery on restart
+pub async fn run(cfg: Config) -> Result<()> {
+    // Ensure state directories exist.
+    std::fs::create_dir_all(&cfg.state_dir)
         .with_context(|| format!("create state_dir: {}", cfg.state_dir.display()))?;
     std::fs::create_dir_all(&cfg.mnt_dir)
         .with_context(|| format!("create mnt_dir: {}", cfg.mnt_dir.display()))?;
