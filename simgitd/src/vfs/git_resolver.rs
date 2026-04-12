@@ -561,5 +561,37 @@ mod tests {
 
         let _ = fs::remove_dir_all(&repo);
     }
+
+    #[test]
+    fn blob_cache_reads_binary_blob_losslessly() {
+        let repo = temp_repo_dir();
+        fs::create_dir_all(&repo).expect("create temp repo");
+
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "user.email", "tests@simgit.local"]);
+        run_git(&repo, &["config", "user.name", "simgit-tests"]);
+
+        let binary = vec![0u8, 1, 2, 3, 255, 10, 20, 30, 40, 50];
+        fs::write(repo.join("bin.dat"), &binary).expect("write binary file");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "binary"]);
+
+        let blob_oid_output = Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD:bin.dat"])
+            .output()
+            .expect("blob rev-parse should execute");
+        assert!(blob_oid_output.status.success(), "blob rev-parse failed");
+        let blob_oid = String::from_utf8(blob_oid_output.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned();
+
+        let cache = BlobCache::new(8, 1024 * 1024);
+        let bytes = cache.get(&blob_oid, &repo).expect("binary blob lookup should pass");
+        assert_eq!(bytes, binary);
+
+        let _ = fs::remove_dir_all(&repo);
+    }
 }
 

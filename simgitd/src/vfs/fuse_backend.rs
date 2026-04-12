@@ -67,7 +67,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use anyhow::Result;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo,
-    MountOption, ReplyAttr, ReplyDirectory, ReplyEntry, Request,
+    LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -382,6 +382,72 @@ impl Filesystem for SessionFs {
         }
         reply.ok();
     }
+
+    fn read(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyData,
+    ) {
+        if ino.0 == 1 {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+
+        let Some(entry) = lookup_entry_for_ino(ino.0, &self.cfg.repo_path, &self.tree_cache, &self.inode_map) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        if entry.kind == super::git_resolver::EntryKind::Dir {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+
+        let offset = offset as usize;
+        let data = match self.blob_cache.get(&entry.oid, &self.cfg.repo_path) {
+            Ok(d) => d,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        let slice = file_slice(&data, offset, size as usize);
+        reply.data(slice);
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        if ino.0 == 1 {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+
+        let Some(entry) = lookup_entry_for_ino(ino.0, &self.cfg.repo_path, &self.tree_cache, &self.inode_map) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        if entry.kind != super::git_resolver::EntryKind::Symlink {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+
+        let target = match self.blob_cache.get(&entry.oid, &self.cfg.repo_path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        reply.data(&target);
+    }
 }
 
 fn resolve_tree_oid(repo_path: &std::path::Path, commitish: &str) -> Result<String> {
@@ -432,6 +498,25 @@ fn directory_tree_oid_for_ino(
     Ok(entry.oid.clone())
 }
 
+fn lookup_entry_for_ino(
+    ino: u64,
+    repo_path: &std::path::Path,
+    tree_cache: &TreeCache,
+    inode_map: &InodeMap,
+) -> Option<super::git_resolver::TreeEntry> {
+    let (tree_oid, entry_idx) = inode_map.lookup(ino)?;
+    let entries = tree_cache.get(&tree_oid, repo_path).ok()?;
+    entries.get(entry_idx).cloned()
+}
+
+fn file_slice(data: &[u8], offset: usize, size: usize) -> &[u8] {
+    if offset >= data.len() {
+        return &[];
+    }
+    let end = offset.saturating_add(size).min(data.len());
+    &data[offset..end]
+}
+
 fn entry_kind_to_file_type(kind: super::git_resolver::EntryKind) -> FileType {
     match kind {
         super::git_resolver::EntryKind::File => FileType::RegularFile,
@@ -477,5 +562,28 @@ fn root_attr() -> FileAttr {
         rdev:    0,
         flags:   0,
         blksize: 512,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_slice;
+
+    #[test]
+    fn file_slice_within_bounds() {
+        let data = b"abcdef";
+        assert_eq!(file_slice(data, 1, 3), b"bcd");
+    }
+
+    #[test]
+    fn file_slice_offset_past_end() {
+        let data = b"abcdef";
+        assert_eq!(file_slice(data, 99, 5), b"");
+    }
+
+    #[test]
+    fn file_slice_truncates_to_end() {
+        let data = b"abcdef";
+        assert_eq!(file_slice(data, 4, 10), b"ef");
     }
 }
