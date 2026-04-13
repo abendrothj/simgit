@@ -29,6 +29,10 @@ async-trait.workspace = true
 libc.workspace        = true
 prometheus            = "0.13"
 axum                  = "0.7"
+opentelemetry         = "0.27"
+opentelemetry_sdk     = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp    = { version = "0.27", features = ["grpc-tonic", "trace"] }
+tracing-opentelemetry = "0.28"
 
 # NFS-loopback support (macOS primary, optional on Linux)
 [target.'cfg(target_os = "macos")'.dependencies]

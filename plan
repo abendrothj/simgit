@@ -434,6 +434,8 @@ Execution checkoff (updated 2026-04-12):
     - [x] service packaging artifacts: systemd unit + launchd plist
     - [x] embedded Prometheus endpoint with configurable bind (`SIMGIT_METRICS_ENABLED`, `SIMGIT_METRICS_ADDR`)
     - [x] RPC/server instrumentation for request volume/latency, lock conflicts, session lifecycle counters, and active gauges
+    - [x] optional OTLP gRPC tracing bootstrap (`SIMGIT_OTLP_ENDPOINT`)
+    - [x] dev/test container profile with daemon + Prometheus (`deploy/dev/`)
 
 ─────────────────────────────────────────────────────────────────
 PHASE 0 — Foundation & Spike                           [ 2 weeks ]

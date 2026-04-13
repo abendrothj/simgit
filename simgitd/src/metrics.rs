@@ -127,11 +127,65 @@ async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> impl IntoRespon
 }
 
 pub async fn serve(metrics: Arc<Metrics>, addr: &str) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    serve_listener(metrics, listener).await
+}
+
+pub async fn serve_listener(
+    metrics: Arc<Metrics>,
+    listener: tokio::net::TcpListener,
+) -> Result<()> {
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .with_state(metrics);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn metrics_endpoint_exposes_key_series() {
+        let metrics = Arc::new(Metrics::new().expect("metrics init"));
+        metrics.observe_rpc("session.create", true, None, 0.001);
+        metrics.set_active_counts(2, 3);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let server_metrics = Arc::clone(&metrics);
+        let server_task = tokio::spawn(async move {
+            let _ = serve_listener(server_metrics, listener).await;
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect metrics server");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write request");
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        let response = String::from_utf8(response).expect("valid utf8");
+
+        assert!(response.contains("HTTP/1.1 200 OK"));
+        assert!(response.contains("simgit_rpc_requests_total"));
+        assert!(response.contains("simgit_rpc_duration_seconds"));
+        assert!(response.contains("simgit_lock_conflicts_total"));
+        assert!(response.contains("simgit_active_sessions"));
+        assert!(response.contains("simgit_active_locks"));
+
+        server_task.abort();
+    }
 }

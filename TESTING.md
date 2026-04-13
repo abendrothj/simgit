@@ -343,6 +343,8 @@ jobs:
     - Linux-only FUSE integration tests remain unexecuted on this macOS host (`cargo test -p simgitd linux_integration_tests -- --ignored` runs 0 tests).
     - Linux FUSE integration tests are now wired to CI in `.github/workflows/fuse-linux-integration.yml` (manual + nightly); job skips when `/dev/fuse` is unavailable on runner.
     - Phase 7 metrics instrumentation compiles and is covered by daemon regression suite (`cargo test -p simgitd`).
+    - Phase 7 includes an HTTP scrape test for `GET /metrics` in `metrics::tests::metrics_endpoint_exposes_key_series`.
+    - Phase 7 adds a local container profile for observability smoke checks in `deploy/dev/` (daemon + Prometheus).
 
 ## FAQ
 

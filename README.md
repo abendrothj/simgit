@@ -64,6 +64,19 @@ Current metrics include:
 - Lock conflict counter (`simgit_lock_conflicts_total`)
 - Active gauges (`simgit_active_sessions`, `simgit_active_locks`)
 
+Optional OTLP tracing export (gRPC) is enabled by setting:
+
+```bash
+export SIMGIT_OTLP_ENDPOINT=http://127.0.0.1:4317
+```
+
+For a local dev/test setup with daemon + Prometheus, use the container profile:
+
+```bash
+cd deploy/dev
+docker compose up --build
+```
+
 ## Architecture
 
 ```

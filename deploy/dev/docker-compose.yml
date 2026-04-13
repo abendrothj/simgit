@@ -1,0 +1,25 @@
+services:
+  simgitd:
+    build:
+      context: ../..
+      dockerfile: deploy/dev/Dockerfile
+    environment:
+      SIMGIT_REPO: /workspace/repo
+      SIMGIT_STATE_DIR: /workspace/state
+      SIMGIT_METRICS_ENABLED: "1"
+      SIMGIT_METRICS_ADDR: 0.0.0.0:9100
+    volumes:
+      - ./test-repo:/workspace/repo
+      - ./state:/workspace/state
+    ports:
+      - "9100:9100"
+
+  prometheus:
+    image: prom/prometheus:v2.53.3
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - simgitd
