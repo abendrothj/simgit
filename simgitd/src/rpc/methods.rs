@@ -94,6 +94,8 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
 
     let info = state.sessions.get(session_id).ok_or_else(|| not_found(session_id))?;
 
+    let stage_started = std::time::Instant::now();
+
     // Capture mount-side changes in a blocking task to avoid starving the async executor.
     // This is heavy I/O (git subprocess calls, file walks) that must not block other RPC handlers.
     let state_clone = Arc::clone(state);
@@ -104,7 +106,11 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
     .await
     .map_err(|e| internal(format!("task join error: {e}")))?
     .map_err(internal)?;
+    state
+        .metrics
+        .observe_session_commit_stage("capture_self", stage_started.elapsed().as_secs_f64());
 
+    let stage_started = std::time::Instant::now();
     let active_sessions = state.sessions.list(Some(SessionStatus::Active));
     
     // Capture deltas for all active peers in a blocking task.
@@ -119,7 +125,11 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
     .await
     .map_err(|e| internal(format!("task join error: {e}")))?
     .map_err(internal)?;
+    state
+        .metrics
+        .observe_session_commit_stage("capture_peers", stage_started.elapsed().as_secs_f64());
 
+    let stage_started = std::time::Instant::now();
     let manifest = state.deltas.load_manifest(session_id).map_err(internal)?;
     let this_ops = changed_path_ops(&manifest);
 
@@ -156,7 +166,21 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
             }));
         }
     }
+    state
+        .metrics
+        .observe_session_commit_stage("conflict_scan", stage_started.elapsed().as_secs_f64());
     if !conflicts.is_empty() {
+        let conflicting_paths = conflicts
+            .iter()
+            .filter_map(|conflict| conflict.get("paths"))
+            .filter_map(|paths| paths.as_array())
+            .map(|paths| paths.len())
+            .sum::<usize>();
+        state.metrics.observe_session_commit_conflict(
+            "active_session_overlap",
+            conflicts.len(),
+            conflicting_paths,
+        );
         return Err(RpcError {
             code: ERR_MERGE_CONFLICT,
             message: "pre-commit conflict: overlapping active session paths".to_owned(),
@@ -168,6 +192,7 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
         });
     }
 
+    let stage_started = std::time::Instant::now();
     // Flatten delta to git branch in a blocking task (heavy git I/O).
     let repo_path = state.config.repo_path.clone();
     let base_commit = info.base_commit.clone();
@@ -187,6 +212,9 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
     .await
     .map_err(|e| internal(format!("task join error: {e}")))?
     .map_err(|e| flatten_error_to_rpc(e, session_id, &branch_name))?;
+    state
+        .metrics
+        .observe_session_commit_stage("flatten", stage_started.elapsed().as_secs_f64());
 
     // Release locks, update status.
     state.borrows.release_session(session_id);
@@ -946,6 +974,11 @@ mod tests {
         let conflicts = data["conflicts"].as_array().expect("conflicts array");
         assert!(!conflicts.is_empty());
 
+        let metrics = state.metrics.render().expect("render metrics");
+        assert!(metrics.contains("simgit_session_commit_conflicts_total{kind=\"active_session_overlap\"} 1"));
+        assert!(metrics.contains("simgit_session_commit_conflict_paths_sum 1"));
+        assert!(metrics.contains("simgit_session_commit_conflict_peers_sum 1"));
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1003,6 +1036,12 @@ mod tests {
         assert!(res.is_ok(), "non-overlap commit should succeed");
         let updated = state.sessions.get(s1.session_id).expect("s1 exists");
         assert_eq!(updated.status, simgit_sdk::SessionStatus::Committed);
+
+        let metrics = state.metrics.render().expect("render metrics");
+        assert!(metrics.contains("simgit_session_commit_stage_duration_seconds_count{stage=\"capture_self\"} 1"));
+        assert!(metrics.contains("simgit_session_commit_stage_duration_seconds_count{stage=\"capture_peers\"} 1"));
+        assert!(metrics.contains("simgit_session_commit_stage_duration_seconds_count{stage=\"conflict_scan\"} 1"));
+        assert!(metrics.contains("simgit_session_commit_stage_duration_seconds_count{stage=\"flatten\"} 1"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

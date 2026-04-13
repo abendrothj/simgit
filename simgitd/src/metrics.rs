@@ -10,8 +10,8 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
-    TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
+    Registry, TextEncoder,
 };
 
 pub struct Metrics {
@@ -24,6 +24,10 @@ pub struct Metrics {
     session_creates_total: IntCounter,
     session_commits_total: IntCounter,
     session_aborts_total: IntCounter,
+    session_commit_stage_duration_seconds: HistogramVec,
+    session_commit_conflicts_total: IntCounterVec,
+    session_commit_conflict_paths: Histogram,
+    session_commit_conflict_peers: Histogram,
     active_sessions: IntGauge,
     active_locks: IntGauge,
     contention_by_path: Mutex<HashMap<String, u64>>,
@@ -65,6 +69,28 @@ impl Metrics {
             "session_aborts_total",
             "Total successful session.abort calls",
         )?;
+        let session_commit_stage_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "session_commit_stage_duration_seconds",
+                "Latency of internal session.commit stages in seconds",
+            ),
+            &["stage"],
+        )?;
+        let session_commit_conflicts_total = IntCounterVec::new(
+            Opts::new(
+                "session_commit_conflicts_total",
+                "Total session.commit conflicts by kind",
+            ),
+            &["kind"],
+        )?;
+        let session_commit_conflict_paths = Histogram::with_opts(HistogramOpts::new(
+            "session_commit_conflict_paths",
+            "Number of conflicting paths seen in a blocked session.commit",
+        ))?;
+        let session_commit_conflict_peers = Histogram::with_opts(HistogramOpts::new(
+            "session_commit_conflict_peers",
+            "Number of active peer sessions involved in a blocked session.commit",
+        ))?;
         let active_sessions = IntGauge::new("active_sessions", "Current ACTIVE sessions")?;
         let active_locks = IntGauge::new("active_locks", "Current lock table size")?;
 
@@ -76,6 +102,10 @@ impl Metrics {
         registry.register(Box::new(session_creates_total.clone()))?;
         registry.register(Box::new(session_commits_total.clone()))?;
         registry.register(Box::new(session_aborts_total.clone()))?;
+        registry.register(Box::new(session_commit_stage_duration_seconds.clone()))?;
+        registry.register(Box::new(session_commit_conflicts_total.clone()))?;
+        registry.register(Box::new(session_commit_conflict_paths.clone()))?;
+        registry.register(Box::new(session_commit_conflict_peers.clone()))?;
         registry.register(Box::new(active_sessions.clone()))?;
         registry.register(Box::new(active_locks.clone()))?;
 
@@ -89,6 +119,10 @@ impl Metrics {
             session_creates_total,
             session_commits_total,
             session_aborts_total,
+            session_commit_stage_duration_seconds,
+            session_commit_conflicts_total,
+            session_commit_conflict_paths,
+            session_commit_conflict_peers,
             active_sessions,
             active_locks,
             contention_by_path: Mutex::new(HashMap::new()),
@@ -137,6 +171,20 @@ impl Metrics {
         if !acquired {
             self.lock_wait_timeouts_total.inc();
         }
+    }
+
+    pub fn observe_session_commit_stage(&self, stage: &str, elapsed_seconds: f64) {
+        self.session_commit_stage_duration_seconds
+            .with_label_values(&[stage])
+            .observe(elapsed_seconds);
+    }
+
+    pub fn observe_session_commit_conflict(&self, kind: &str, peers: usize, paths: usize) {
+        self.session_commit_conflicts_total
+            .with_label_values(&[kind])
+            .inc();
+        self.session_commit_conflict_peers.observe(peers as f64);
+        self.session_commit_conflict_paths.observe(paths as f64);
     }
 
     pub fn record_lock_contention_path(&self, path: &Path) {
@@ -200,6 +248,8 @@ mod tests {
         let metrics = Arc::new(Metrics::new().expect("metrics init"));
         metrics.observe_rpc("session.create", true, None, 0.001);
         metrics.observe_lock_wait(false, 0.05);
+        metrics.observe_session_commit_stage("flatten", 0.12);
+        metrics.observe_session_commit_conflict("active_session_overlap", 2, 3);
         metrics.set_active_counts(2, 3);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -233,6 +283,10 @@ mod tests {
         assert!(response.contains("simgit_lock_conflicts_total"));
         assert!(response.contains("simgit_lock_wait_duration_seconds"));
         assert!(response.contains("simgit_lock_wait_timeouts_total"));
+        assert!(response.contains("simgit_session_commit_stage_duration_seconds"));
+        assert!(response.contains("simgit_session_commit_conflicts_total"));
+        assert!(response.contains("simgit_session_commit_conflict_paths"));
+        assert!(response.contains("simgit_session_commit_conflict_peers"));
         assert!(response.contains("simgit_active_sessions"));
         assert!(response.contains("simgit_active_locks"));
 
