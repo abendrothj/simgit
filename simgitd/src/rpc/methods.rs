@@ -14,6 +14,7 @@ use simgit_sdk::{
 
 use crate::daemon::AppState;
 use crate::delta::flatten::FlattenError;
+use crate::delta::store::ByteRange;
 
 /// Dispatch a JSON-RPC method call. Returns `Ok(result)` or `Err(RpcError)`.
 pub async fn dispatch(
@@ -133,7 +134,6 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
     let this_ops = changed_path_ops(&manifest);
 
     // Pre-commit conflict check against other active sessions.
-    let this_changed: BTreeSet<PathBuf> = this_ops.keys().cloned().collect();
     let mut conflicts = Vec::new();
     for peer in active_sessions {
         if peer.session_id == session_id {
@@ -144,8 +144,7 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
             Err(_) => continue,
         };
         let peer_ops = changed_path_ops(&peer_manifest);
-        let peer_changed: BTreeSet<PathBuf> = peer_ops.keys().cloned().collect();
-        let overlap = overlap_paths(&this_changed, &peer_changed);
+        let overlap = compute_conflict_paths(&this_ops, &manifest, &peer_ops, &peer_manifest);
         if !overlap.is_empty() {
             let path_conflicts: Vec<_> = overlap
                 .iter()
@@ -515,6 +514,57 @@ fn overlap_paths(a: &BTreeSet<PathBuf>, b: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
     a.intersection(b).cloned().collect()
 }
 
+/// Range-aware conflict detection between two sessions.
+///
+/// For write-write pairs on the same path: conflict only when byte ranges overlap
+/// (or when either side has no range info — NFS full-file writes).
+/// For delete/rename ops on the same path: always a conflict.
+fn compute_conflict_paths(
+    our_ops:      &std::collections::BTreeMap<PathBuf, BTreeSet<&'static str>>,
+    our_manifest: &crate::delta::store::DeltaManifest,
+    peer_ops:     &std::collections::BTreeMap<PathBuf, BTreeSet<&'static str>>,
+    peer_manifest: &crate::delta::store::DeltaManifest,
+) -> Vec<PathBuf> {
+    let our_paths:  BTreeSet<&PathBuf> = our_ops.keys().collect();
+    let peer_paths: BTreeSet<&PathBuf> = peer_ops.keys().collect();
+    let mut result = Vec::new();
+    for path in our_paths.intersection(&peer_paths) {
+        let path = *path;
+        let our_ops_set  = &our_ops[path];
+        let peer_ops_set = &peer_ops[path];
+        // If both sides only have a "write" op, check byte ranges.
+        let our_write_only  = our_ops_set.len() == 1 && our_ops_set.contains("write");
+        let peer_write_only = peer_ops_set.len() == 1 && peer_ops_set.contains("write");
+        if our_write_only && peer_write_only {
+            let our_ranges  = our_manifest.ranges.get(path).map(Vec::as_slice);
+            let peer_ranges = peer_manifest.ranges.get(path).map(Vec::as_slice);
+            if !byte_ranges_conflict(our_ranges, peer_ranges) {
+                continue;
+            }
+        }
+        result.push(path.clone());
+    }
+    result
+}
+
+/// Returns `true` if the byte ranges from two sessions conflict.
+/// `None` means a full-file write (no range info) — always conflicts.
+fn byte_ranges_conflict(a: Option<&[ByteRange]>, b: Option<&[ByteRange]>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => ranges_overlap(a, b),
+        _                  => true,
+    }
+}
+
+fn ranges_overlap(a: &[ByteRange], b: &[ByteRange]) -> bool {
+    a.iter().any(|ar| {
+        b.iter().any(|br| {
+            ar.offset < br.offset.saturating_add(br.len)
+                && br.offset < ar.offset.saturating_add(ar.len)
+        })
+    })
+}
+
 fn diff_bytes_for_path(path: &Path, old: Option<&[u8]>, new: Option<&[u8]>) -> Result<String> {
     let tmp = std::env::temp_dir().join(format!("simgit-diff-{}-{}", std::process::id(), Uuid::now_v7()));
     std::fs::create_dir_all(&tmp)?;
@@ -710,6 +760,7 @@ mod tests {
     use super::{dispatch, session_commit};
     use crate::borrow::BorrowRegistry;
     use crate::config::{Config, VfsBackend};
+    use crate::delta::store::ByteRange;
     use crate::delta::flatten::FlattenError;
     use crate::daemon::AppState;
     use crate::delta::store::DeltaManifest;
@@ -936,7 +987,7 @@ mod tests {
             .expect("init s1 delta");
         state
             .deltas
-            .write_blob(s1.session_id, Path::new("README.md"), b"change-1\n")
+            .write_blob(s1.session_id, Path::new("README.md"), b"change-1\n", None)
             .expect("write s1 blob");
 
         let s2 = state
@@ -956,7 +1007,7 @@ mod tests {
             .expect("init s2 delta");
         state
             .deltas
-            .write_blob(s2.session_id, Path::new("README.md"), b"change-2\n")
+            .write_blob(s2.session_id, Path::new("README.md"), b"change-2\n", None)
             .expect("write s2 blob");
 
         let res = session_commit(&state, serde_json::json!({
@@ -1002,7 +1053,7 @@ mod tests {
             .expect("init s1 delta");
         state
             .deltas
-            .write_blob(s1.session_id, Path::new("README.md"), b"change-a\n")
+            .write_blob(s1.session_id, Path::new("README.md"), b"change-a\n", None)
             .expect("write s1 blob");
 
         let s2 = state
@@ -1022,7 +1073,7 @@ mod tests {
             .expect("init s2 delta");
         state
             .deltas
-            .write_blob(s2.session_id, Path::new("src.txt"), b"change-b\n")
+            .write_blob(s2.session_id, Path::new("src.txt"), b"change-b\n", None)
             .expect("write s2 blob");
 
         let res = session_commit(&state, serde_json::json!({
@@ -1042,6 +1093,75 @@ mod tests {
         assert!(metrics.contains("simgit_session_commit_stage_duration_seconds_count{stage=\"conflict_scan\"} 1"));
         assert!(metrics.contains("simgit_session_commit_stage_duration_seconds_count{stage=\"flatten\"} 1"));
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_commit_succeeds_for_non_overlapping_byte_ranges() {
+        let (state, root) = build_state_for_commit_tests().await;
+
+        let s1 = state.sessions.create(
+            "task-r1".into(), Some("agent-r1".into()), "HEAD".into(),
+            state.config.mnt_dir.join("sr1"), false, 8,
+        ).expect("create s1");
+        state.deltas.init_session(s1.session_id, &s1.base_commit).expect("init s1");
+        state.deltas.write_blob(
+            s1.session_id, Path::new("hotspot.log"), b"aaaaaaaaaa",
+            Some(ByteRange { offset: 0, len: 10 }),
+        ).expect("write s1");
+
+        let s2 = state.sessions.create(
+            "task-r2".into(), Some("agent-r2".into()), "HEAD".into(),
+            state.config.mnt_dir.join("sr2"), false, 8,
+        ).expect("create s2");
+        state.deltas.init_session(s2.session_id, &s2.base_commit).expect("init s2");
+        state.deltas.write_blob(
+            s2.session_id, Path::new("hotspot.log"), b"bbbbbbbbbb",
+            Some(ByteRange { offset: 10, len: 10 }),
+        ).expect("write s2");
+
+        let res = session_commit(&state, serde_json::json!({
+            "session_id": s1.session_id,
+            "branch_name": "feat/range-noconflict",
+            "message": "non-overlapping ranges",
+        })).await;
+
+        assert!(res.is_ok(), "adjacent byte ranges must not conflict: {:?}", res.err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_commit_conflicts_for_overlapping_byte_ranges() {
+        let (state, root) = build_state_for_commit_tests().await;
+
+        let s1 = state.sessions.create(
+            "task-o1".into(), Some("agent-o1".into()), "HEAD".into(),
+            state.config.mnt_dir.join("so1"), false, 8,
+        ).expect("create s1");
+        state.deltas.init_session(s1.session_id, &s1.base_commit).expect("init s1");
+        state.deltas.write_blob(
+            s1.session_id, Path::new("hotspot.log"), b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Some(ByteRange { offset: 0, len: 50 }),
+        ).expect("write s1");
+
+        let s2 = state.sessions.create(
+            "task-o2".into(), Some("agent-o2".into()), "HEAD".into(),
+            state.config.mnt_dir.join("so2"), false, 8,
+        ).expect("create s2");
+        state.deltas.init_session(s2.session_id, &s2.base_commit).expect("init s2");
+        state.deltas.write_blob(
+            s2.session_id, Path::new("hotspot.log"), b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            Some(ByteRange { offset: 25, len: 50 }),
+        ).expect("write s2");
+
+        let res = session_commit(&state, serde_json::json!({
+            "session_id": s1.session_id,
+            "branch_name": "feat/range-conflict",
+            "message": "overlapping ranges",
+        })).await;
+
+        assert!(res.is_err(), "overlapping byte ranges must conflict");
+        assert_eq!(res.unwrap_err().code, simgit_sdk::ERR_MERGE_CONFLICT);
         let _ = std::fs::remove_dir_all(&root);
     }
 

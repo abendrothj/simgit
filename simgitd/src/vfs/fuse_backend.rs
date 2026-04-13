@@ -85,6 +85,7 @@ use simgit_sdk::SessionInfo;
 use crate::config::Config;
 use crate::borrow::BorrowRegistry;
 use crate::delta::DeltaStore;
+use crate::delta::store::ByteRange;
 use super::git_resolver::{TreeCache, BlobCache, InodeMap};
 
 /// FUSE backend driver (Linux).
@@ -1009,7 +1010,7 @@ impl Filesystem for SessionFs {
             return;
         }
 
-        if self.deltas.write_blob(self.session_id, &path, &[]).is_err() {
+        if self.deltas.write_blob(self.session_id, &path, &[], None).is_err() {
             reply.error(Errno::EIO);
             return;
         }
@@ -1066,7 +1067,7 @@ impl Filesystem for SessionFs {
 
             apply_write_at_offset(&mut current, offset as usize, data);
 
-            if self.deltas.write_blob(self.session_id, &meta.path, &current).is_err() {
+            if self.deltas.write_blob(self.session_id, &meta.path, &current, Some(ByteRange { offset, len: data.len() as u64 })).is_err() {
                 reply.error(Errno::EIO);
                 return;
             }
@@ -1115,7 +1116,7 @@ impl Filesystem for SessionFs {
 
         apply_write_at_offset(&mut current, offset as usize, data);
 
-        if self.deltas.write_blob(self.session_id, &path, &current).is_err() {
+        if self.deltas.write_blob(self.session_id, &path, &current, Some(ByteRange { offset, len: data.len() as u64 })).is_err() {
             reply.error(Errno::EIO);
             return;
         }
@@ -1348,7 +1349,7 @@ impl Filesystem for SessionFs {
             }
         };
 
-        if self.deltas.write_blob(self.session_id, &new_path, &source_data).is_err() {
+        if self.deltas.write_blob(self.session_id, &new_path, &source_data, None).is_err() {
             reply.error(Errno::EIO);
             return;
         }

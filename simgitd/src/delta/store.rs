@@ -16,6 +16,17 @@ use uuid::Uuid;
 
 use serde::{Deserialize, Serialize};
 
+/// A half-open byte interval `[offset, offset + len)` written in a single VFS call.
+///
+/// Stored per-path in `DeltaManifest::ranges` when the write was intercepted by the
+/// FUSE layer. Absent for full-file NFS snapshot writes; in that case the conflict
+/// scan falls back to whole-file path comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ByteRange {
+    pub offset: u64,
+    pub len: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DeltaManifest {
     /// base commit OID (hex) this delta was forked from.
@@ -26,6 +37,10 @@ pub struct DeltaManifest {
     pub deletes: HashSet<PathBuf>,
     /// renames: (from, to)
     pub renames: Vec<(PathBuf, PathBuf)>,
+    /// Byte ranges written per path. Absent for full-file (NFS) writes; conflict
+    /// scan treats absent entries as whole-file overlap.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ranges: HashMap<PathBuf, Vec<ByteRange>>,
 }
 
 pub struct DeltaStore {
@@ -115,9 +130,12 @@ impl DeltaStore {
     /// Write `content` into the delta store for `session_id` at `path`.
     /// Returns the SHA-256 hex of the content.
     ///
+    /// `range` is the half-open byte interval of the write if known (FUSE write path).
+    /// Pass `None` for full-file writes (NFS snapshot, renames, creates).
+    ///
     /// Returns an error if adding this blob would push the session's total
     /// unique-blob size over `max_delta_bytes`.
-    pub fn write_blob(&self, session_id: Uuid, path: &Path, content: &[u8]) -> Result<String> {
+    pub fn write_blob(&self, session_id: Uuid, path: &Path, content: &[u8], range: Option<ByteRange>) -> Result<String> {
         // Compute content hash for deduplication and integrity.
         let hash = hex::encode(Sha256::digest(content));
 
@@ -164,6 +182,10 @@ impl DeltaStore {
         // Remove from deletes if it was previously deleted.
         manifest.deletes.remove(path);
         manifest.writes.insert(path.to_owned(), hash.clone());
+        match range {
+            Some(r) => manifest.ranges.entry(path.to_owned()).or_default().push(r),
+            None    => { manifest.ranges.remove(path); }
+        }
         self.write_manifest(session_id, &manifest)?;
 
         Ok(hash)
@@ -315,7 +337,7 @@ mod tests {
 
         store.init_session(session_id, "HEAD").expect("init session");
         store
-            .write_blob(session_id, old_path, b"hello")
+            .write_blob(session_id, old_path, b"hello", None)
             .expect("write old path");
         store
             .record_rename(session_id, old_path, new_path)
@@ -373,7 +395,7 @@ mod tests {
 
         store.init_session(session_id, "HEAD").expect("init");
         store
-            .write_blob(session_id, Path::new("file.txt"), b"small content")
+            .write_blob(session_id, Path::new("file.txt"), b"small content", None)
             .expect("write should succeed within quota");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -389,7 +411,7 @@ mod tests {
 
         store.init_session(session_id, "HEAD").expect("init");
         let err = store
-            .write_blob(session_id, Path::new("big.txt"), content)
+            .write_blob(session_id, Path::new("big.txt"), content, None)
             .expect_err("write should fail when quota exceeded");
 
         assert!(err.to_string().contains("quota exceeded"), "error must mention quota exceeded");
@@ -409,11 +431,11 @@ mod tests {
         store.init_session(session_id, "HEAD").expect("init");
         // First write — should succeed.
         store
-            .write_blob(session_id, Path::new("a.txt"), content)
+            .write_blob(session_id, Path::new("a.txt"), content, None)
             .expect("first write should succeed");
         // Second write of same bytes (different path) — dedup: no new bytes on disk.
         store
-            .write_blob(session_id, Path::new("b.txt"), content)
+            .write_blob(session_id, Path::new("b.txt"), content, None)
             .expect("dedup write of same content should not be rejected by quota");
 
         let _ = std::fs::remove_dir_all(&root);

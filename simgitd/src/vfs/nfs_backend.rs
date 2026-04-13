@@ -252,7 +252,7 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
             seen.insert(rel.clone());
 
             if baseline.as_deref() != Some(current.as_slice()) {
-                self.deltas.write_blob(session.session_id, rel, &current)?;
+                self.deltas.write_blob(session.session_id, rel, &current, None)?;
             }
         }
 
