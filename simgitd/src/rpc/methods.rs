@@ -112,19 +112,18 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
 
     let stage_started = std::time::Instant::now();
     let active_sessions = state.sessions.list(Some(SessionStatus::Active));
-    
-    // Capture deltas for all active peers in a blocking task.
-    let state_clone = Arc::clone(state);
-    let peers_clone = active_sessions.clone();
-    tokio::task::spawn_blocking(move || {
-        for s in &peers_clone {
-            state_clone.vfs.capture_mount_delta(s).ok(); // Ignore errors for peers
-        }
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .map_err(|e| internal(format!("task join error: {e}")))?
-    .map_err(internal)?;
+
+    // Capture deltas for all active peers concurrently, one blocking task
+    // per peer so the thread pool can overlap the git I/O in parallel.
+    let mut join_set = tokio::task::JoinSet::new();
+    for peer in &active_sessions {
+        let state_clone = Arc::clone(state);
+        let peer_clone = peer.clone();
+        join_set.spawn_blocking(move || {
+            state_clone.vfs.capture_mount_delta(&peer_clone).ok();
+        });
+    }
+    while let Some(_) = join_set.join_next().await {}
     state
         .metrics
         .observe_session_commit_stage("capture_peers", stage_started.elapsed().as_secs_f64());
