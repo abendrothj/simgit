@@ -249,7 +249,24 @@ impl SessionManager {
             return Ok(());
         }
         warn!("{} active session(s) found from previous run — recovering", active.len());
+        let recovery_ttl = state.config.session_recovery_ttl_seconds;
         for session in active {
+            // If the session age exceeds the recovery TTL, mark it stale rather
+            // than re-mounting it.  TTL == 0 means "keep indefinitely".
+            if recovery_ttl > 0 {
+                let age_secs = (Utc::now() - session.created_at).num_seconds().max(0) as u64;
+                if age_secs > recovery_ttl {
+                    warn!(
+                        id = %session.session_id,
+                        age_secs,
+                        recovery_ttl,
+                        "session too old — marking stale instead of re-mounting"
+                    );
+                    state.borrows.release_session(session.session_id);
+                    self.mark_stale(session.session_id)?;
+                    continue;
+                }
+            }
             match state.vfs.mount(&session).await {
                 Ok(_) => info!(id = %session.session_id, "re-mounted session"),
                 Err(e) => {
@@ -402,6 +419,7 @@ mod tests {
             max_sessions: 16,
             max_delta_bytes: 2 * 1024 * 1024,
             lock_ttl_seconds: 3600,
+            session_recovery_ttl_seconds: 86400,
             vfs_backend: VfsBackend::NfsLoopback,
             metrics_enabled: false,
             metrics_addr: "127.0.0.1:0".to_owned(),

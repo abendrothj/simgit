@@ -74,7 +74,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::signal;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::borrow::BorrowRegistry;
 use crate::config::Config;
@@ -200,6 +200,53 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     // Recover any sessions that were ACTIVE before a previous crash.
     state.sessions.recover_active_sessions(&state).await?;
+
+    // --- Startup GC: orphaned git worktrees ----------------------------------
+    // If simgitd was killed after `git worktree add` but before cleanup, a
+    // dangling entry is registered under `.git/worktrees/`.  `git worktree
+    // prune` removes entries whose checkout directories no longer exist.
+    {
+        let repo = cfg.repo_path.clone();
+        match tokio::task::spawn_blocking(move || {
+            std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(["worktree", "prune"])
+                .output()
+        })
+        .await
+        {
+            Ok(Ok(out)) if out.status.success() =>
+                info!("git worktree prune: ok"),
+            Ok(Ok(out)) =>
+                warn!("git worktree prune exited {}: {}", out.status,
+                      String::from_utf8_lossy(&out.stderr).trim()),
+            Ok(Err(e)) =>
+                warn!("git worktree prune failed to spawn: {e}"),
+            Err(e) =>
+                warn!("git worktree prune task panicked: {e}"),
+        }
+    }
+
+    // --- Startup GC: orphaned delta directories ------------------------------
+    // Sessions that were ACTIVE at crash time left behind delta dirs.  Any
+    // delta dir whose UUID is not in the post-recovery ACTIVE set is orphaned.
+    {
+        let active_ids: std::collections::HashSet<uuid::Uuid> =
+            state.sessions.list_active().iter().map(|s| s.session_id).collect();
+        match state.deltas.list_sessions() {
+            Ok(all_delta_ids) => {
+                for orphan_id in all_delta_ids {
+                    if !active_ids.contains(&orphan_id) {
+                        match state.deltas.purge_session(orphan_id) {
+                            Ok(()) => info!(id = %orphan_id, "purged orphaned delta dir"),
+                            Err(e) => warn!(id = %orphan_id, err = %e, "failed to purge orphaned delta dir"),
+                        }
+                    }
+                }
+            }
+            Err(e) => warn!("could not list delta sessions for GC: {e}"),
+        }
+    }
 
     // Start TTL sweeper.
     crate::borrow::ttl_sweeper::spawn(Arc::clone(&state.borrows));

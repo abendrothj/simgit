@@ -30,4 +30,3 @@ Repository = "https://github.com/simgit/simgit"
 bindings = "pyo3"
 module-name = "simgit.simgit"
 python-source = "."
-strip = true

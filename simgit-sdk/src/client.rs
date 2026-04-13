@@ -9,8 +9,29 @@ use uuid::Uuid;
 
 use crate::error::SdkError;
 use crate::types::*;
+use std::time::Duration;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn decode_rpc_error(err: RpcError) -> Result<SdkError, SdkError> {
+    match err.code {
+        ERR_BORROW_CONFLICT => {
+            let be: BorrowError = serde_json::from_value(
+                err.data.unwrap_or(serde_json::Value::Null),
+            )?;
+            Ok(SdkError::BorrowConflict(be))
+        }
+        ERR_SESSION_NOT_FOUND => Ok(SdkError::SessionNotFound(err.message)),
+        ERR_MERGE_CONFLICT => {
+            let detail: MergeConflictDetail = serde_json::from_value(
+                err.data.unwrap_or(serde_json::Value::Null),
+            )?;
+            Ok(SdkError::MergeConflict(detail))
+        }
+        ERR_QUOTA_EXCEEDED => Ok(SdkError::QuotaExceeded(err.message)),
+        _ => Ok(SdkError::Rpc { code: err.code, message: err.message }),
+    }
+}
 
 fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
@@ -76,29 +97,18 @@ impl Client {
 
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            reader.read_line(&mut line)
+        )
+        .await
+        .map_err(|_| SdkError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "RPC response timeout (30s)")))?
+        .map_err(SdkError::Io)?;
 
         let resp: RpcResponse = serde_json::from_str(line.trim())?;
 
         if let Some(err) = resp.error {
-            return Err(match err.code {
-                ERR_BORROW_CONFLICT => {
-                    let be: BorrowError = serde_json::from_value(
-                        err.data.unwrap_or(serde_json::Value::Null),
-                    )?;
-                    SdkError::BorrowConflict(be)
-                }
-                ERR_SESSION_NOT_FOUND => SdkError::SessionNotFound(err.message),
-                ERR_MERGE_CONFLICT => {
-                    let paths: Vec<PathBuf> = serde_json::from_value(
-                        err.data.unwrap_or(serde_json::Value::Null),
-                    )
-                    .unwrap_or_default();
-                    SdkError::MergeConflict(paths)
-                }
-                ERR_QUOTA_EXCEEDED => SdkError::QuotaExceeded(err.message),
-                _ => SdkError::Rpc { code: err.code, message: err.message },
-            });
+            return Err(decode_rpc_error(err)?);
         }
 
         Ok(resp.result.unwrap_or(serde_json::Value::Null))
@@ -249,5 +259,53 @@ impl Client {
             return Ok(None);
         }
         Ok(Some(serde_json::from_value(event)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_rpc_error;
+    use crate::error::SdkError;
+    use crate::types::{RpcError, ERR_MERGE_CONFLICT};
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    #[test]
+    fn decode_merge_conflict_preserves_paths_and_peer_sessions() {
+        let err = RpcError {
+            code: ERR_MERGE_CONFLICT,
+            message: "pre-commit conflict: overlapping active session paths".to_owned(),
+            data: Some(json!({
+                "session_id": "019d8664-4b4c-79d3-8155-44df5d3203c5",
+                "kind": "active_session_overlap",
+                "conflicts": [
+                    {
+                        "session_id": "019d8629-0609-7f02-9290-4a98e6a307ed",
+                        "task_id": "stress-peer",
+                        "paths": ["hotspot/shared.txt"],
+                        "path_conflicts": [
+                            {
+                                "path": "hotspot/shared.txt",
+                                "ours_ops": ["modify"],
+                                "peer_ops": ["modify"]
+                            }
+                        ]
+                    }
+                ]
+            })),
+        };
+
+        let sdk_error = decode_rpc_error(err).expect("decode conflict");
+        match sdk_error {
+            SdkError::MergeConflict(detail) => {
+                assert_eq!(detail.conflicts.len(), 1);
+                assert_eq!(detail.conflicts[0].paths, vec![PathBuf::from("hotspot/shared.txt")]);
+                assert_eq!(detail.conflicts[0].task_id, "stress-peer");
+                let rendered = detail.to_string();
+                assert!(rendered.contains("hotspot/shared.txt"));
+                assert!(rendered.contains("019d8629-0609-7f02-9290-4a98e6a307ed"));
+            }
+            other => panic!("expected merge conflict, got {other:?}"),
+        }
     }
 }

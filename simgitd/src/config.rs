@@ -90,6 +90,11 @@ pub struct Config {
     /// Default write-lock TTL in seconds (0 = no TTL). Default 3600.
     pub lock_ttl_seconds: u64,
 
+    /// How long a recovered ACTIVE session is allowed to keep its ACTIVE status
+    /// after a crash before the startup sweep marks it STALE.
+    /// Default 86400 seconds (24 hours). 0 = keep indefinitely (not recommended).
+    pub session_recovery_ttl_seconds: u64,
+
     /// VFS backend to use.
     pub vfs_backend: VfsBackend,
 
@@ -176,6 +181,10 @@ impl Config {
             max_sessions:    256,
             max_delta_bytes: 2 * 1024 * 1024 * 1024,
             lock_ttl_seconds: 3600,
+            session_recovery_ttl_seconds: std::env::var("SIMGIT_SESSION_RECOVERY_TTL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(86400),
             vfs_backend,
             metrics_enabled: std::env::var("SIMGIT_METRICS_ENABLED")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))

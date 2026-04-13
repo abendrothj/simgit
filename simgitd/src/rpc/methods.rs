@@ -94,14 +94,31 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
 
     let info = state.sessions.get(session_id).ok_or_else(|| not_found(session_id))?;
 
-    // Some backends (e.g., macOS NFS-loopback stub) write to plain directories.
-    // Capture those mount-side changes into the session delta before conflict checks.
-    state.vfs.capture_mount_delta(&info).map_err(internal)?;
+    // Capture mount-side changes in a blocking task to avoid starving the async executor.
+    // This is heavy I/O (git subprocess calls, file walks) that must not block other RPC handlers.
+    let state_clone = Arc::clone(state);
+    let info_clone = info.clone();
+    tokio::task::spawn_blocking(move || {
+        state_clone.vfs.capture_mount_delta(&info_clone)
+    })
+    .await
+    .map_err(|e| internal(format!("task join error: {e}")))?
+    .map_err(internal)?;
 
     let active_sessions = state.sessions.list(Some(SessionStatus::Active));
-    for s in &active_sessions {
-        state.vfs.capture_mount_delta(s).map_err(internal)?;
-    }
+    
+    // Capture deltas for all active peers in a blocking task.
+    let state_clone = Arc::clone(state);
+    let peers_clone = active_sessions.clone();
+    tokio::task::spawn_blocking(move || {
+        for s in &peers_clone {
+            state_clone.vfs.capture_mount_delta(s).ok(); // Ignore errors for peers
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|e| internal(format!("task join error: {e}")))?
+    .map_err(internal)?;
 
     let manifest = state.deltas.load_manifest(session_id).map_err(internal)?;
     let this_ops = changed_path_ops(&manifest);
@@ -151,16 +168,25 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
         });
     }
 
-    // Flatten delta to git branch.
-    let result = crate::delta::flatten::flatten(
-        &state.config.repo_path,
-        &info.base_commit,
-        &manifest,
-        &state.config.state_dir.join("deltas"),
-        session_id,
-        &branch_name,
-        &message,
-    ).map_err(|e| flatten_error_to_rpc(e, session_id, &branch_name))?;
+    // Flatten delta to git branch in a blocking task (heavy git I/O).
+    let repo_path = state.config.repo_path.clone();
+    let base_commit = info.base_commit.clone();
+    let state_dir = state.config.state_dir.clone();
+    let branch_name_clone = branch_name.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::delta::flatten::flatten(
+            &repo_path,
+            &base_commit,
+            &manifest,
+            &state_dir.join("deltas"),
+            session_id,
+            &branch_name_clone,
+            &message,
+        )
+    })
+    .await
+    .map_err(|e| internal(format!("task join error: {e}")))?
+    .map_err(|e| flatten_error_to_rpc(e, session_id, &branch_name))?;
 
     // Release locks, update status.
     state.borrows.release_session(session_id);
@@ -833,6 +859,7 @@ mod tests {
             max_sessions: 8,
             max_delta_bytes: 2 * 1024 * 1024,
             lock_ttl_seconds: 3600,
+            session_recovery_ttl_seconds: 86400,
             vfs_backend: VfsBackend::NfsLoopback,
             metrics_enabled: false,
             metrics_addr: "127.0.0.1:0".to_owned(),

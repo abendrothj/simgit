@@ -1,5 +1,5 @@
 use thiserror::Error;
-use crate::types::BorrowError;
+use crate::types::{BorrowError, MergeConflictDetail};
 
 #[derive(Debug, Error)]
 pub enum SdkError {
@@ -21,8 +21,8 @@ pub enum SdkError {
     #[error("session not found: {0}")]
     SessionNotFound(String),
 
-    #[error("merge conflict on paths: {0:?}")]
-    MergeConflict(Vec<std::path::PathBuf>),
+    #[error("{0}")]
+    MergeConflict(MergeConflictDetail),
 
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),

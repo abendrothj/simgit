@@ -5,6 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -42,7 +43,7 @@ pub enum SessionStatus {
 /// use simgit_sdk::{SessionInfo, SessionStatus};
 ///
 /// let session = SessionInfo {
-///     session_id: Uuid::new_v7(),
+///     session_id: Uuid::now_v7(),
 ///     task_id: "implement-feature-x".into(),
 ///     agent_label: Some("copilot-agent-5".into()),
 ///     base_commit: "abc123def456".into(),
@@ -74,6 +75,71 @@ pub struct SessionInfo {
     /// Whether this session opted into peer visibility (`--peers` flag).
     /// When true, agents can see in-flight writes from sibling sessions.
     pub peers_enabled: bool,
+}
+
+// ── Merge conflicts ──────────────────────────────────────────────────────────
+
+/// Detailed operation overlap for a single conflicting path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergePathConflict {
+    pub path: PathBuf,
+    pub ours_ops: Vec<String>,
+    pub peer_ops: Vec<String>,
+}
+
+/// Conflict details for one active peer session that blocked our commit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeConflictPeer {
+    pub session_id: Uuid,
+    pub task_id: String,
+    pub paths: Vec<PathBuf>,
+    pub path_conflicts: Vec<MergePathConflict>,
+}
+
+/// Structured payload returned by the daemon for pre-commit overlap conflicts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeConflictDetail {
+    pub session_id: Uuid,
+    pub kind: String,
+    pub conflicts: Vec<MergeConflictPeer>,
+}
+
+impl MergeConflictDetail {
+    pub fn all_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for conflict in &self.conflicts {
+            for path in &conflict.paths {
+                if !paths.iter().any(|p| p == path) {
+                    paths.push(path.clone());
+                }
+            }
+        }
+        paths
+    }
+}
+
+impl fmt::Display for MergeConflictDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let paths = self
+            .all_paths()
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let peers = self
+            .conflicts
+            .iter()
+            .map(|conflict| format!("{} ({})", conflict.session_id, conflict.task_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "merge conflict for session {} on paths [{}] against active session(s): {}",
+            self.session_id,
+            paths,
+            peers
+        )
+    }
 }
 
 // ── Locks ─────────────────────────────────────────────────────────────────────

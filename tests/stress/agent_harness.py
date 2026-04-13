@@ -17,6 +17,7 @@ import os
 import random
 import string
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,6 +54,7 @@ def run_agent(
     socket_path: str | None,
     overlap_path: str,
     jitter_ms: int,
+    barrier: threading.Barrier | None = None,
 ) -> AgentResult:
     start = time.time()
     simgit = _load_simgit_module()
@@ -74,6 +76,10 @@ def run_agent(
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "w", encoding="utf-8") as f:
                 f.write(f"agent={agent_id} ts={time.time_ns()}\n")
+
+            # If using two-phase barrier, wait for all agents to write before committing
+            if barrier is not None:
+                barrier.wait()
 
             if jitter_ms > 0:
                 time.sleep(random.randint(0, jitter_ms) / 1000.0)
@@ -127,6 +133,11 @@ def parse_args() -> argparse.Namespace:
         help="max random delay before commit in commit mode",
     )
     parser.add_argument(
+        "--two-phase-barrier",
+        action="store_true",
+        help="use two-phase barrier: all agents write, then all commit simultaneously",
+    )
+    parser.add_argument(
         "--report-out",
         help="optional file path to write JSON report",
     )
@@ -168,6 +179,11 @@ def main() -> int:
         print("--agents must be >= 1", file=sys.stderr)
         return 2
 
+    # Create barrier if two-phase mode is enabled (commit mode only)
+    barrier = None
+    if args.two_phase_barrier and args.mode == "commit":
+        barrier = threading.Barrier(args.agents)
+
     results: list[AgentResult] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
         futs = [
@@ -178,6 +194,7 @@ def main() -> int:
                 args.socket,
                 args.overlap_path,
                 args.commit_jitter_ms,
+                barrier,
             )
             for i in range(args.agents)
         ]
@@ -210,6 +227,7 @@ def main() -> int:
         "agents": args.agents,
         "workers": args.workers,
         "mode": args.mode,
+        "two_phase_barrier": args.two_phase_barrier,
         "successes": successes,
         "failures": failures,
         "failure_breakdown": failure_breakdown,
@@ -220,8 +238,9 @@ def main() -> int:
     if args.json:
         print(json.dumps(summary, indent=2))
     else:
+        barrier_label = " (two-phase barrier)" if args.two_phase_barrier else ""
         print(
-            f"agents={args.agents} mode={args.mode} "
+            f"agents={args.agents} mode={args.mode}{barrier_label} "
             f"successes={successes} failures={failures}"
         )
         for r in results:
