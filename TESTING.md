@@ -39,6 +39,12 @@ cargo test --test '*' --lib
 cargo test test_borrow_semantics_exclusive_write
 ```
 
+### Run Range-Aware Commit Tests
+```bash
+cargo test -p simgitd session_commit_succeeds_for_non_overlapping_byte_ranges
+cargo test -p simgitd session_commit_conflicts_for_overlapping_byte_ranges
+```
+
 ### Run with Logging
 ```bash
 RUST_LOG=debug cargo test -- --nocapture
@@ -259,6 +265,34 @@ fn test_something() {
     assert!(condition);
 }
 ```
+
+## Stress Benchmarks
+
+Use the stress harness for control-plane and conflict behavior validation under load.
+
+```bash
+# Start daemon in a disposable repo
+rm -rf /tmp/simgit-stress-state && mkdir -p /tmp/simgit-stress-state
+cd /tmp/simgit-disposable-repo
+SIMGIT_REPO=/tmp/simgit-disposable-repo \
+SIMGIT_STATE_DIR=/tmp/simgit-stress-state \
+/Users/ja/Desktop/projects/simgit/target/debug/simgitd
+
+# In another shell
+cd /Users/ja/Desktop/projects/simgit
+source .venv/bin/activate
+python tests/stress/agent_harness.py \
+    --agents 50 --workers 50 --mode commit \
+    --overlap-path hotspot/shared.txt --two-phase-barrier \
+    --socket /tmp/simgit-stress-state/control.sock \
+    --json --report-out /tmp/simgit-stress-report.json
+```
+
+Key Prometheus series to capture during stress runs:
+- `simgit_session_commit_stage_duration_seconds{stage="capture_self|capture_peers|conflict_scan|flatten"}`
+- `simgit_session_commit_conflicts_total{kind="active_session_overlap"}`
+- `simgit_session_commit_conflict_paths`
+- `simgit_session_commit_conflict_peers`
 
 ### Run with Log Output
 ```bash

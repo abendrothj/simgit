@@ -77,9 +77,22 @@ python3 tests/stress/agent_harness.py --agents 50 --mode abort
 
 Use `--mode commit` only when your mounted session paths are writable and your daemon is connected to a disposable test repository.
 
+For conflict-focused benchmarking:
+
+```bash
+python3 tests/stress/agent_harness.py \
+    --agents 50 --workers 50 --mode commit \
+    --overlap-path hotspot/shared.txt --two-phase-barrier \
+    --socket /tmp/simgit-stress-state/control.sock --json
+```
+
+Then inspect:
+- `simgit_session_commit_stage_duration_seconds{stage="capture_peers"}`
+- `simgit_session_commit_conflicts_total{kind="active_session_overlap"}`
+
 ## Operational Guidance
 
 - Prefer one session per autonomous task.
 - Use deterministic branch names (`feat/<task-id>`) for traceability.
-- On conflict errors, inspect payload details and retry with a refreshed session.
+- On conflict errors, inspect peer/session/path details and retry with a refreshed session.
 - Keep stress runs on test repos; avoid production branches.

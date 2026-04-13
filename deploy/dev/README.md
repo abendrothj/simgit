@@ -35,3 +35,12 @@ curl -s http://127.0.0.1:9100/metrics | head
 ```
 
 Open Prometheus at http://127.0.0.1:9090.
+
+Useful queries for commit-path performance and contention:
+
+```bash
+curl -s http://127.0.0.1:9100/metrics | grep simgit_session_commit_stage_duration_seconds
+curl -s http://127.0.0.1:9100/metrics | grep simgit_session_commit_conflicts_total
+curl -s http://127.0.0.1:9100/metrics | grep simgit_session_commit_conflict_paths
+curl -s http://127.0.0.1:9100/metrics | grep simgit_session_commit_conflict_peers
+```

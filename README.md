@@ -63,6 +63,13 @@ Current metrics include:
 - Session lifecycle counters (`simgit_session_creates_total`, `simgit_session_commits_total`, `simgit_session_aborts_total`)
 - Lock conflict counter (`simgit_lock_conflicts_total`)
 - Active gauges (`simgit_active_sessions`, `simgit_active_locks`)
+- Commit-path stage latency histogram (`simgit_session_commit_stage_duration_seconds{stage=...}`)
+- Commit conflict counter by kind (`simgit_session_commit_conflicts_total{kind=...}`)
+- Conflict cardinality histograms (`simgit_session_commit_conflict_paths`, `simgit_session_commit_conflict_peers`)
+
+Recent benchmark baseline (50-agent hotspot barrier) identified `capture_peers` as the dominant
+cost. Parallel peer capture reduced end-to-end p95 from 44.3s to 22.2s while preserving
+correctness (`0/50` successes on intentional full-overlap workloads).
 
 Optional OTLP tracing export (gRPC) is enabled by setting:
 
@@ -96,7 +103,7 @@ Agent → /vdev/<session-id>/ → FUSE/NFS Mount → simgitd daemon
 ## Design Decisions (ADR-001)
 
 - **Platform**: Both Linux (FUSE) and macOS (NFS-loopback) from day one
-- **Write Granularity**: Whole-file locks (not byte-range)
+- **Write Granularity**: Path-level lock ownership with range-aware commit conflict checks for write/write overlaps when byte offsets are available
 - **Conflict Resolution**: Auto three-way merge; block on true conflicts
 - **Peer Visibility**: Optional per-session (`--peers` flag) — agents see in-flight changes from siblings
 - **Git Backend**: `gitoxide` (pure Rust, no C dependencies)
@@ -136,8 +143,7 @@ simgit/
 │       ├── delta/               # Delta store
 │       │   ├── mod.rs
 │       │   ├── store.rs         # Content-addressed blob storage
-│       │   ├── flatten.rs       # Convert delta → git branch
-│       │   └── manifest.rs      # Delta manifest format
+│       │   └── flatten.rs       # Convert delta → git branch
 │       ├── session/             # Session lifecycle
 │       │   ├── mod.rs
 │       │   ├── db.rs            # SQLite persistence
@@ -219,6 +225,28 @@ cargo test --test e2e_multi_agent
 
 ```bash
 cargo test --workspace
+```
+
+### Stress Benchmark (50 agents)
+
+```bash
+# build daemon once
+cargo build -p simgitd
+
+# start disposable daemon instance
+rm -rf /tmp/simgit-bench-state && mkdir -p /tmp/simgit-bench-state
+cd /tmp/simgit-disposable-repo
+SIMGIT_REPO=/tmp/simgit-disposable-repo \
+SIMGIT_STATE_DIR=/tmp/simgit-bench-state \
+/Users/ja/Desktop/projects/simgit/target/debug/simgitd
+
+# run stress harness from workspace root
+cd /Users/ja/Desktop/projects/simgit
+source .venv/bin/activate
+python tests/stress/agent_harness.py \
+    --agents 50 --workers 50 --mode commit \
+    --overlap-path hotspot/shared.txt --two-phase-barrier \
+    --socket /tmp/simgit-bench-state/control.sock --json
 ```
 
 ## Development Workflow
@@ -341,7 +369,7 @@ cargo test -- --test-threads=1 --nocapture
 
 ## Future Work (Post-Phase 7)
 
-- **Byte-range locks** for finer granularity (e.g., parallel line edits)
+- **Byte-range lock acquisition API** (explicit lock primitives to complement current range-aware commit conflict detection)
 - **NFS real implementation** (full NFSv3 XDR server for macOS)
 - **Network daemon** (daemon runs on central server, agents mount via TCP NFS)
 - **Git-native format** (store deltas as git patches for better review UX)

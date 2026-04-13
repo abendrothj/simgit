@@ -775,10 +775,19 @@ Git object store reads
 
 ## 12. Open Questions / Future Work
 
+  Current implementation note (April 2026):
+  - Commit-path observability now includes per-stage latency histograms and
+    conflict cardinality metrics.
+  - Peer delta capture in `session.commit` now runs concurrently (thread-pool
+    fan-out) instead of serially.
+  - Conflict detection is now range-aware for write/write overlap when byte
+    offsets are available in the delta manifest; fallback remains whole-path
+    conflict for operations without range metadata.
+
   - Should simgit manage the git remote push, or hand off to the agent?
   - Signed commits: can the daemon sign on behalf of the agent's identity?
-  - Partial-file locking: line-range rather than whole-file ownership
-    (requires semantic diff + language-aware lock granularity).
+  - Partial-file lock acquisition APIs at borrow-registry level (line/byte
+    ranges beyond commit-time conflict filtering).
   - VS Code extension: show live borrow status in the editor gutter.
   - Web UI: real-time dashboard of session activity and lock contention.
   - Integration with GitHub Actions: simgit as a step in CI to run N

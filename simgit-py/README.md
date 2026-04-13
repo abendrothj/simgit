@@ -45,3 +45,12 @@ print(session.session_id)
 print(session.diff())
 session.abort()
 ```
+
+## Conflict Diagnostics
+
+When `session.commit()` fails due to overlapping active-session changes, the Python
+binding surfaces structured conflict details (conflicting paths plus blocking peer
+session/task identities) instead of a path-only error.
+
+This is useful for automated retry logic, conflict-aware orchestration, and stress
+test triage.
