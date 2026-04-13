@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -11,17 +14,19 @@ use prometheus::{
     TextEncoder,
 };
 
-#[derive(Clone)]
 pub struct Metrics {
     registry: Registry,
     rpc_requests_total: IntCounterVec,
     rpc_duration_seconds: HistogramVec,
     lock_conflicts_total: IntCounter,
+    lock_wait_timeouts_total: IntCounter,
+    lock_wait_duration_seconds: HistogramVec,
     session_creates_total: IntCounter,
     session_commits_total: IntCounter,
     session_aborts_total: IntCounter,
     active_sessions: IntGauge,
     active_locks: IntGauge,
+    contention_by_path: Mutex<HashMap<String, u64>>,
 }
 
 impl Metrics {
@@ -39,6 +44,14 @@ impl Metrics {
         let lock_conflicts_total = IntCounter::new(
             "lock_conflicts_total",
             "Total borrow/lock conflict responses",
+        )?;
+        let lock_wait_timeouts_total = IntCounter::new(
+            "lock_wait_timeouts_total",
+            "Total lock.wait calls that timed out",
+        )?;
+        let lock_wait_duration_seconds = HistogramVec::new(
+            HistogramOpts::new("lock_wait_duration_seconds", "lock.wait duration in seconds"),
+            &["outcome"],
         )?;
         let session_creates_total = IntCounter::new(
             "session_creates_total",
@@ -58,6 +71,8 @@ impl Metrics {
         registry.register(Box::new(rpc_requests_total.clone()))?;
         registry.register(Box::new(rpc_duration_seconds.clone()))?;
         registry.register(Box::new(lock_conflicts_total.clone()))?;
+        registry.register(Box::new(lock_wait_timeouts_total.clone()))?;
+        registry.register(Box::new(lock_wait_duration_seconds.clone()))?;
         registry.register(Box::new(session_creates_total.clone()))?;
         registry.register(Box::new(session_commits_total.clone()))?;
         registry.register(Box::new(session_aborts_total.clone()))?;
@@ -69,11 +84,14 @@ impl Metrics {
             rpc_requests_total,
             rpc_duration_seconds,
             lock_conflicts_total,
+            lock_wait_timeouts_total,
+            lock_wait_duration_seconds,
             session_creates_total,
             session_commits_total,
             session_aborts_total,
             active_sessions,
             active_locks,
+            contention_by_path: Mutex::new(HashMap::new()),
         })
     }
 
@@ -109,6 +127,35 @@ impl Metrics {
     pub fn set_active_counts(&self, sessions: usize, locks: usize) {
         self.active_sessions.set(sessions as i64);
         self.active_locks.set(locks as i64);
+    }
+
+    pub fn observe_lock_wait(&self, acquired: bool, elapsed_seconds: f64) {
+        let outcome = if acquired { "acquired" } else { "timeout" };
+        self.lock_wait_duration_seconds
+            .with_label_values(&[outcome])
+            .observe(elapsed_seconds);
+        if !acquired {
+            self.lock_wait_timeouts_total.inc();
+        }
+    }
+
+    pub fn record_lock_contention_path(&self, path: &Path) {
+        let path = path.to_string_lossy().to_string();
+        let mut counts = self.contention_by_path.lock().unwrap();
+        *counts.entry(path).or_insert(0) += 1;
+    }
+
+    pub fn top_contended_paths(&self, limit: usize) -> Vec<(String, u64)> {
+        let mut entries: Vec<_> = self
+            .contention_by_path
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        entries.truncate(limit);
+        entries
     }
 
     pub fn render(&self) -> Result<String> {
@@ -152,6 +199,7 @@ mod tests {
     async fn metrics_endpoint_exposes_key_series() {
         let metrics = Arc::new(Metrics::new().expect("metrics init"));
         metrics.observe_rpc("session.create", true, None, 0.001);
+        metrics.observe_lock_wait(false, 0.05);
         metrics.set_active_counts(2, 3);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -183,9 +231,23 @@ mod tests {
         assert!(response.contains("simgit_rpc_requests_total"));
         assert!(response.contains("simgit_rpc_duration_seconds"));
         assert!(response.contains("simgit_lock_conflicts_total"));
+        assert!(response.contains("simgit_lock_wait_duration_seconds"));
+        assert!(response.contains("simgit_lock_wait_timeouts_total"));
         assert!(response.contains("simgit_active_sessions"));
         assert!(response.contains("simgit_active_locks"));
 
         server_task.abort();
+    }
+
+    #[test]
+    fn top_contended_paths_returns_sorted_counts() {
+        let metrics = Metrics::new().expect("metrics init");
+        metrics.record_lock_contention_path(Path::new("/src/a.rs"));
+        metrics.record_lock_contention_path(Path::new("/src/b.rs"));
+        metrics.record_lock_contention_path(Path::new("/src/a.rs"));
+
+        let top = metrics.top_contended_paths(2);
+        assert_eq!(top[0], ("/src/a.rs".to_owned(), 2));
+        assert_eq!(top[1], ("/src/b.rs".to_owned(), 1));
     }
 }

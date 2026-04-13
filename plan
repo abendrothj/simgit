@@ -436,6 +436,9 @@ Execution checkoff (updated 2026-04-12):
     - [x] RPC/server instrumentation for request volume/latency, lock conflicts, session lifecycle counters, and active gauges
     - [x] optional OTLP gRPC tracing bootstrap (`SIMGIT_OTLP_ENDPOINT`)
     - [x] dev/test container profile with daemon + Prometheus (`deploy/dev/`)
+    - [x] lock persistence failure-injection tests for SQLite error paths
+    - [x] lock contention telemetry rollups with top-path RPC report (`lock.contention`)
+    - [x] stress harness report upgrades (p50/p95/p99 latency + failure taxonomy JSON)
 
 ─────────────────────────────────────────────────────────────────
 PHASE 0 — Foundation & Spike                           [ 2 weeks ]

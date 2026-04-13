@@ -323,6 +323,7 @@ impl BorrowRegistry {
 mod tests {
     use super::*;
     use crate::session::SessionManager;
+    use std::sync::Arc;
 
     /// Helper to generate deterministic test UUIDs.
     fn test_uuid(idx: u8) -> Uuid {
@@ -334,6 +335,12 @@ mod tests {
     /// Create a `BorrowRegistry` backed by an in-memory SQLite database.
     fn mk_registry() -> BorrowRegistry {
         BorrowRegistry::new(SessionManager::for_testing())
+    }
+
+    fn mk_registry_with_manager() -> (Arc<SessionManager>, BorrowRegistry) {
+        let manager = SessionManager::for_testing();
+        let registry = BorrowRegistry::new(Arc::clone(&manager));
+        (manager, registry)
     }
 
     // ── Core exclusive-write invariant ────────────────────────────────────
@@ -385,6 +392,37 @@ mod tests {
         assert!(lock.reader_sessions.contains(&r1));
         assert!(lock.reader_sessions.contains(&r2));
         assert!(lock.reader_sessions.contains(&r3));
+    }
+
+    #[test]
+    fn acquire_write_still_grants_when_sqlite_persist_fails() {
+        let (manager, reg) = mk_registry_with_manager();
+        manager.set_fail_persist_lock(true);
+
+        let s1 = test_uuid(1);
+        let path = Path::new("/src/resilient.rs");
+
+        reg.acquire_write(s1, path, None)
+            .expect("write lock should still be granted in-memory");
+
+        let locks = reg.list(None);
+        let lock = locks.iter().find(|l| l.path == path).expect("lock exists");
+        assert_eq!(lock.writer_session, Some(s1));
+    }
+
+    #[test]
+    fn release_session_still_clears_in_memory_when_sqlite_remove_fails() {
+        let (manager, reg) = mk_registry_with_manager();
+
+        let s1 = test_uuid(1);
+        let path = Path::new("/src/release.rs");
+        reg.acquire_write(s1, path, None).expect("acquire");
+
+        manager.set_fail_remove_lock(true);
+        reg.release_session(s1);
+
+        assert!(reg.list(None).iter().all(|l| l.path != path));
+        assert!(reg.is_write_free(path, test_uuid(2)));
     }
 
     // ── Release ───────────────────────────────────────────────────────────

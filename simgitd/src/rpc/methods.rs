@@ -31,6 +31,7 @@ pub async fn dispatch(
         "event.subscribe" => event_subscribe(state, params).await,
         "lock.acquire"   => lock_acquire(state, params).await,
         "lock.list"      => lock_list(state, params).await,
+        "lock.contention" => lock_contention(state, params).await,
         "lock.wait"      => lock_wait(state, params).await,
         _                => Err(RpcError {
             code:    -32601,
@@ -502,6 +503,7 @@ async fn lock_acquire(state: &Arc<AppState>, p: serde_json::Value) -> Result<ser
     match state.borrows.acquire_write(session_id, &path, ttl_seconds) {
         Ok(()) => Ok(serde_json::json!({ "acquired": true })),
         Err(e) => {
+            state.metrics.record_lock_contention_path(&path);
             let payload = serde_json::to_value(&e).ok();
             Err(RpcError {
                 code: ERR_BORROW_CONFLICT,
@@ -518,6 +520,26 @@ async fn lock_list(state: &Arc<AppState>, p: serde_json::Value) -> Result<serde_
     let path = p["path"].as_str().map(PathBuf::from);
     let locks = state.borrows.list(path.as_deref());
     serde_json::to_value(locks).map_err(internal)
+}
+
+async fn lock_contention(state: &Arc<AppState>, p: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+    let limit = p
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 100) as usize)
+        .unwrap_or(20);
+
+    let top = state
+        .metrics
+        .top_contended_paths(limit)
+        .into_iter()
+        .map(|(path, conflicts)| serde_json::json!({
+            "path": path,
+            "conflicts": conflicts,
+        }))
+        .collect::<Vec<_>>();
+
+    Ok(serde_json::json!({ "top": top }))
 }
 
 // ── lock.wait ─────────────────────────────────────────────────────────────────
@@ -540,12 +562,19 @@ async fn lock_wait(state: &Arc<AppState>, p: serde_json::Value) -> Result<serde_
 
     loop {
         if state.borrows.is_write_free(&path, caller) {
+            state
+                .metrics
+                .observe_lock_wait(true, start.elapsed().as_secs_f64());
             return Ok(serde_json::json!({
                 "acquired": true,
                 "waited_ms": start.elapsed().as_millis() as u64,
             }));
         }
         if tokio::time::Instant::now() >= deadline {
+            state
+                .metrics
+                .observe_lock_wait(false, start.elapsed().as_secs_f64());
+            state.metrics.record_lock_contention_path(&path);
             let holder = state
                 .borrows
                 .list(Some(&path))
@@ -615,7 +644,7 @@ mod tests {
         changed_path_ops, changed_paths_set, diff_bytes_for_path, flatten_error_to_rpc, ops_for_path,
         overlap_paths,
     };
-    use super::session_commit;
+    use super::{dispatch, session_commit};
     use crate::borrow::BorrowRegistry;
     use crate::config::{Config, VfsBackend};
     use crate::delta::flatten::FlattenError;
@@ -937,6 +966,34 @@ mod tests {
         assert!(res.is_ok(), "non-overlap commit should succeed");
         let updated = state.sessions.get(s1.session_id).expect("s1 exists");
         assert_eq!(updated.status, simgit_sdk::SessionStatus::Committed);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn lock_contention_reports_top_paths() {
+        let (state, root) = build_state_for_commit_tests().await;
+
+        state
+            .metrics
+            .record_lock_contention_path(Path::new("src/a.rs"));
+        state
+            .metrics
+            .record_lock_contention_path(Path::new("src/b.rs"));
+        state
+            .metrics
+            .record_lock_contention_path(Path::new("src/a.rs"));
+
+        let value = dispatch(&state, "lock.contention", serde_json::json!({ "limit": 2 }))
+            .await
+            .expect("lock.contention result");
+
+        let top = value["top"].as_array().expect("top array");
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0]["path"], "src/a.rs");
+        assert_eq!(top[0]["conflicts"], 2);
+        assert_eq!(top[1]["path"], "src/b.rs");
+        assert_eq!(top[1]["conflicts"], 1);
 
         let _ = std::fs::remove_dir_all(&root);
     }

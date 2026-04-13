@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
@@ -17,12 +19,23 @@ pub struct SessionManager {
     db:    Mutex<Db>,
     /// In-memory cache for hot-path reads (lock conflict messages, etc.)
     cache: Mutex<HashMap<Uuid, SessionInfo>>,
+    #[cfg(test)]
+    fail_persist_lock: AtomicBool,
+    #[cfg(test)]
+    fail_remove_lock: AtomicBool,
 }
 
 impl SessionManager {
     pub async fn open(db_path: &Path) -> Result<Self> {
         let db = Db::open(db_path)?;
-        let mgr = Self { db: Mutex::new(db), cache: Mutex::new(HashMap::new()) };
+        let mgr = Self {
+            db: Mutex::new(db),
+            cache: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_persist_lock: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_remove_lock: AtomicBool::new(false),
+        };
         mgr.warm_cache()?;
         Ok(mgr)
     }
@@ -35,7 +48,22 @@ impl SessionManager {
     pub fn for_testing() -> std::sync::Arc<Self> {
         use super::db::Db;
         let db = Db::in_memory().expect("in-memory SQLite");
-        std::sync::Arc::new(Self { db: Mutex::new(db), cache: Mutex::new(HashMap::new()) })
+        std::sync::Arc::new(Self {
+            db: Mutex::new(db),
+            cache: Mutex::new(HashMap::new()),
+            fail_persist_lock: AtomicBool::new(false),
+            fail_remove_lock: AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn set_fail_persist_lock(&self, fail: bool) {
+        self.fail_persist_lock.store(fail, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub fn set_fail_remove_lock(&self, fail: bool) {
+        self.fail_remove_lock.store(fail, Ordering::Relaxed);
     }
 
     fn warm_cache(&self) -> Result<()> {
@@ -174,6 +202,11 @@ impl SessionManager {
         acquired_at: chrono::DateTime<Utc>,
         ttl_seconds: Option<u64>,
     ) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_persist_lock.load(Ordering::Relaxed) {
+            bail!("injected persist_lock failure");
+        }
+
         let reader_ids: Vec<String> = readers.iter().map(|u| u.to_string()).collect();
         let readers_json = serde_json::to_string(&reader_ids).context("serialize reader_sessions")?;
         let writer_str = writer.map(|u| u.to_string());
@@ -188,6 +221,11 @@ impl SessionManager {
 
     /// Delete a lock row from SQLite (called when a path's lock entry is fully released).
     pub fn remove_lock(&self, path: &Path) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_remove_lock.load(Ordering::Relaxed) {
+            bail!("injected remove_lock failure");
+        }
+
         self.db
             .lock()
             .unwrap()

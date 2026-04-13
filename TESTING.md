@@ -344,7 +344,10 @@ jobs:
     - Linux FUSE integration tests are now wired to CI in `.github/workflows/fuse-linux-integration.yml` (manual + nightly); job skips when `/dev/fuse` is unavailable on runner.
     - Phase 7 metrics instrumentation compiles and is covered by daemon regression suite (`cargo test -p simgitd`).
     - Phase 7 includes an HTTP scrape test for `GET /metrics` in `metrics::tests::metrics_endpoint_exposes_key_series`.
+    - Lock persistence fault-injection coverage validates in-memory lock invariants under simulated SQLite failures (`acquire_write_still_grants_when_sqlite_persist_fails`, `release_session_still_clears_in_memory_when_sqlite_remove_fails`).
+    - RPC lock contention reporting is validated by `rpc::methods::tests::lock_contention_reports_top_paths`.
     - Phase 7 adds a local container profile for observability smoke checks in `deploy/dev/` (daemon + Prometheus).
+    - Stress harness now emits percentile latency and failure taxonomy in JSON (`tests/stress/agent_harness.py --report-out <path>`).
 
 ## FAQ
 
