@@ -29,5 +29,5 @@ Repository = "https://github.com/simgit/simgit"
 [tool.maturin]
 bindings = "pyo3"
 module-name = "simgit.simgit"
-python-source = "simgit"
+python-source = "."
 strip = true
