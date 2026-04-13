@@ -47,7 +47,13 @@ def rand_suffix(n: int = 6) -> str:
     return "".join(random.choice(string.ascii_lowercase) for _ in range(n))
 
 
-def run_agent(agent_id: int, mode: str, socket_path: str | None) -> AgentResult:
+def run_agent(
+    agent_id: int,
+    mode: str,
+    socket_path: str | None,
+    overlap_path: str,
+    jitter_ms: int,
+) -> AgentResult:
     start = time.time()
     simgit = _load_simgit_module()
 
@@ -60,11 +66,18 @@ def run_agent(agent_id: int, mode: str, socket_path: str | None) -> AgentResult:
 
         session_id = session.session_id
 
-        # Optional noop write spot for future extension if mount-path file writes
-        # are injected by a runner wrapper.
-        _ = session.info()
+        info = session.info()
 
         if mode == "commit":
+            mount_path = info["mount_path"]
+            target = os.path.join(mount_path, overlap_path)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(f"agent={agent_id} ts={time.time_ns()}\n")
+
+            if jitter_ms > 0:
+                time.sleep(random.randint(0, jitter_ms) / 1000.0)
+
             branch_name = f"stress/agent-{agent_id}-{rand_suffix()}"
             session.commit(branch_name=branch_name, message="stress harness commit")
         else:
@@ -101,6 +114,17 @@ def parse_args() -> argparse.Namespace:
         "--json",
         action="store_true",
         help="print structured JSON output",
+    )
+    parser.add_argument(
+        "--overlap-path",
+        default="hotspot/shared.txt",
+        help="relative path written by all agents in commit mode",
+    )
+    parser.add_argument(
+        "--commit-jitter-ms",
+        type=int,
+        default=50,
+        help="max random delay before commit in commit mode",
     )
     parser.add_argument(
         "--report-out",
@@ -146,7 +170,17 @@ def main() -> int:
 
     results: list[AgentResult] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = [pool.submit(run_agent, i, args.mode, args.socket) for i in range(args.agents)]
+        futs = [
+            pool.submit(
+                run_agent,
+                i,
+                args.mode,
+                args.socket,
+                args.overlap_path,
+                args.commit_jitter_ms,
+            )
+            for i in range(args.agents)
+        ]
         for fut in concurrent.futures.as_completed(futs):
             results.append(fut.result())
 

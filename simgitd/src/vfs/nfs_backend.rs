@@ -71,12 +71,15 @@
 //! - Same inode numbering scheme (1 = root, 2+ = path entries)
 
 use std::sync::Arc;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use anyhow::Result;
 use uuid::Uuid;
 use tracing::warn;
 
 use simgit_sdk::SessionInfo;
 use crate::config::Config;
+use crate::delta::DeltaStore;
 
 /// NFS-loopback backend driver (macOS, Phase 0 stub).
 ///
@@ -93,6 +96,7 @@ use crate::config::Config;
 /// to attach sessions as read-only NFS mounts (with delta overlay, matching FUSE semantics).
 pub struct NfsLoopbackBackend {
     cfg: Arc<Config>,
+    deltas: Arc<DeltaStore>,
 }
 
 impl NfsLoopbackBackend {
@@ -103,8 +107,72 @@ impl NfsLoopbackBackend {
     /// - `cfg`: Daemon configuration (mount options, cache sizes, git repo path)
     ///
     /// In Phase 0, this is a no-op. Phase 1 will initialize NFSv3 RPC server resources.
-    pub fn new(cfg: Arc<Config>) -> Self {
-        Self { cfg }
+    pub fn new(cfg: Arc<Config>, deltas: Arc<DeltaStore>) -> Self {
+        Self { cfg, deltas }
+    }
+
+    fn list_mount_files(root: &Path) -> Result<Vec<PathBuf>> {
+        fn walk(acc: &mut Vec<PathBuf>, root: &Path, dir: &Path) -> Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let ty = entry.file_type()?;
+                if ty.is_dir() {
+                    walk(acc, root, &path)?;
+                } else if ty.is_file() {
+                    let rel = path
+                        .strip_prefix(root)
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or(path.clone());
+                    acc.push(rel);
+                }
+            }
+            Ok(())
+        }
+
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        walk(&mut out, root, root)?;
+        Ok(out)
+    }
+
+    fn rel_to_git_path(rel: &Path) -> String {
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    fn git_show_blob(repo: &Path, base_commit: &str, rel: &Path) -> Result<Option<Vec<u8>>> {
+        let spec = format!("{}:{}", base_commit, Self::rel_to_git_path(rel));
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["show", &spec])
+            .output()?;
+        if out.status.success() {
+            Ok(Some(out.stdout))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn git_list_paths(repo: &Path, base_commit: &str) -> Result<Vec<PathBuf>> {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["ls-tree", "-r", "--name-only", base_commit])
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "git ls-tree failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let s = String::from_utf8_lossy(&out.stdout);
+        Ok(s.lines().map(PathBuf::from).collect())
     }
 }
 
@@ -164,6 +232,37 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
         // On macOS the real implementation will call:
         //   std::process::Command::new("umount").arg(&mount_path).status()
         let _ = std::fs::remove_dir(&mount_path);
+        Ok(())
+    }
+
+    fn capture_mount_delta(&self, session: &SessionInfo) -> Result<()> {
+        // Phase 0 macOS backend writes directly to a plain directory; recover
+        // the effective delta by diffing mount files against base commit.
+        if !session.mount_path.exists() {
+            return Ok(());
+        }
+
+        let files = Self::list_mount_files(&session.mount_path)?;
+        let mut seen = HashSet::new();
+
+        for rel in &files {
+            let mount_file = session.mount_path.join(rel);
+            let current = std::fs::read(&mount_file)?;
+            let baseline = Self::git_show_blob(&self.cfg.repo_path, &session.base_commit, rel)?;
+            seen.insert(rel.clone());
+
+            if baseline.as_deref() != Some(current.as_slice()) {
+                self.deltas.write_blob(session.session_id, rel, &current)?;
+            }
+        }
+
+        // Paths present in baseline but absent in the mounted view are deletes.
+        for base_path in Self::git_list_paths(&self.cfg.repo_path, &session.base_commit)? {
+            if !seen.contains(&base_path) {
+                self.deltas.mark_deleted(session.session_id, &base_path)?;
+            }
+        }
+
         Ok(())
     }
 }

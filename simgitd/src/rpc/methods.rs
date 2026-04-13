@@ -93,13 +93,23 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
         .to_owned();
 
     let info = state.sessions.get(session_id).ok_or_else(|| not_found(session_id))?;
+
+    // Some backends (e.g., macOS NFS-loopback stub) write to plain directories.
+    // Capture those mount-side changes into the session delta before conflict checks.
+    state.vfs.capture_mount_delta(&info).map_err(internal)?;
+
+    let active_sessions = state.sessions.list(Some(SessionStatus::Active));
+    for s in &active_sessions {
+        state.vfs.capture_mount_delta(s).map_err(internal)?;
+    }
+
     let manifest = state.deltas.load_manifest(session_id).map_err(internal)?;
     let this_ops = changed_path_ops(&manifest);
 
     // Pre-commit conflict check against other active sessions.
     let this_changed: BTreeSet<PathBuf> = this_ops.keys().cloned().collect();
     let mut conflicts = Vec::new();
-    for peer in state.sessions.list(Some(SessionStatus::Active)) {
+    for peer in active_sessions {
         if peer.session_id == session_id {
             continue;
         }

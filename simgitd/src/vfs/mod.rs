@@ -147,6 +147,15 @@ pub trait VfsBackendTrait: Send + Sync {
     /// Best-effort; errors are logged but don't fail the unmount operation.
     /// Cleans up kernel resources (FUSE fd, inode cache) or directory tree.
     async fn unmount(&self, session_id: Uuid) -> Result<()>;
+
+    /// Synchronize backend-native mount writes into the delta store prior to commit.
+    ///
+    /// Backends with in-kernel/write-intercept paths (FUSE) can keep the default no-op.
+    /// Backends that currently mount plain directories (macOS NFS-loopback stub) can
+    /// materialize changed files into the per-session delta manifest here.
+    fn capture_mount_delta(&self, _session: &SessionInfo) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// VFS manager — dispatches mount/unmount to the appropriate backend.
@@ -191,7 +200,7 @@ impl VfsManager {
     pub fn new(cfg: Arc<Config>, deltas: Arc<DeltaStore>, borrows: Arc<BorrowRegistry>) -> Self {
         let backend: Box<dyn VfsBackendTrait> = match cfg.vfs_backend {
             VfsBackend::Fuse        => Box::new(fuse_backend::FuseBackend::new(cfg, deltas, borrows)),
-            VfsBackend::NfsLoopback => Box::new(nfs_backend::NfsLoopbackBackend::new(cfg)),
+            VfsBackend::NfsLoopback => Box::new(nfs_backend::NfsLoopbackBackend::new(cfg, deltas)),
         };
         Self { backend, mounted: Mutex::new(HashMap::new()) }
     }
@@ -240,5 +249,10 @@ impl VfsManager {
         for id in ids {
             self.unmount_session(id).await;
         }
+    }
+
+    /// Ask the backend to synchronize mount-side writes into the session delta store.
+    pub fn capture_mount_delta(&self, session: &SessionInfo) -> Result<()> {
+        self.backend.capture_mount_delta(session)
     }
 }
