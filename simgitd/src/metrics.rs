@@ -30,6 +30,7 @@ pub struct Metrics {
     session_commit_conflict_peers: Histogram,
     active_sessions: IntGauge,
     active_locks: IntGauge,
+    peer_capture_skip_total: IntCounterVec,
     contention_by_path: Mutex<HashMap<String, u64>>,
 }
 
@@ -93,6 +94,13 @@ impl Metrics {
         ))?;
         let active_sessions = IntGauge::new("active_sessions", "Current ACTIVE sessions")?;
         let active_locks = IntGauge::new("active_locks", "Current lock table size")?;
+        let peer_capture_skip_total = IntCounterVec::new(
+            Opts::new(
+                "peer_capture_skip_total",
+                "Incremental peer capture fingerprint decisions: hit = skipped (unchanged), miss = rescanned",
+            ),
+            &["result"],
+        )?;
 
         registry.register(Box::new(rpc_requests_total.clone()))?;
         registry.register(Box::new(rpc_duration_seconds.clone()))?;
@@ -108,6 +116,7 @@ impl Metrics {
         registry.register(Box::new(session_commit_conflict_peers.clone()))?;
         registry.register(Box::new(active_sessions.clone()))?;
         registry.register(Box::new(active_locks.clone()))?;
+        registry.register(Box::new(peer_capture_skip_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -125,6 +134,7 @@ impl Metrics {
             session_commit_conflict_peers,
             active_sessions,
             active_locks,
+            peer_capture_skip_total,
             contention_by_path: Mutex::new(HashMap::new()),
         })
     }
@@ -185,6 +195,16 @@ impl Metrics {
             .inc();
         self.session_commit_conflict_peers.observe(peers as f64);
         self.session_commit_conflict_paths.observe(paths as f64);
+    }
+
+    /// Record a fingerprint-based peer-capture skip decision.
+    ///
+    /// - `"hit"`: mount fingerprint matched; file-tree walk was skipped.
+    /// - `"miss"`: fingerprint changed or first capture; full walk executed.
+    pub fn record_peer_capture_skip(&self, result: &str) {
+        self.peer_capture_skip_total
+            .with_label_values(&[result])
+            .inc();
     }
 
     pub fn record_lock_contention_path(&self, path: &Path) {

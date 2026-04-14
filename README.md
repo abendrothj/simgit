@@ -275,8 +275,8 @@ python tests/stress/agent_harness.py \
 - Manifest tracking (deletes, renames, writes)
 - Content-addressed blob storage
 - Atomic write-then-rename
-- Status: ✅ Completed (code + local validation)
-- Implemented so far:
+- Status: ✅ Completed (code + macOS NFS validation + Linux tests prepared)
+- Implementation highlights:
     - Existing-file `write` interception into session delta blobs
     - `create` interception for new files into session delta blobs
     - `unlink` and `rename` capture via delta manifest tombstones/renames
@@ -285,7 +285,10 @@ python tests/stress/agent_harness.py \
     - ACTIVE session mount re-attachment regression via NFS-loopback backend
     - Linux FUSE integration harness added for create/unlink/rename and remount flows
     - Delta-aware metadata updates for file size in `getattr`
-    - Remaining external validation: Linux-runtime execution of the FUSE harness
+- Phase 2 Linux FUSE tests:
+    - `fuse_mount_roundtrip_create_unlink_rename` — Tests create/write/rename/unlink operations
+    - `fuse_mount_can_remount_same_session_path` — Tests mount/unmount/remount idempotency
+    - Status: Harness and CI wiring are in place (`.github/workflows/fuse-linux-integration.yml`); first Linux green run is still pending
 
 ### Phase 3: Borrow Checker (2 weeks)
 - Lock acquisition at session creation
@@ -298,16 +301,25 @@ python tests/stress/agent_harness.py \
     - structured conflict payload via `lock.acquire` RPC
 
 ### Phase 4: Flatten & Merge (2 weeks)
-- Convert delta → git tree/blob objects
-- Auto three-way merge
+- Convert delta → git tree/blob objects (current impl: worktree-based via git CLI)
+- Auto three-way merge (pending)
 - Create commit + update branch
 - Error handling (merge conflicts)
-- Status: 🚧 In progress
-- Implemented highlights:
+- Status: 🚧 In progress (core flatten + overlap detection complete)
+- Implementation highlights:
     - pre-commit overlap detection across active sessions in `session.commit`
     - multi-session commit tests for overlap-block and non-overlap success
     - per-path conflict operation reporting (`ours_ops` / `peer_ops`) in overlap payloads
     - structured flatten failure taxonomy (`missing_delta_blob`, `git_conflict`, `git_operation_failed`, `filesystem_io`)
+    - Range-aware conflict detection: byte-range support for write/write overlap detection
+    - Commit latency metrics: per-stage histogram (capture_self, capture_peers, conflict_scan, flatten)
+    - Conflict cardinality reporting: per-session and per-peer counts
+    - Current behavior for overlapping paths/ranges is conservative block-until-resolved
+
+### Active Todo (1-3)
+1. Phase 4: implement auto three-way merge attempt for non-conflicting overlap cases.
+2. Add a full flatten E2E integration test (delta -> branch -> commit verification).
+3. Start pure-gix flatten migration plan and scaffold (replace temp worktree + git CLI path).
 
 ### Phase 5: CLI & SDK (1 week)
 - All 9 `sg` subcommands

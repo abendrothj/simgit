@@ -43,6 +43,8 @@ class AgentResult:
     session_id: str | None
     duration_ms: int
     error: str | None = None
+    attempts: int = 1
+    attempt_durations_ms: list[int] | None = None
 
 
 @dataclass
@@ -141,29 +143,67 @@ def prepare_agent_session(
         return None, AgentResult(agent_id, False, stress_mode, None, elapsed, str(exc))
 
 
-def commit_prepared_session(prepared: PreparedSession, jitter_ms: int) -> AgentResult:
+def commit_prepared_session(
+    prepared: PreparedSession,
+    jitter_ms: int,
+    retry_attempts: int = 1,
+    retry_failure_mode: str = "none",
+) -> AgentResult:
     start = time.time()
-    try:
-        if jitter_ms > 0:
-            time.sleep(random.randint(0, jitter_ms) / 1000.0)
+    attempt_durations: list[int] = []
+    last_error: str | None = None
 
-        if prepared.mode == "hotspot":
-            branch_name = f"stress/hotspot-agent-{prepared.agent_id}-{rand_suffix()}"
-            message = "stress hotspot commit"
-        else:
-            branch_name = f"stress/disjoint-agent-{prepared.agent_id}-{rand_suffix()}"
-            message = "stress disjoint-range commit"
-
-        prepared.session.commit(branch_name=branch_name, message=message)
-        elapsed = int((time.time() - start) * 1000)
-        return AgentResult(prepared.agent_id, True, prepared.mode, prepared.session_id, elapsed)
-    except Exception as exc:  # pragma: no cover
+    for attempt in range(1, retry_attempts + 1):
+        attempt_start = time.time()
         try:
-            prepared.session.abort()
-        except Exception:
-            pass
-        elapsed = int((time.time() - start) * 1000)
-        return AgentResult(prepared.agent_id, False, prepared.mode, prepared.session_id, elapsed, str(exc))
+            if jitter_ms > 0:
+                time.sleep(random.randint(0, jitter_ms) / 1000.0)
+
+            if prepared.mode == "hotspot":
+                branch_name = f"stress/hotspot-agent-{prepared.agent_id}-{rand_suffix()}"
+                message = "stress hotspot commit"
+            else:
+                branch_name = f"stress/disjoint-agent-{prepared.agent_id}-{rand_suffix()}"
+                message = "stress disjoint-range commit"
+
+            # Retry-focused benchmark mode: force failures on early attempts so
+            # we can measure long-lived session commit retries.
+            if retry_failure_mode == "invalid-branch" and attempt < retry_attempts:
+                branch_name = f"invalid branch {prepared.agent_id} {attempt}"
+
+            prepared.session.commit(branch_name=branch_name, message=message)
+            attempt_durations.append(int((time.time() - attempt_start) * 1000))
+            elapsed = int((time.time() - start) * 1000)
+            return AgentResult(
+                prepared.agent_id,
+                True,
+                prepared.mode,
+                prepared.session_id,
+                elapsed,
+                attempts=attempt,
+                attempt_durations_ms=attempt_durations,
+            )
+        except Exception as exc:  # pragma: no cover
+            attempt_durations.append(int((time.time() - attempt_start) * 1000))
+            last_error = str(exc)
+            if attempt < retry_attempts:
+                continue
+
+    try:
+        prepared.session.abort()
+    except Exception:
+        pass
+    elapsed = int((time.time() - start) * 1000)
+    return AgentResult(
+        prepared.agent_id,
+        False,
+        prepared.mode,
+        prepared.session_id,
+        elapsed,
+        last_error,
+        attempts=retry_attempts,
+        attempt_durations_ms=attempt_durations,
+    )
 
 
 def run_agent_hotspot(
@@ -318,6 +358,18 @@ def parse_args() -> argparse.Namespace:
         help="use two-phase barrier: all agents write, then all commit simultaneously",
     )
     parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=1,
+        help="number of commit attempts per prepared session in phased mode",
+    )
+    parser.add_argument(
+        "--retry-failure-mode",
+        choices=["none", "invalid-branch"],
+        default="none",
+        help="optional synthetic failure mode for early retry attempts (phased mode)",
+    )
+    parser.add_argument(
         "--report-out",
         help="optional file path to write JSON report",
     )
@@ -360,6 +412,9 @@ def main() -> int:
     if args.agents < 1:
         print("--agents must be >= 1", file=sys.stderr)
         return 2
+    if args.retry_attempts < 1:
+        print("--retry-attempts must be >= 1", file=sys.stderr)
+        return 2
 
     # Create barrier if two-phase mode is enabled. A barrier requires every
     # agent task to be able to run concurrently; otherwise the first wave of
@@ -396,7 +451,13 @@ def main() -> int:
         commit_workers = args.commit_workers if args.commit_workers > 0 else worker_count
         with concurrent.futures.ThreadPoolExecutor(max_workers=commit_workers) as pool:
             commit_futs = [
-                pool.submit(commit_prepared_session, s, args.commit_jitter_ms)
+                pool.submit(
+                    commit_prepared_session,
+                    s,
+                    args.commit_jitter_ms,
+                    args.retry_attempts,
+                    args.retry_failure_mode,
+                )
                 for s in prepared
             ]
             for fut in concurrent.futures.as_completed(commit_futs):
@@ -451,6 +512,23 @@ def main() -> int:
         "p99_ms": percentile(durations, 0.99),
     }
 
+    total_attempts = sum(r.attempts for r in results)
+    attempt_latencies = [d for r in results for d in (r.attempt_durations_ms or [])]
+    retry = {
+        "enabled": args.retry_attempts > 1,
+        "attempts_configured": args.retry_attempts,
+        "failure_mode": args.retry_failure_mode,
+        "attempts_observed": total_attempts,
+        "avg_attempts_per_agent": round(total_attempts / len(results), 2) if results else 0,
+        "attempt_latency": {
+            "min_ms": min(attempt_latencies) if attempt_latencies else 0,
+            "max_ms": max(attempt_latencies) if attempt_latencies else 0,
+            "p50_ms": percentile(attempt_latencies, 0.50),
+            "p95_ms": percentile(attempt_latencies, 0.95),
+            "p99_ms": percentile(attempt_latencies, 0.99),
+        },
+    }
+
     summary = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "total_duration_ms": int((time.time() - started) * 1000),
@@ -464,6 +542,7 @@ def main() -> int:
         "failures": failures,
         "failure_breakdown": failure_breakdown,
         "latency": latency,
+        "retry": retry,
     }
 
     # Mode-specific metadata

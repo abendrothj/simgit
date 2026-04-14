@@ -72,6 +72,9 @@
 
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 use anyhow::Result;
 use uuid::Uuid;
 use tracing::warn;
@@ -80,6 +83,7 @@ use simgit_sdk::SessionInfo;
 use crate::config::Config;
 use crate::delta::store::ByteRange;
 use crate::delta::DeltaStore;
+use crate::metrics::Metrics;
 
 /// NFS-loopback backend driver (macOS, Phase 0 stub).
 ///
@@ -97,6 +101,9 @@ use crate::delta::DeltaStore;
 pub struct NfsLoopbackBackend {
     cfg: Arc<Config>,
     deltas: Arc<DeltaStore>,
+    last_mount_fingerprint: Mutex<HashMap<Uuid, u64>>,
+    incremental_capture_enabled: bool,
+    metrics: Arc<Metrics>,
 }
 
 impl NfsLoopbackBackend {
@@ -107,8 +114,67 @@ impl NfsLoopbackBackend {
     /// - `cfg`: Daemon configuration (mount options, cache sizes, git repo path)
     ///
     /// In Phase 0, this is a no-op. Phase 1 will initialize NFSv3 RPC server resources.
-    pub fn new(cfg: Arc<Config>, deltas: Arc<DeltaStore>) -> Self {
-        Self { cfg, deltas }
+    pub fn new(cfg: Arc<Config>, deltas: Arc<DeltaStore>, metrics: Arc<Metrics>) -> Self {
+        let incremental_capture_enabled = std::env::var("SIMGIT_NFS_INCREMENTAL_CAPTURE")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        Self {
+            cfg,
+            deltas,
+            last_mount_fingerprint: Mutex::new(HashMap::new()),
+            incremental_capture_enabled,
+            metrics,
+        }
+    }
+
+    fn list_mount_file_entries(root: &Path) -> Result<Vec<(PathBuf, u64, u128)>> {
+        fn walk(acc: &mut Vec<(PathBuf, u64, u128)>, root: &Path, dir: &Path) -> Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let ty = entry.file_type()?;
+                if ty.is_dir() {
+                    walk(acc, root, &path)?;
+                } else if ty.is_file() {
+                    let rel = path
+                        .strip_prefix(root)
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or(path.clone());
+                    let meta = entry.metadata()?;
+                    let size = meta.len();
+                    let mtime_nanos = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    acc.push((rel, size, mtime_nanos));
+                }
+            }
+            Ok(())
+        }
+
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        walk(&mut out, root, root)?;
+        Ok(out)
+    }
+
+    fn compute_mount_fingerprint(entries: &[(PathBuf, u64, u128)]) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // deterministic independent of read_dir ordering
+        let mut ordered = entries.to_vec();
+        ordered.sort_by(|a, b| a.0.cmp(&b.0));
+        for (path, size, mtime_nanos) in ordered {
+            path.hash(&mut hasher);
+            size.hash(&mut hasher);
+            mtime_nanos.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     fn list_mount_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -265,6 +331,9 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
         // On macOS the real implementation will call:
         //   std::process::Command::new("umount").arg(&mount_path).status()
         let _ = std::fs::remove_dir(&mount_path);
+        if let Ok(mut fp) = self.last_mount_fingerprint.lock() {
+            fp.remove(&session_id);
+        }
         Ok(())
     }
 
@@ -279,7 +348,22 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
             return Ok(());
         }
 
-        let files = Self::list_mount_files(&session.mount_path)?;
+        let entries = Self::list_mount_file_entries(&session.mount_path)?;
+        if self.incremental_capture_enabled {
+            let fingerprint = Self::compute_mount_fingerprint(&entries);
+            if let Ok(mut fp) = self.last_mount_fingerprint.lock() {
+                if let Some(prev) = fp.get(&session.session_id) {
+                    if *prev == fingerprint {
+                        self.metrics.record_peer_capture_skip("hit");
+                        return Ok(());
+                    }
+                }
+                fp.insert(session.session_id, fingerprint);
+            }
+            self.metrics.record_peer_capture_skip("miss");
+        }
+
+        let files: Vec<PathBuf> = entries.into_iter().map(|(p, _, _)| p).collect();
 
         for rel in &files {
             let mount_file = session.mount_path.join(rel);
@@ -293,5 +377,25 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NfsLoopbackBackend;
+    use std::path::PathBuf;
+
+    #[test]
+    fn mount_fingerprint_changes_with_metadata_changes() {
+        let a = vec![
+            (PathBuf::from("a.txt"), 10_u64, 100_u128),
+            (PathBuf::from("b.txt"), 20_u64, 200_u128),
+        ];
+        let mut b = a.clone();
+        b[1].1 = 21; // size changed
+
+        let fa = NfsLoopbackBackend::compute_mount_fingerprint(&a);
+        let fb = NfsLoopbackBackend::compute_mount_fingerprint(&b);
+        assert_ne!(fa, fb);
     }
 }

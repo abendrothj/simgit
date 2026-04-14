@@ -434,6 +434,7 @@ mod tests {
             Arc::clone(&cfg),
             Arc::clone(&deltas),
             Arc::clone(&borrows),
+            Arc::new(crate::metrics::Metrics::new().expect("metrics")),
         ));
         let state = AppState {
             config: Arc::clone(&cfg),

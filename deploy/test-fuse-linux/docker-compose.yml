@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  linux-fuse-tests:
+    build:
+      context: ../..
+      dockerfile: deploy/test-fuse-linux/Dockerfile
+    # Required for FUSE to work inside container
+    devices:
+      - /dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
+    # Keep container running for debugging if tests fail
+    stdin_open: true
+    tty: true

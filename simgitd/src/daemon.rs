@@ -186,6 +186,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         Arc::clone(&cfg),
         Arc::clone(&deltas),
         Arc::clone(&borrows),
+        Arc::clone(&metrics),
     ));
 
     let state = AppState {

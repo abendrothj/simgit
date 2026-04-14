@@ -288,11 +288,84 @@ python tests/stress/agent_harness.py \
     --json --report-out /tmp/simgit-stress-report.json
 ```
 
+Retry-focused benchmark (long-lived session commit attempts):
+
+```bash
+cd /Users/ja/Desktop/projects/simgit
+source .venv/bin/activate
+python tests/stress/agent_harness.py \
+    --agents 20 --workers 10 --execution-mode phased \
+    --stress-mode disjoint-range --commit-workers 10 \
+    --retry-attempts 3 --retry-failure-mode invalid-branch \
+    --socket /tmp/simgit-stress-state/control.sock \
+    --report-out /tmp/simgit-retry-report.json
+```
+
+The JSON report includes `retry` fields with attempt counts and per-attempt
+latency percentiles (`retry.attempt_latency.p50_ms`, `p95_ms`, `p99_ms`).
+
 Key Prometheus series to capture during stress runs:
 - `simgit_session_commit_stage_duration_seconds{stage="capture_self|capture_peers|conflict_scan|flatten"}`
 - `simgit_session_commit_conflicts_total{kind="active_session_overlap"}`
 - `simgit_session_commit_conflict_paths`
 - `simgit_session_commit_conflict_peers`
+- `simgit_peer_capture_skip_total{result="hit|miss"}`
+
+### Incremental Peer-Capture A/B (Validated)
+
+Observed on `20 agents x 5 retry attempts` (`invalid-branch` early failures, disjoint-range workload):
+- `capture_peers_execution` average/event: `242.432ms -> 7.408ms` (96.9% reduction)
+- End-to-end latency: `p95 10688ms -> 3771ms` (64.7% reduction)
+- Fingerprint skip efficiency:
+  - `hit=1344` (skip mount walk)
+  - `miss=20` (re-scan mount)
+  - hit rate: `98.5%`
+
+Interpretation:
+- The dominant retry-path tax moved out of the commit critical path.
+- The `miss` population confirms invalidation still triggers when peer state changes.
+
+### False-Positive Guardrail Checklist
+
+Use this checklist to avoid over-claiming wins from measurement artifacts:
+- Run control and treatment with identical workload shape (agent count, retries, commit workers, socket timeout, state isolation).
+- Capture metrics snapshots before and after each run, then diff only the window (`after - before`).
+- Verify `simgit_peer_capture_skip_total{result="hit|miss"}` and stage histograms move in the same direction.
+- Confirm `SIMGIT_NFS_INCREMENTAL_CAPTURE=0` materially degrades `capture_peers_execution` vs `=1`.
+- Ensure correctness invariants stay green (`successes=agents`, no unexpected conflict taxonomy drift).
+
+Minimum anti-false-positive command pair:
+
+```bash
+# Control (incremental OFF)
+SIMGIT_NFS_INCREMENTAL_CAPTURE=0 ... simgitd ...
+
+# Treatment (incremental ON)
+SIMGIT_NFS_INCREMENTAL_CAPTURE=1 ... simgitd ...
+```
+
+### Fingerprinting Hardening Roadmap
+
+Current fingerprint inputs: `(relative_path, size, mtime_ns)`.
+
+Hardening candidates for high-frequency rewrite loops:
+- Add `ctime_ns` when available.
+- Include inode identity/generation when platform support is reliable.
+- Optional fast content sentinel (e.g., hash of first 4KB) on suspiciously stable metadata.
+
+Policy:
+- Keep commit-time fingerprinting deterministic by default.
+- Gate stronger probes behind env flags to preserve baseline throughput when not needed.
+
+### Lessons Learned
+
+1. The real scaling wall was algorithmic, not scheduler-related:
+    - Without skip logic, peer capture behaves like repeated full scans across active peers, which trends toward an $O(N^2)$ tax as active sessions rise.
+2. Backend behavior matters for optimization shape:
+    - macOS NFS-loopback (Phase 0 plain-directory capture at commit time) benefits immediately from fingerprint skips.
+    - Linux FUSE path already intercepts writes in-kernel, so this specific optimization primarily targets the macOS commit path.
+3. Deterministic commit-time checks are operationally simpler than event-driven invalidation:
+    - Fewer moving parts, easier incident replay, lower maintenance burden while throughput is already acceptable.
 
 ### Run with Log Output
 ```bash
@@ -365,6 +438,7 @@ jobs:
     - Phase 4 helper coverage includes changed-path and overlap detection for pre-commit conflict checks.
     - Phase 4 integration tests now cover commit overlap blocking and non-overlap commit success across active sessions.
     - Phase 4 RPC coverage now validates per-path overlap operation details and flatten error taxonomy mapping.
+    - Phase 4 auto-merge behavior is not yet enabled; overlap policy is currently conservative blocking.
     - Phase 5 bootstrap validation: `cargo check -p simgit-py` is green with ABI3 compatibility enabled.
     - Phase 5 packaging flow is configured via `simgit-py/pyproject.toml` (maturin backend).
     - Wheel build/publish commands are documented; runtime wheel build was not executed locally because `maturin` is not installed in this environment.
@@ -382,6 +456,11 @@ jobs:
     - RPC lock contention reporting is validated by `rpc::methods::tests::lock_contention_reports_top_paths`.
     - Phase 7 adds a local container profile for observability smoke checks in `deploy/dev/` (daemon + Prometheus).
     - Stress harness now emits percentile latency and failure taxonomy in JSON (`tests/stress/agent_harness.py --report-out <path>`).
+
+### Next Todo (1-3)
+1. Implement auto three-way merge attempt for non-conflicting overlaps in `session.commit` path.
+2. Add flatten E2E integration test coverage (delta to branch commit verification).
+3. Prepare pure-gix flatten migration scaffold and test plan.
 
 ## FAQ
 

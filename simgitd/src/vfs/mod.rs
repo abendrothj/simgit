@@ -197,10 +197,10 @@ impl VfsManager {
     /// # Panics
     ///
     /// None. Backend instantiation is always fallible via async mount calls.
-    pub fn new(cfg: Arc<Config>, deltas: Arc<DeltaStore>, borrows: Arc<BorrowRegistry>) -> Self {
+    pub fn new(cfg: Arc<Config>, deltas: Arc<DeltaStore>, borrows: Arc<BorrowRegistry>, metrics: Arc<crate::metrics::Metrics>) -> Self {
         let backend: Box<dyn VfsBackendTrait> = match cfg.vfs_backend {
             VfsBackend::Fuse        => Box::new(fuse_backend::FuseBackend::new(cfg, deltas, borrows)),
-            VfsBackend::NfsLoopback => Box::new(nfs_backend::NfsLoopbackBackend::new(cfg, deltas)),
+            VfsBackend::NfsLoopback => Box::new(nfs_backend::NfsLoopbackBackend::new(cfg, deltas, metrics)),
         };
         Self { backend, mounted: Mutex::new(HashMap::new()) }
     }
