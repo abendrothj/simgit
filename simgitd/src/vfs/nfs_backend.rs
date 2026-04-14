@@ -71,7 +71,6 @@
 //! - Same inode numbering scheme (1 = root, 2+ = path entries)
 
 use std::sync::Arc;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use anyhow::Result;
 use uuid::Uuid;
@@ -79,6 +78,7 @@ use tracing::warn;
 
 use simgit_sdk::SessionInfo;
 use crate::config::Config;
+use crate::delta::store::ByteRange;
 use crate::delta::DeltaStore;
 
 /// NFS-loopback backend driver (macOS, Phase 0 stub).
@@ -159,20 +159,53 @@ impl NfsLoopbackBackend {
         }
     }
 
-    fn git_list_paths(repo: &Path, base_commit: &str) -> Result<Vec<PathBuf>> {
-        let out = std::process::Command::new("git")
-            .current_dir(repo)
-            .args(["ls-tree", "-r", "--name-only", base_commit])
-            .output()?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "git ls-tree failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+    fn infer_changed_ranges(current: &[u8], baseline: Option<&[u8]>) -> Vec<ByteRange> {
+        let base = baseline.unwrap_or_default();
+        let max_len = current.len().max(base.len());
+        let mut ranges = Vec::new();
+        let mut start: Option<usize> = None;
+
+        for i in 0..max_len {
+            let cur = current.get(i).copied().unwrap_or(0);
+            let old = base.get(i).copied().unwrap_or(0);
+            if cur != old {
+                if start.is_none() {
+                    start = Some(i);
+                }
+            } else if let Some(s) = start.take() {
+                ranges.push(ByteRange {
+                    offset: s as u64,
+                    len: (i - s) as u64,
+                });
+            }
         }
 
-        let s = String::from_utf8_lossy(&out.stdout);
-        Ok(s.lines().map(PathBuf::from).collect())
+        if let Some(s) = start {
+            ranges.push(ByteRange {
+                offset: s as u64,
+                len: (max_len - s) as u64,
+            });
+        }
+
+        ranges
+    }
+
+    fn record_blob_with_ranges(
+        &self,
+        session_id: Uuid,
+        rel: &Path,
+        current: &[u8],
+        ranges: &[ByteRange],
+    ) -> Result<()> {
+        if ranges.is_empty() {
+            self.deltas.write_blob(session_id, rel, current, None)?;
+            return Ok(());
+        }
+
+        for range in ranges {
+            self.deltas.write_blob(session_id, rel, current, Some(*range))?;
+        }
+        Ok(())
     }
 }
 
@@ -236,30 +269,26 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
     }
 
     fn capture_mount_delta(&self, session: &SessionInfo) -> Result<()> {
-        // Phase 0 macOS backend writes directly to a plain directory; recover
-        // the effective delta by diffing mount files against base commit.
+        // Phase 0 macOS backend writes directly to a plain directory. Capture only
+        // files that appear in the session mount and differ from base content.
+        //
+        // Important: do not infer global deletes from "missing in mount" because
+        // the Phase 0 mount is not a full repo projection. Treating every absent
+        // path as deleted causes false conflicts across the whole repository.
         if !session.mount_path.exists() {
             return Ok(());
         }
 
         let files = Self::list_mount_files(&session.mount_path)?;
-        let mut seen = HashSet::new();
 
         for rel in &files {
             let mount_file = session.mount_path.join(rel);
             let current = std::fs::read(&mount_file)?;
             let baseline = Self::git_show_blob(&self.cfg.repo_path, &session.base_commit, rel)?;
-            seen.insert(rel.clone());
 
             if baseline.as_deref() != Some(current.as_slice()) {
-                self.deltas.write_blob(session.session_id, rel, &current, None)?;
-            }
-        }
-
-        // Paths present in baseline but absent in the mounted view are deletes.
-        for base_path in Self::git_list_paths(&self.cfg.repo_path, &session.base_commit)? {
-            if !seen.contains(&base_path) {
-                self.deltas.mark_deleted(session.session_id, &base_path)?;
+                let ranges = Self::infer_changed_ranges(&current, baseline.as_deref());
+                self.record_blob_with_ranges(session.session_id, rel, &current, &ranges)?;
             }
         }
 

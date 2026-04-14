@@ -1742,9 +1742,11 @@ mod linux_integration_tests {
             max_sessions: 8,
             max_delta_bytes: 2 * 1024 * 1024,
             lock_ttl_seconds: 3600,
+            session_recovery_ttl_seconds: 86400,
             vfs_backend: VfsBackend::Fuse,
             metrics_enabled: false,
             metrics_addr: "127.0.0.1:0".to_owned(),
+            commit_peer_capture_concurrency: 4,
         });
 
         let db_path = state_dir.join("state.db");
@@ -1805,9 +1807,11 @@ mod linux_integration_tests {
             max_sessions: 8,
             max_delta_bytes: 2 * 1024 * 1024,
             lock_ttl_seconds: 3600,
+            session_recovery_ttl_seconds: 86400,
             vfs_backend: VfsBackend::Fuse,
             metrics_enabled: false,
             metrics_addr: "127.0.0.1:0".to_owned(),
+            commit_peer_capture_concurrency: 4,
         });
 
         let db_path = state_dir.join("state.db");

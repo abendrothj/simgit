@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -44,15 +45,20 @@ pub struct DeltaManifest {
 }
 
 pub struct DeltaStore {
-    root:           PathBuf,
+    root:            PathBuf,
     /// Maximum bytes of delta blobs per session. `u64::MAX` = unlimited.
     max_delta_bytes: u64,
+    manifest_locks:  Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
 }
 
 impl DeltaStore {
     /// Create a store with no quota limit.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), max_delta_bytes: u64::MAX }
+        Self {
+            root: root.into(),
+            max_delta_bytes: u64::MAX,
+            manifest_locks: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Create a store that enforces a per-session delta-size quota.
@@ -60,7 +66,11 @@ impl DeltaStore {
     /// `write_blob` will return an error when adding a new blob would push the
     /// cumulative unique-blob size for the session over `max_delta_bytes`.
     pub fn new_with_quota(root: impl Into<PathBuf>, max_delta_bytes: u64) -> Self {
-        Self { root: root.into(), max_delta_bytes }
+        Self {
+            root: root.into(),
+            max_delta_bytes,
+            manifest_locks: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Sum of all unique blob file sizes currently stored for `session_id`.
@@ -116,13 +126,30 @@ impl DeltaStore {
         self.session_dir(session_id).join("manifest.json")
     }
 
+    fn manifest_lock(&self, session_id: Uuid) -> Arc<Mutex<()>> {
+        let mut locks = self.manifest_locks.lock().expect("manifest locks poisoned");
+        Arc::clone(
+            locks
+                .entry(session_id)
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    fn with_session_lock<T>(&self, session_id: Uuid, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let lock = self.manifest_lock(session_id);
+        let _guard = lock.lock().expect("session manifest lock poisoned");
+        f()
+    }
+
     /// Initialise the directory structure for a new session.
     pub fn init_session(&self, session_id: Uuid, base_commit: &str) -> Result<()> {
-        std::fs::create_dir_all(self.objects_dir(session_id))
-            .with_context(|| format!("create objects dir for session {session_id}"))?;
+        self.with_session_lock(session_id, || {
+            std::fs::create_dir_all(self.objects_dir(session_id))
+                .with_context(|| format!("create objects dir for session {session_id}"))?;
 
-        let manifest = DeltaManifest { base_commit: base_commit.to_owned(), ..Default::default() };
-        self.write_manifest(session_id, &manifest)
+            let manifest = DeltaManifest { base_commit: base_commit.to_owned(), ..Default::default() };
+            self.write_manifest(session_id, &manifest)
+        })
     }
 
     // ── Blob write ────────────────────────────────────────────────────────
@@ -136,59 +163,49 @@ impl DeltaStore {
     /// Returns an error if adding this blob would push the session's total
     /// unique-blob size over `max_delta_bytes`.
     pub fn write_blob(&self, session_id: Uuid, path: &Path, content: &[u8], range: Option<ByteRange>) -> Result<String> {
-        // Compute content hash for deduplication and integrity.
-        let hash = hex::encode(Sha256::digest(content));
+        self.with_session_lock(session_id, || {
+            // Compute content hash for deduplication and integrity.
+            let hash = hex::encode(Sha256::digest(content));
 
-        // Bucket by first 2 hex chars.
-        let bucket = &hash[..2];
-        let blob_dir = self.objects_dir(session_id).join(bucket);
-        std::fs::create_dir_all(&blob_dir)?;
+            // Bucket by first 2 hex chars.
+            let bucket = &hash[..2];
+            let blob_dir = self.objects_dir(session_id).join(bucket);
+            std::fs::create_dir_all(&blob_dir)?;
 
-        let blob_path = blob_dir.join(&hash[2..]);
-        if !blob_path.exists() {
-            // Quota check: only new (non-deduplicated) blobs consume space.
-            //
-            // This is a *soft* limit. There is a narrow TOCTOU window between the
-            // `session_bytes_used()` call and the actual write, so two concurrent
-            // writes to the *same* session could each pass the check and collectively
-            // slightly exceed the quota. In practice, the VFS write path is
-            // single-threaded per session, and any overshoot is bounded by one
-            // additional blob. Full serialization would require a per-session Mutex
-            // and is deferred to a future hardening pass.
-            if self.max_delta_bytes != u64::MAX {
-                let used = self.session_bytes_used(session_id);
-                let new_size = content.len() as u64;
-                if used.saturating_add(new_size) > self.max_delta_bytes {
-                    anyhow::bail!(
-                        "delta quota exceeded for session {session_id}: \
-                         {} bytes used + {} bytes new > {} bytes limit",
-                        used, new_size, self.max_delta_bytes
-                    );
+            let blob_path = blob_dir.join(&hash[2..]);
+            if !blob_path.exists() {
+                if self.max_delta_bytes != u64::MAX {
+                    let used = self.session_bytes_used(session_id);
+                    let new_size = content.len() as u64;
+                    if used.saturating_add(new_size) > self.max_delta_bytes {
+                        anyhow::bail!(
+                            "delta quota exceeded for session {session_id}: \
+                             {} bytes used + {} bytes new > {} bytes limit",
+                            used, new_size, self.max_delta_bytes
+                        );
+                    }
                 }
+
+                let tmp = blob_path.with_extension(format!("tmp-{}", Uuid::now_v7()));
+                {
+                    let mut f = std::fs::File::create(&tmp)?;
+                    f.write_all(content)?;
+                    f.sync_data()?;
+                }
+                std::fs::rename(&tmp, &blob_path)?;
             }
 
-            // Write-then-rename for atomicity.
-            let tmp = blob_path.with_extension("tmp");
-            {
-                let mut f = std::fs::File::create(&tmp)?;
-                f.write_all(content)?;
-                f.sync_data()?;
+            let mut manifest = self.load_manifest_unlocked(session_id)?;
+            manifest.deletes.remove(path);
+            manifest.writes.insert(path.to_owned(), hash.clone());
+            match range {
+                Some(r) => manifest.ranges.entry(path.to_owned()).or_default().push(r),
+                None    => { manifest.ranges.remove(path); }
             }
-            std::fs::rename(&tmp, &blob_path)?;
-        }
+            self.write_manifest(session_id, &manifest)?;
 
-        // Update manifest.
-        let mut manifest = self.load_manifest(session_id)?;
-        // Remove from deletes if it was previously deleted.
-        manifest.deletes.remove(path);
-        manifest.writes.insert(path.to_owned(), hash.clone());
-        match range {
-            Some(r) => manifest.ranges.entry(path.to_owned()).or_default().push(r),
-            None    => { manifest.ranges.remove(path); }
-        }
-        self.write_manifest(session_id, &manifest)?;
-
-        Ok(hash)
+            Ok(hash)
+        })
     }
 
     // ── Blob read ─────────────────────────────────────────────────────────
@@ -226,38 +243,51 @@ impl DeltaStore {
     // ── Delete marker ─────────────────────────────────────────────────────
 
     pub fn mark_deleted(&self, session_id: Uuid, path: &Path) -> Result<()> {
-        let mut manifest = self.load_manifest(session_id)?;
-        manifest.writes.remove(path);
-        manifest.deletes.insert(path.to_owned());
-        self.write_manifest(session_id, &manifest)
+        self.with_session_lock(session_id, || {
+            let mut manifest = self.load_manifest_unlocked(session_id)?;
+            manifest.writes.remove(path);
+            manifest.deletes.insert(path.to_owned());
+            self.write_manifest(session_id, &manifest)
+        })
     }
 
     // ── Rename ────────────────────────────────────────────────────────────
 
     pub fn record_rename(&self, session_id: Uuid, from: &Path, to: &Path) -> Result<()> {
-        let mut manifest = self.load_manifest(session_id)?;
-        // Move write entry from old path to new path.
-        if let Some(hash) = manifest.writes.remove(from) {
-            manifest.writes.insert(to.to_owned(), hash);
-        }
-        manifest.renames.push((from.to_owned(), to.to_owned()));
-        self.write_manifest(session_id, &manifest)
+        self.with_session_lock(session_id, || {
+            let mut manifest = self.load_manifest_unlocked(session_id)?;
+            if let Some(hash) = manifest.writes.remove(from) {
+                manifest.writes.insert(to.to_owned(), hash);
+            }
+            manifest.renames.push((from.to_owned(), to.to_owned()));
+            self.write_manifest(session_id, &manifest)
+        })
     }
 
     // ── Manifest helpers ──────────────────────────────────────────────────
 
     pub fn load_manifest(&self, session_id: Uuid) -> Result<DeltaManifest> {
+        self.with_session_lock(session_id, || self.load_manifest_unlocked(session_id))
+    }
+
+    fn load_manifest_unlocked(&self, session_id: Uuid) -> Result<DeltaManifest> {
         let p = self.manifest_path(session_id);
         if !p.exists() {
             return Ok(DeltaManifest::default());
         }
-        let data = std::fs::read(&p)?;
+        let data = match std::fs::read(&p) {
+            Ok(data) => data,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DeltaManifest::default());
+            }
+            Err(err) => return Err(err.into()),
+        };
         serde_json::from_slice(&data).with_context(|| format!("parse manifest for {session_id}"))
     }
 
     fn write_manifest(&self, session_id: Uuid, manifest: &DeltaManifest) -> Result<()> {
         let p = self.manifest_path(session_id);
-        let tmp = p.with_extension("tmp");
+        let tmp = p.with_extension(format!("tmp-{}", Uuid::now_v7()));
         {
             let mut f = std::fs::File::create(&tmp)?;
             serde_json::to_writer(&mut f, manifest)?;
@@ -269,10 +299,15 @@ impl DeltaStore {
 
     /// Remove all delta data for a session (post-commit cleanup).
     pub fn purge_session(&self, session_id: Uuid) -> Result<()> {
-        let dir = self.session_dir(session_id);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
-        }
+        self.with_session_lock(session_id, || {
+            let dir = self.session_dir(session_id);
+            if dir.exists() {
+                std::fs::remove_dir_all(&dir)?;
+            }
+            Ok(())
+        })?;
+        let mut locks = self.manifest_locks.lock().expect("manifest locks poisoned");
+        locks.remove(&session_id);
         Ok(())
     }
 

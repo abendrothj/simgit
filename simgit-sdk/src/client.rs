@@ -37,6 +37,34 @@ fn next_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn rpc_timeout_secs() -> u64 {
+    std::env::var("SIMGIT_RPC_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(30)
+}
+
+fn rpc_retry_count() -> u32 {
+    std::env::var("SIMGIT_RPC_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2)
+}
+
+fn is_retryable_io(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotFound
+    )
+}
+
 /// Default socket path: `$XDG_RUNTIME_DIR/simgit/control.sock`
 /// Falls back to `/tmp/simgit-<uid>/control.sock`.
 pub fn default_socket_path() -> PathBuf {
@@ -72,46 +100,124 @@ impl Client {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, SdkError> {
-        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound
-                || e.kind() == std::io::ErrorKind::ConnectionRefused
-            {
-                SdkError::DaemonNotFound(self.socket_path.display().to_string())
-            } else {
-                SdkError::Io(e)
+        let attempts = rpc_retry_count() + 1;
+        let timeout_secs = rpc_timeout_secs();
+        let mut last_err: Option<SdkError> = None;
+
+        for attempt in 1..=attempts {
+            let stream = match UnixStream::connect(&self.socket_path).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let err = if e.kind() == std::io::ErrorKind::NotFound
+                        || e.kind() == std::io::ErrorKind::ConnectionRefused
+                    {
+                        SdkError::DaemonNotFound(self.socket_path.display().to_string())
+                    } else {
+                        SdkError::Io(e)
+                    };
+                    if attempt < attempts {
+                        tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+
+            let req = RpcRequest {
+                jsonrpc: "2.0".into(),
+                id:      next_id(),
+                method:  method.into(),
+                params:  params.clone(),
+            };
+            let mut payload = serde_json::to_string(&req)?;
+            payload.push('\n'); // newline-delimited JSON
+
+            let (read_half, mut write_half) = stream.into_split();
+            if let Err(e) = write_half.write_all(payload.as_bytes()).await {
+                if attempt < attempts && is_retryable_io(&e) {
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                    last_err = Some(SdkError::Io(e));
+                    continue;
+                }
+                return Err(SdkError::Io(e));
             }
-        })?;
+            if let Err(e) = write_half.shutdown().await {
+                if attempt < attempts && is_retryable_io(&e) {
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                    last_err = Some(SdkError::Io(e));
+                    continue;
+                }
+                return Err(SdkError::Io(e));
+            }
 
-        let req = RpcRequest {
-            jsonrpc: "2.0".into(),
-            id:      next_id(),
-            method:  method.into(),
-            params,
-        };
-        let mut payload = serde_json::to_string(&req)?;
-        payload.push('\n'); // newline-delimited JSON
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            let read_result = tokio::time::timeout(
+                Duration::from_secs(timeout_secs),
+                reader.read_line(&mut line)
+            )
+            .await;
 
-        let (read_half, mut write_half) = stream.into_split();
-        write_half.write_all(payload.as_bytes()).await?;
-        write_half.shutdown().await?;
+            let bytes = match read_result {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    if attempt < attempts && is_retryable_io(&e) {
+                        tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                        last_err = Some(SdkError::Io(e));
+                        continue;
+                    }
+                    return Err(SdkError::Io(e));
+                }
+                Err(_) => {
+                    let e = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("RPC response timeout ({}s)", timeout_secs),
+                    );
+                    if attempt < attempts {
+                        tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                        last_err = Some(SdkError::Io(e));
+                        continue;
+                    }
+                    return Err(SdkError::Io(e));
+                }
+            };
 
-        let mut reader = BufReader::new(read_half);
-        let mut line = String::new();
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            reader.read_line(&mut line)
-        )
-        .await
-        .map_err(|_| SdkError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "RPC response timeout (30s)")))?
-        .map_err(SdkError::Io)?;
+            if bytes == 0 || line.trim().is_empty() {
+                let e = std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "empty RPC response",
+                );
+                if attempt < attempts {
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                    last_err = Some(SdkError::Io(e));
+                    continue;
+                }
+                return Err(SdkError::Io(e));
+            }
 
-        let resp: RpcResponse = serde_json::from_str(line.trim())?;
+            let resp: RpcResponse = match serde_json::from_str(line.trim()) {
+                Ok(resp) => resp,
+                Err(e) => {
+                    if attempt < attempts {
+                        tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                        last_err = Some(SdkError::Json(e));
+                        continue;
+                    }
+                    return Err(SdkError::Json(e));
+                }
+            };
 
-        if let Some(err) = resp.error {
-            return Err(decode_rpc_error(err)?);
+            if let Some(err) = resp.error {
+                return Err(decode_rpc_error(err)?);
+            }
+
+            return Ok(resp.result.unwrap_or(serde_json::Value::Null));
         }
 
-        Ok(resp.result.unwrap_or(serde_json::Value::Null))
+        Err(last_err.unwrap_or_else(|| {
+            SdkError::Io(std::io::Error::other("RPC call failed after retries"))
+        }))
     }
 
     // ── session methods ──────────────────────────────────────────────────────

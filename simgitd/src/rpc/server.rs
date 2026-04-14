@@ -113,8 +113,25 @@ async fn handle_connection(stream: UnixStream, state: Arc<AppState>) {
             }
         };
 
-        let mut payload = serde_json::to_string(&response).unwrap_or_default();
-        payload.push('\n');
+        let payload = match serde_json::to_string(&response) {
+            Ok(payload) => format!("{payload}\n"),
+            Err(err) => {
+                error!(?err, ?response, "failed to serialize rpc response");
+                let fallback = error_response(
+                    response.id,
+                    -32603,
+                    format!("internal error: failed to serialize response: {err}"),
+                    None,
+                );
+                match serde_json::to_string(&fallback) {
+                    Ok(payload) => format!("{payload}\n"),
+                    Err(fallback_err) => {
+                        error!(?fallback_err, "failed to serialize fallback rpc error response");
+                        break;
+                    }
+                }
+            }
+        };
         if write_half.write_all(payload.as_bytes()).await.is_err() {
             break;
         }

@@ -103,6 +103,9 @@ pub struct Config {
 
     /// Listen address for Prometheus metrics endpoint.
     pub metrics_addr: String,
+
+    /// Max number of peer sessions to capture concurrently during commit.
+    pub commit_peer_capture_concurrency: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +194,11 @@ impl Config {
                 .unwrap_or(true),
             metrics_addr: std::env::var("SIMGIT_METRICS_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:9100".to_owned()),
+            commit_peer_capture_concurrency: std::env::var("SIMGIT_COMMIT_PEER_CAPTURE_CONCURRENCY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(8),
         })
     }
 }

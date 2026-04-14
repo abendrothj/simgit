@@ -423,6 +423,7 @@ mod tests {
             vfs_backend: VfsBackend::NfsLoopback,
             metrics_enabled: false,
             metrics_addr: "127.0.0.1:0".to_owned(),
+            commit_peer_capture_concurrency: 4,
         });
 
         let sessions = Arc::new(SessionManager::open(&db_path).await.expect("open manager"));

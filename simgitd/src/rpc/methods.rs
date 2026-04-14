@@ -114,17 +114,27 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
     let stage_started = std::time::Instant::now();
     let active_sessions = state.sessions.list(Some(SessionStatus::Active));
 
-    // Capture deltas for all active peers concurrently, one blocking task
-    // per peer so the thread pool can overlap the git I/O in parallel.
-    let mut join_set = tokio::task::JoinSet::new();
-    for peer in &active_sessions {
-        let state_clone = Arc::clone(state);
-        let peer_clone = peer.clone();
-        join_set.spawn_blocking(move || {
-            state_clone.vfs.capture_mount_delta(&peer_clone).ok();
-        });
+    // Capture deltas for active peers with bounded parallelism to avoid
+    // saturating the blocking thread pool under high session counts.
+    let peers_to_capture: Vec<_> = active_sessions
+        .iter()
+        .filter(|peer| peer.session_id != session_id)
+        .cloned()
+        .collect();
+    let max_parallel = state.config.commit_peer_capture_concurrency.max(1);
+    let mut idx = 0;
+    while idx < peers_to_capture.len() {
+        let mut join_set = tokio::task::JoinSet::new();
+        for peer in peers_to_capture.iter().skip(idx).take(max_parallel) {
+            let state_clone = Arc::clone(state);
+            let peer_clone = peer.clone();
+            join_set.spawn_blocking(move || {
+                state_clone.vfs.capture_mount_delta(&peer_clone).ok();
+            });
+        }
+        while let Some(_) = join_set.join_next().await {}
+        idx += max_parallel;
     }
-    while let Some(_) = join_set.join_next().await {}
     state
         .metrics
         .observe_session_commit_stage("capture_peers", stage_started.elapsed().as_secs_f64());
@@ -941,6 +951,7 @@ mod tests {
             vfs_backend: VfsBackend::NfsLoopback,
             metrics_enabled: false,
             metrics_addr: "127.0.0.1:0".to_owned(),
+            commit_peer_capture_concurrency: 4,
         });
 
         let db_path = state_dir.join("state.db");
