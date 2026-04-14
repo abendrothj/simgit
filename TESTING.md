@@ -444,6 +444,124 @@ All SLO gate runs are archived with:
 
 Trend analysis: Extract peer_capture_skip deltas across weekly/monthly runs to plot efficiency degradation and set ceiling.
 
+## Track 2: Mock-to-Reality Calibration
+
+Once mock swarm SLOs are stable (2+ weeks), the next phase validates system behavior against real agents.
+Real-agent scenarios capture:
+- **Conflict patterns:** Real agents produce diverse, irregular edits (not repeated hotspot contention like mock).
+- **Tool-call patterns:** Retries are erratic and influenced by LLM latency, not deterministic.
+- **File churn:** Build artifacts, cache files, temporary outputs that mock doesn't model.
+- **Latency tails:** Model inference time dominates (not just RPC round-trip).
+
+### Using the Real-Agent Harness
+
+**Skeleton Status:** Implemented in `tests/real_agent_harness.py` with pluggable agent interface.
+
+**Current Capability:** Deterministic test agent (creates/modifies/commits) for immediate CI validation.
+
+**Future Capability:** LLM-powered agent (OpenAI GPT-4o, Claude, local models) for real behavior modeling.
+
+**Session Management:** RPC client handles session lifecycle; agent implementations focus on edit strategy.
+
+```bash
+# Deterministic test run (validates harness infrastructure)
+python3 tests/real_agent_harness.py \
+  --agents 5 \
+  --socket /tmp/simgit-slo-latest/control.sock \
+  --report-out /tmp/real_test_results.json
+```
+
+**Report Structure:**
+```json
+{
+  "timestamp": "2026-04-14T...",
+  "total_agents": 5,
+  "successful_agents": 3,
+  "sessions": [
+    {
+      "agent_id": "agent-abc123",
+      "session_id": "sess-xyz789",
+      "success": true,
+      "total_duration_s": 2.345,
+      "file_edits": [
+        {"file_path": "main.py", "action": "create", "size_bytes": 150},
+        {"file_path": "main.py", "action": "modify", "size_bytes": 250}
+      ],
+      "commit_attempts": [
+        {
+          "attempt_num": 1,
+          "duration_ms": 234.5,
+          "success": true,
+          "edits_count": 2
+        }
+      ],
+      "conflicts_encountered": 0,
+      "model_used": null
+    }
+  ],
+  "summary": {
+    "success_rate": 0.6,
+    "avg_duration_s": 2.1,
+    "total_conflicts": 5
+  }
+}
+```
+
+### Extending with LLM Agents
+
+To implement an LLM-powered agent:
+
+1. Create a subclass of `Agent` (in `tests/real_agent_harness.py`):
+   ```python
+   class LLMAgent(Agent):
+       def __init__(self, agent_id: str, task_id: str, model: str = "gpt-4o"):
+           super().__init__(agent_id, task_id)
+           self.model = model
+           # Initialize LLM client here
+       
+       def initialize(self, rpc_client: SimgitRPCClient) -> bool:
+           # Load model weights, auth with OpenAI, etc.
+           return True
+       
+       def get_next_action(self) -> Optional[List[FileEdit]]:
+           # Call LLM to determine what files to edit
+           # Return list of FileEdit objects
+           pass
+       
+       def should_commit(self) -> bool:
+           # LLM decides when ready to commit
+           pass
+       
+       def explain_result(self, session: AgentSession) -> str:
+           # Summarize outcome
+           pass
+   ```
+
+2. Update main() to accept `--agent-type llm --model <model-name>`.
+
+3. Track `model_tokens_used` and `tool_calls_made` in session for cost analysis.
+
+### Comparison Methodology
+
+After running real agents:
+
+1. **Conflict taxonomy comparison:**
+   - Extract lock_conflict rate from mock hotspot baseline
+   - Compare to real-agent failure breakdown
+   - If real shows new types (e.g., merge_conflict), investigate root cause
+
+2. **Latency distribution:**
+   - Compare p50/p95/p99 real vs mock (expect real to be longer due to model inference)
+   - Confirm tail doesn't regress by >10% vs baseline
+
+3. **File churn analysis:**
+   - Real agents typically generate more files (build artifacts, cache scripts)
+   - Mock harness can be updated with observed patterns for improved realism
+
+4. **Retry behavior:**
+   - Real agents show more irregular retry patterns (LLM-driven, not phased)
+   - Compare conflict resolution rates: mock (explicit blocking) vs real (potential deadlocks)
+
 ### Run with Log Output
 ```bash
 RUST_LOG=debug cargo test test_name -- --nocapture
