@@ -110,6 +110,7 @@ echo
 # Step 4: Run disjoint-range stress
 echo "[step 4a] Running disjoint-range stress (60 agents, 24 workers)..."
 set +e  # Don't exit on harness exit code; we check it explicitly
+SIMGIT_SOCKET="$STATE_DIR/control.sock" \
 python3 "$SCRIPT_DIR/stress/agent_harness.py" \
     --agents 60 \
     --workers 24 \
@@ -131,6 +132,7 @@ echo
 # Step 5: Run hotspot stress
 echo "[step 4b] Running hotspot stress (60 agents, 24 workers)..."
 set +e
+SIMGIT_SOCKET="$STATE_DIR/control.sock" \
 python3 "$SCRIPT_DIR/stress/agent_harness.py" \
     --agents 60 \
     --workers 24 \
