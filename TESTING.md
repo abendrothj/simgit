@@ -367,6 +367,83 @@ Policy:
 3. Deterministic commit-time checks are operationally simpler than event-driven invalidation:
     - Fewer moving parts, easier incident replay, lower maintenance burden while throughput is already acceptable.
 
+## SLO Definition & Nightly Gate
+
+Mock swarm stress testing is the primary hardening lever: a deterministic, reproducible baseline that detects regressions before real-agent canary runs.
+
+**Baseline Established:** April 2026, 60-agent swarm validation (commit a104774).
+
+### SLO Table
+
+| Scenario | Success Rate | p95 Latency | p99 Latency | Peer-Capture Hit Rate | Failure Taxonomy | Notes |
+|----------|-------------|------------|------------|---------------------|------------------|-------|
+| **Disjoint-Range (60 agents)** | 100% | < 8,000ms | < 8,500ms | > 90% | None | Workers write to non-overlapping paths. This is the happy path. |
+| **Hotspot (60 agents)** | lock_conflict only | < 6,500ms | < 7,000ms | > 85% | All failures must be `lock_conflict` only. Zero other failure types tolerated. | Multiple workers contend on shared path(s). Conflicts must be explicit, not silent. |
+
+### Interpretation & Escalation
+
+- **Disjoint-Range Regression:** If success rate drops below 100%, or p95/p99 exceed thresholds, investigate:
+  - New panic/unwind in commit path
+  - RPC timeout misconfiguration
+  - Daemon stability under load
+  - **Escalation:** Block deployment, run bisect against main
+  
+- **Hotspot Regression:** If non-lock_conflict failures appear (e.g., `silent_corruption`, `merge_conflict`), investigate:
+  - Incorrect conflict detection (false negatives)
+  - Data corruption in delta store
+  - Fingerprinting skipping legitimate invalidation
+  - **Escalation:** Block deployment, run control/treatment A/B to isolate root cause
+  
+- **Peer-Capture Regression:** If hit rate drops below target (90%), investigate:
+  - Fingerprint invalidation logic (too conservative or too aggressive)
+  - Mount walk performance degradation
+  - **Action:** Re-baseline using control/treatment pair (SIMGIT_NFS_INCREMENTAL_CAPTURE=0/1)
+
+### Running the SLO Gate
+
+**Automated (Nightly CI):**
+The gate runs on all commits via `.github/workflows/nightly-slo.yml` (see CI section below).
+
+**Manual Validation:**
+```bash
+# Clean state and run the gate locally
+cd /Users/ja/Desktop/projects/simgit
+./tests/nightly-slo-gate.sh
+```
+
+Output structure:
+```
+===== NIGHTLY SLO GATE =====
+Loading release binary...
+Starting daemon...
+Running disjoint-range (60 agents, 24 workers)...
+Running hotspot (60 agents, 24 workers)...
+Extracting metrics...
+
+DISJOINT-RANGE RESULTS:
+  Success: 60/60 (PASS)
+  p95: 6708ms (PASS, threshold 8000ms)
+  p99: 7068ms (PASS, threshold 8500ms)
+  Peer-Capture Hit Rate: 97.1% (PASS, threshold 90%)
+
+HOTSPOT RESULTS:
+  Success: 0/60 (expected lock_conflict)
+  Failure Taxonomy: lock_conflict=60 (PASS, zero other types)
+  p95: 5401ms (PASS, threshold 6500ms)
+  p99: 5603ms (PASS, threshold 7000ms)
+
+OVERALL: PASS ✓
+```
+
+### Archiving Results
+
+All SLO gate runs are archived with:
+- JSON reports (`/tmp/simgit-slo-*-{disjoint,hotspot}.json`)
+- Prometheus metrics snapshots (`/tmp/simgit-slo-*-{before,after}.prom`)
+- Human-readable summary (logged to stdout and saved to `/tmp/simgit-slo-latest.log`)
+
+Trend analysis: Extract peer_capture_skip deltas across weekly/monthly runs to plot efficiency degradation and set ceiling.
+
 ### Run with Log Output
 ```bash
 RUST_LOG=debug cargo test test_name -- --nocapture
