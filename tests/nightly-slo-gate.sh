@@ -88,7 +88,8 @@ echo "[step 3] Daemon started (PID: $DAEMON_PID)"
 # Wait for daemon to be ready
 echo "[step 3] Waiting for daemon to be ready..."
 for i in {1..100}; do
-    if pgrep -p "$DAEMON_PID" > /dev/null && \
+    # Check if process is still running (macOS compatible: kill -0 returns 0 if process exists)
+    if kill -0 "$DAEMON_PID" 2>/dev/null && \
        curl -s "http://127.0.0.1:$METRICS_PORT/metrics" > /dev/null 2>&1; then
         echo "[step 3] Daemon is ready"
         break
@@ -393,5 +394,8 @@ overall_result: $([ "$exit_code" -eq 0 ] && echo "PASS" || echo "FAIL")
 SUMMARY
 
 echo "Summary: $STATE_DIR/slo-summary.txt"
+
+# Create symlink to latest for easy downstream access
+ln -sf "$STATE_DIR" /tmp/simgit-slo-latest
 
 exit "$exit_code"
