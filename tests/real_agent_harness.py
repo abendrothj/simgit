@@ -18,6 +18,7 @@ Current status: Skeleton scaffold with session management and metrics capture.
 LLM backend integration deferred pending model selection and auth setup.
 """
 
+import glob
 import json
 import socket
 import time
@@ -152,24 +153,22 @@ class SimgitRPCClient:
             
             payload = json.dumps(request) + '\n'
             sock.sendall(payload.encode())
-            
-            # Read response
+
+            # Read one JSON-RPC response line.
             response_data = b""
-            while True:
-                try:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    response_data += chunk
-                except socket.timeout:
+            while b"\n" not in response_data:
+                chunk = sock.recv(4096)
+                if not chunk:
                     break
+                response_data += chunk
             
             sock.close()
             
             if not response_data:
                 return {"error": "No response from daemon"}
             
-            response = json.loads(response_data.decode())
+            first_line = response_data.splitlines()[0] if response_data else b""
+            response = json.loads(first_line.decode())
             return response
         
         except Exception as e:
@@ -192,11 +191,20 @@ class SimgitRPCClient:
         
         return False, f"Unexpected response: {result}"
     
-    def session_flatten(self, session_id: str) -> tuple[bool, Dict[str, Any]]:
+    def session_commit(
+        self,
+        session_id: str,
+        branch_name: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> tuple[bool, Dict[str, Any]]:
         """Commit a session (flatten to base). Returns (success, result_dict)."""
-        result = self._send_request("session.flatten", {
-            "session_id": session_id
-        })
+        payload = {"session_id": session_id}
+        if branch_name:
+            payload["branch_name"] = branch_name
+        if message:
+            payload["message"] = message
+
+        result = self._send_request("session.commit", payload)
         
         if "error" in result:
             error_msg = result.get("error", "Unknown error")
@@ -372,7 +380,7 @@ class RealAgentHarness:
         # Write report
         self._write_report()
         
-        return True
+        return all(s.success for s in self.sessions)
     
     def _run_agent(self, agent: Agent, session: AgentSession) -> None:
         """Run one agent's workflow."""
@@ -400,21 +408,28 @@ class RealAgentHarness:
                     edits_count=len(edits)
                 )
                 
-                success, result = self.rpc_client.session_flatten(session.session_id)
+                success, result = self.rpc_client.session_commit(
+                    session.session_id,
+                    branch_name=f"simgit/real-agent/{session.agent_id}",
+                    message=f"real-agent harness commit ({session.agent_id})",
+                )
                 attempt.timestamp_end = time.time()
                 attempt.duration_ms = (attempt.timestamp_end - attempt.timestamp_start) * 1000
                 
                 if success:
                     attempt.success = True
+                    session.commit_attempts.append(attempt)
                     session.success = True
                     logger.info(f"{session.agent_id}: Commit successful (p95={attempt.duration_ms:.0f}ms)")
                     break
                 else:
                     # Extract error type
-                    error = result.get("error", "unknown")
-                    if "lock_conflict" in error.lower():
+                    raw_error = result.get("error", "unknown")
+                    error = raw_error if isinstance(raw_error, str) else json.dumps(raw_error)
+                    error_lc = error.lower()
+                    if "lock_conflict" in error_lc:
                         attempt.error_type = "lock_conflict"
-                    elif "merge" in error.lower():
+                    elif "merge" in error_lc:
                         attempt.error_type = "merge_conflict"
                     else:
                         attempt.error_type = "other"
@@ -432,8 +447,7 @@ class RealAgentHarness:
                     else:
                         session.failure_type = attempt.error_type
                         break
-                
-                session.commit_attempts.append(attempt)
+
         
         if not session.success and not session.failure_type:
             session.failure_type = "max_iterations"
@@ -472,6 +486,42 @@ class RealAgentHarness:
 # ============================================================================
 
 def main():
+    def socket_accepting_connections(path: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        try:
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.5)
+            probe.connect(path)
+            probe.close()
+            return True
+        except OSError:
+            return False
+
+    def resolve_socket_path(input_socket: str) -> str:
+        if socket_accepting_connections(input_socket):
+            return input_socket
+
+        latest_default = '/tmp/simgit-slo-latest/control.sock'
+        candidates = []
+        for path in glob.glob('/tmp/simgit-slo-*/control.sock'):
+            if socket_accepting_connections(path):
+                candidates.append((os.path.getmtime(path), path))
+
+        if candidates:
+            candidates.sort(reverse=True)
+            resolved = candidates[0][1]
+            if input_socket != resolved:
+                logger.info(
+                    f"Socket '{input_socket}' unavailable; resolved latest live socket: {resolved}"
+                )
+            return resolved
+
+        if input_socket == latest_default:
+            return input_socket
+
+        return input_socket
+
     parser = argparse.ArgumentParser(
         description="Real-agent harness for mock-to-reality calibration",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -500,11 +550,12 @@ Examples:
     parser.add_argument('--task', help='Task description (for LLM agent, future feature)')
     
     args = parser.parse_args()
+    args.socket = resolve_socket_path(args.socket)
     
-    # Check socket exists
-    if not os.path.exists(args.socket):
-        logger.error(f"Daemon socket not found: {args.socket}")
-        logger.error("Make sure daemon is running before starting harness")
+    # Check socket is live
+    if not socket_accepting_connections(args.socket):
+        logger.error(f"Daemon socket is unavailable or not accepting connections: {args.socket}")
+        logger.error("Start simgitd first (or run tests/nightly-slo-gate.sh to create a fresh daemon socket)")
         sys.exit(2)
     
     # Create harness

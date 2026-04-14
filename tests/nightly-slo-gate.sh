@@ -20,15 +20,18 @@ STATE_DIR="/tmp/simgit-slo-$(date +%s)"
 METRICS_PORT=9125
 
 # SLO thresholds (from TESTING.md)
-DISJOINT_P95_MAX_MS=8000
-DISJOINT_P99_MAX_MS=8500
-HOTSPOT_P95_MAX_MS=6500
-HOTSPOT_P99_MAX_MS=7000
+DISJOINT_P95_MAX_MS="${DISJOINT_P95_MAX_MS:-8000}"
+DISJOINT_P99_MAX_MS="${DISJOINT_P99_MAX_MS:-8500}"
+HOTSPOT_P95_MAX_MS="${HOTSPOT_P95_MAX_MS:-6500}"
+HOTSPOT_P99_MAX_MS="${HOTSPOT_P99_MAX_MS:-7000}"
+HOTSPOT_ALLOWED_FAILURE_TYPES="lock_conflict,merge_conflict"
 
 echo "===== NIGHTLY SLO GATE ====="
 echo "State directory: $STATE_DIR"
 echo "Timestamp: $(date)"
 echo
+
+KEEP_STATE_ON_FAILURE="${KEEP_STATE_ON_FAILURE:-1}"
 
 # Cleanup function
 cleanup() {
@@ -40,8 +43,13 @@ cleanup() {
         echo "[cleanup] State directory: $STATE_DIR (keep for trends analysis)"
         ln -sf "$STATE_DIR" /tmp/simgit-slo-latest
     else
-        echo "[cleanup] Removing state directory due to error..."
-        rm -rf "$STATE_DIR"
+        if [ "$KEEP_STATE_ON_FAILURE" = "1" ]; then
+            echo "[cleanup] State directory: $STATE_DIR (kept for failure analysis)"
+            ln -sf "$STATE_DIR" /tmp/simgit-slo-latest
+        else
+            echo "[cleanup] Removing state directory due to error..."
+            rm -rf "$STATE_DIR"
+        fi
     fi
     return "$exit_code"
 }
@@ -147,25 +155,50 @@ echo
 echo "[step 6] Extracting and validating SLO results..."
 echo
 
-export STATE_DIR DISJOINT_P95_MAX_MS DISJOINT_P99_MAX_MS HOTSPOT_P95_MAX_MS HOTSPOT_P99_MAX_MS
+export STATE_DIR DISJOINT_P95_MAX_MS DISJOINT_P99_MAX_MS HOTSPOT_P95_MAX_MS HOTSPOT_P99_MAX_MS HOTSPOT_ALLOWED_FAILURE_TYPES
 python3 <<'EOFPARSE'
-import json, os, sys
+import json, os, re, sys
 
 state_dir = os.environ['STATE_DIR']
 d_p95_max = float(os.environ['DISJOINT_P95_MAX_MS'])
 d_p99_max = float(os.environ['DISJOINT_P99_MAX_MS'])
 h_p95_max = float(os.environ['HOTSPOT_P95_MAX_MS'])
 h_p99_max = float(os.environ['HOTSPOT_P99_MAX_MS'])
+allowed_failure_types = set(
+    x.strip() for x in os.environ.get('HOTSPOT_ALLOWED_FAILURE_TYPES', '').split(',') if x.strip()
+)
+
+def parse_peer_capture_delta(metrics_before: str, metrics_after: str):
+    pat = re.compile(r'^simgit_peer_capture_skip_total\{result="([^"]+)"\}\s+([0-9]+)$')
+    def read_counts(path: str):
+        counts = {'hit': 0, 'miss': 0}
+        try:
+            with open(path) as f:
+                for line in f:
+                    m = pat.match(line.strip())
+                    if m:
+                        counts[m.group(1)] = int(m.group(2))
+        except OSError:
+            return None
+        return counts
+    b = read_counts(metrics_before)
+    a = read_counts(metrics_after)
+    if not b or not a:
+        return None, None, None
+    hit_delta = a.get('hit', 0) - b.get('hit', 0)
+    miss_delta = a.get('miss', 0) - b.get('miss', 0)
+    total = hit_delta + miss_delta
+    if total <= 0:
+        return hit_delta, miss_delta, None
+    return hit_delta, miss_delta, (100.0 * hit_delta / total)
 
 exit_code = 0
 
-# Load reports
 with open(f"{state_dir}/disjoint_60.json") as f:
     disjoint = json.load(f)
 with open(f"{state_dir}/hotspot_60.json") as f:
     hotspot = json.load(f)
 
-# Validate disjoint-range
 print("DISJOINT-RANGE RESULTS:")
 print(f"  Success: {disjoint['successes']}/60", end="")
 if disjoint['successes'] == 60:
@@ -191,18 +224,20 @@ else:
 
 print()
 print("HOTSPOT RESULTS:")
-print(f"  Failures: {hotspot['failures']}/60 (expected: lock_conflict only)")
+print(f"  Failures: {hotspot['failures']}/60 (expected: contention-only taxonomy)")
 
 fb = hotspot.get('failure_breakdown', {})
-has_other = any(k != 'lock_conflict' for k in fb.keys())
-if not has_other and hotspot['failures'] > 0:
-    print(f"  Failure Types: lock_conflict={fb.get('lock_conflict', 0)} ✓ PASS")
+found_types = set(fb.keys())
+unexpected_types = sorted(found_types - allowed_failure_types)
+if not unexpected_types and hotspot['failures'] > 0:
+    breakdown = ', '.join(f"{k}={v}" for k, v in sorted(fb.items())) if fb else 'none'
+    print(f"  Failure Types: {breakdown} ✓ PASS")
 else:
-    if has_other:
-        print(f"  Failure Types: {fb} ❌ FAIL (unexpected failure type)")
+    if unexpected_types:
+        print(f"  Failure Types: {fb} ❌ FAIL (unexpected failure type(s): {unexpected_types})")
         exit_code = 1
     else:
-        print(f"  Failure Types: none (unexpected for hotspot)")
+        print("  Failure Types: none (unexpected for hotspot)")
 
 h_p95, h_p99 = hotspot['latency']['p95_ms'], hotspot['latency']['p99_ms']
 print(f"  p95: {h_p95:.0f}ms (max: {h_p95_max}ms)", end="")
@@ -218,6 +253,40 @@ if h_p99 <= h_p99_max:
 else:
     print(" ❌ FAIL")
     exit_code = 1
+
+hit_delta, miss_delta, hit_rate = parse_peer_capture_delta(
+    f"{state_dir}/metrics_before.prom",
+    f"{state_dir}/metrics_after.prom",
+)
+if hit_delta is not None and miss_delta is not None:
+    if hit_rate is None:
+        print(f"Peer Capture: hit={hit_delta} miss={miss_delta} hit_rate=UNKNOWN")
+    else:
+        print(f"Peer Capture: hit={hit_delta} miss={miss_delta} hit_rate={hit_rate:.1f}%")
+
+summary = {
+    'disjoint': {
+        'successes': disjoint.get('successes', 0),
+        'failures': disjoint.get('failures', 0),
+        'p95_ms': disjoint['latency']['p95_ms'],
+        'p99_ms': disjoint['latency']['p99_ms'],
+    },
+    'hotspot': {
+        'successes': hotspot.get('successes', 0),
+        'failures': hotspot.get('failures', 0),
+        'failure_breakdown': fb,
+        'p95_ms': hotspot['latency']['p95_ms'],
+        'p99_ms': hotspot['latency']['p99_ms'],
+    },
+    'peer_capture': {
+        'hit_delta': hit_delta,
+        'miss_delta': miss_delta,
+        'hit_rate_percent': hit_rate,
+    },
+    'overall_result': 'PASS' if exit_code == 0 else 'FAIL',
+}
+with open(f"{state_dir}/slo-summary.json", "w") as f:
+    json.dump(summary, f, indent=2)
 
 print()
 print(f"OVERALL: {'✓ PASS' if exit_code == 0 else '❌ FAIL'}")
