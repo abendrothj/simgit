@@ -2,6 +2,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use simgit_sdk::{Client, DiffResult, SessionCommitResult, SessionInfo};
+use std::time::Duration;
 use uuid::Uuid;
 
 fn py_err<E: std::fmt::Display>(e: E) -> PyErr {
@@ -181,17 +182,32 @@ impl PySession {
         session_info_dict(py, &info)
     }
 
-    #[pyo3(signature = (branch_name=None, message=None))]
+    #[pyo3(signature = (branch_name=None, message=None, timeout_secs=None))]
     fn commit(
         &mut self,
         py: Python<'_>,
         branch_name: Option<String>,
         message: Option<String>,
+        timeout_secs: Option<f64>,
     ) -> PyResult<Py<PyDict>> {
         let client = Client::new(&self.socket_path);
         let session_id = Uuid::parse_str(&self.session_id)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let result = run_async(client.session_commit(session_id, branch_name, message))?;
+        let timeout_override = match timeout_secs {
+            Some(secs) if secs > 0.0 => Some(Duration::from_secs_f64(secs)),
+            Some(_) => {
+                return Err(PyValueError::new_err(
+                    "timeout_secs must be greater than 0",
+                ));
+            }
+            None => None,
+        };
+        let result = run_async(client.session_commit_with_timeout(
+            session_id,
+            branch_name,
+            message,
+            timeout_override,
+        ))?;
         let d = commit_result_dict(py, &result)?;
         self.cached_info = Some(d.clone_ref(py));
         Ok(d)

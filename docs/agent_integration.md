@@ -34,6 +34,7 @@ print("changed paths:", diff["changed_paths"])
 result = session.commit(
     branch_name="feat/agent-task-123",
     message="agent update",
+    timeout_secs=5.0,
 )
 
 telemetry = result["telemetry"]
@@ -146,4 +147,4 @@ match result {
 }
 ```
 
-For Python flows, use `SIMGIT_RPC_TIMEOUT_SECS` to bound transport waits today; explicit per-call commit timeout overrides are currently available in the Rust SDK API.
+Python bindings now expose the same per-call knob on `Session.commit(..., timeout_secs=...)`. Use this for adaptive retries instead of only relying on global `SIMGIT_RPC_TIMEOUT_SECS`.
