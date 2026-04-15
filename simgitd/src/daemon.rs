@@ -77,6 +77,7 @@ use tokio::signal;
 use tracing::{info, warn};
 
 use crate::borrow::BorrowRegistry;
+use crate::commit_scheduler::CommitScheduler;
 use crate::config::Config;
 use crate::delta::DeltaStore;
 use crate::events::EventBroker;
@@ -119,13 +120,14 @@ use crate::vfs::VfsManager;
 /// ```
 #[derive(Clone)]
 pub struct AppState {
-    pub config:   Arc<Config>,
-    pub sessions: Arc<SessionManager>,
-    pub borrows:  Arc<BorrowRegistry>,
-    pub deltas:   Arc<DeltaStore>,
-    pub events:   Arc<EventBroker>,
-    pub vfs:      Arc<VfsManager>,
-    pub metrics:  Arc<Metrics>,
+    pub config:           Arc<Config>,
+    pub sessions:         Arc<SessionManager>,
+    pub borrows:          Arc<BorrowRegistry>,
+    pub deltas:           Arc<DeltaStore>,
+    pub events:           Arc<EventBroker>,
+    pub vfs:              Arc<VfsManager>,
+    pub metrics:          Arc<Metrics>,
+    pub commit_scheduler: Arc<CommitScheduler>,
 }
 
 /// Run the simgitd daemon until shutdown signal.
@@ -189,6 +191,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         Arc::clone(&metrics),
     ));
 
+    let commit_scheduler = Arc::new(CommitScheduler::new(
+        std::time::Duration::from_secs(cfg.commit_wait_secs),
+    ));
+
     let state = AppState {
         config: Arc::clone(&cfg),
         sessions,
@@ -197,6 +203,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         events,
         vfs,
         metrics,
+        commit_scheduler,
     };
 
     // Recover any sessions that were ACTIVE before a previous crash.

@@ -424,6 +424,7 @@ mod tests {
             metrics_enabled: false,
             metrics_addr: "127.0.0.1:0".to_owned(),
             commit_peer_capture_concurrency: 4,
+            commit_wait_secs: 30,
         });
 
         let sessions = Arc::new(SessionManager::open(&db_path).await.expect("open manager"));
@@ -444,6 +445,9 @@ mod tests {
             events,
             vfs,
             metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics")),
+            commit_scheduler: Arc::new(crate::commit_scheduler::CommitScheduler::new(
+                std::time::Duration::from_secs(30),
+            )),
         };
 
         let info = sessions

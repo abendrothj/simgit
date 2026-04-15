@@ -455,21 +455,63 @@ Real-agent scenarios capture:
 
 ### Using the Real-Agent Harness
 
-**Skeleton Status:** Implemented in `tests/real_agent_harness.py` with pluggable agent interface.
+**Harness Status:** Implemented in `tests/real_agent_harness.py` with real mount-path writes, concurrent execution, commit retries, and weakness-focused reporting.
 
-**Current Capability:** Deterministic test agent (creates/modifies/commits) for immediate CI validation.
+**Current Capability:**
+- Deterministic overlap profiles: `hotspot-file`, `disjoint-files`, `mixed`, `sharded-hotspot`
+- OpenAI-compatible LLM agent via `SIMGIT_LLM_API_KEY` or `OPENAI_API_KEY`
+- Weakness summary with dominant failure type, top paths, retry rate, and commit latency percentiles
 
-**Future Capability:** LLM-powered agent (OpenAI GPT-4o, Claude, local models) for real behavior modeling.
+**Track 3 Status (Validated):**
+- Path-level commit scheduling is active when `SIMGIT_COMMIT_WAIT_SECS > 0`.
+- Latest smoke validation (`8 agents`) with scheduling enabled:
+  - `hotspot-file`: `success_rate=1.0`, `total_conflicts=0`
+  - `sharded-hotspot`: `success_rate=1.0`, `total_conflicts=0`
+  - `disjoint-files`: `success_rate=1.0`, `total_conflicts=0`
 
-**Session Management:** RPC client handles session lifecycle; agent implementations focus on edit strategy.
+**Session Management:** RPC client handles session lifecycle; agent implementations focus on edit strategy and return real file edits that are applied in the session mount before commit.
 
 ```bash
-# Deterministic test run (validates harness infrastructure)
+# Deterministic hotspot run (good for exposing contention)
 python3 tests/real_agent_harness.py \
   --agents 5 \
+  --task-profile hotspot-file \
+  --commit-barrier \
   --socket /tmp/simgit-slo-latest/control.sock \
   --report-out /tmp/real_test_results.json
+
+# Deterministic disjoint run (good control group)
+python3 tests/real_agent_harness.py \
+  --agents 5 \
+  --task-profile disjoint-files \
+  --socket /tmp/simgit-slo-latest/control.sock \
+  --report-out /tmp/real_disjoint_results.json
+
+# Deterministic sharded hotspot run (same directory family, per-agent shard files)
+python3 tests/real_agent_harness.py \
+  --agents 5 \
+  --task-profile sharded-hotspot \
+  --socket /tmp/simgit-slo-latest/control.sock \
+  --report-out /tmp/real_sharded_results.json
+
+# LLM-driven run using an OpenAI-compatible endpoint
+SIMGIT_LLM_API_KEY=... python3 tests/real_agent_harness.py \
+  --agent-type llm \
+  --model gpt-4.1 \
+  --agents 5 \
+  --task-profile mixed \
+  --task "Refine the benchmark text files clearly and consistently" \
+  --report-out /tmp/real_llm_results.json
 ```
+
+**LLM Environment Variables:**
+- `SIMGIT_LLM_API_KEY` or `OPENAI_API_KEY`: required for `--agent-type llm`
+- `SIMGIT_LLM_BASE_URL` or `OPENAI_BASE_URL`: optional OpenAI-compatible base URL
+- `SIMGIT_LLM_TIMEOUT_SECS`: optional HTTP timeout override
+
+**Commit Scheduler Environment Variable:**
+- `SIMGIT_COMMIT_WAIT_SECS`: enables path-level commit scheduling when `> 0` (default `30`)
+- Set to `0` to disable scheduling and keep immediate overlap rejection semantics
 
 **Report Structure:**
 ```json
@@ -502,44 +544,31 @@ python3 tests/real_agent_harness.py \
   "summary": {
     "success_rate": 0.6,
     "avg_duration_s": 2.1,
+    "total_commit_attempts": 8,
     "total_conflicts": 5
+  },
+  "weakness_summary": {
+    "dominant_failure_type": "lock_conflict",
+    "conflict_rate": 0.625,
+    "commit_latency_ms": {
+      "p50": 184.0,
+      "p95": 712.3,
+      "p99": 801.0
+    },
+    "top_paths": [["bench/shared_hotspot.txt", 10]],
+    "recommendation": "edit_isolation_or_ast_locking"
   }
 }
 ```
 
 ### Extending with LLM Agents
 
-To implement an LLM-powered agent:
+The built-in `LLMAgent` already uses an OpenAI-compatible `chat/completions` endpoint and asks the model to emit a JSON edit plan constrained to the allowed benchmark paths. If you extend it further, preserve these invariants:
 
-1. Create a subclass of `Agent` (in `tests/real_agent_harness.py`):
-   ```python
-   class LLMAgent(Agent):
-       def __init__(self, agent_id: str, task_id: str, model: str = "gpt-4o"):
-           super().__init__(agent_id, task_id)
-           self.model = model
-           # Initialize LLM client here
-       
-       def initialize(self, rpc_client: SimgitRPCClient) -> bool:
-           # Load model weights, auth with OpenAI, etc.
-           return True
-       
-       def get_next_action(self) -> Optional[List[FileEdit]]:
-           # Call LLM to determine what files to edit
-           # Return list of FileEdit objects
-           pass
-       
-       def should_commit(self) -> bool:
-           # LLM decides when ready to commit
-           pass
-       
-       def explain_result(self, session: AgentSession) -> str:
-           # Summarize outcome
-           pass
-   ```
-
-2. Update main() to accept `--agent-type llm --model <model-name>`.
-
-3. Track `model_tokens_used` and `tool_calls_made` in session for cost analysis.
+1. Keep path selection constrained so overlap is intentional and measurable.
+2. Record `model_tokens_used` and `tool_calls_made` for cost analysis.
+3. Treat malformed model output as harness signal, not silent success.
+4. Prefer deterministic benchmark tasks before repo-wide open-ended tasks.
 
 ### Comparison Methodology
 
@@ -562,6 +591,12 @@ After running real agents:
    - Real agents show more irregular retry patterns (LLM-driven, not phased)
    - Compare conflict resolution rates: mock (explicit blocking) vs real (potential deadlocks)
 
+5. **Weakness selection:**
+  - `edit_isolation_or_ast_locking`: repeated overlap on the same paths with high conflict rate
+  - `scheduler_or_backpressure`: high tail latency without dominant conflict pressure
+  - `task_routing_or_overlap_policy`: moderate conflict rate with avoidable overlap patterns
+  - `harness_or_protocol_hardening`: non-conflict infrastructure failures still dominate
+
 ### Run with Log Output
 ```bash
 RUST_LOG=debug cargo test test_name -- --nocapture
@@ -579,10 +614,10 @@ rust-gdb ./target/debug/deps/simgitd-<hash>
 
 ## Continuous Integration
 
-Tests are run on every commit:
+CI coverage is active and includes Linux FUSE integration workflows in addition to standard crate tests.
+Example baseline workflow shape:
 
 ```yaml
-# .github/workflows/test.yml (TODO: implement)
 on: [push, pull_request]
 jobs:
   test:
@@ -599,7 +634,7 @@ jobs:
 ### Phase 0 (Complete)
 - ✅ Module-level documentation tests
 - ✅ Basic borrow registry semantics
-- ⬜ Full integration tests deferred to Phase 1
+- ✅ Foundation integration test scaffolding established; deeper end-to-end coverage continues in later phases
 
 ### Phase 1
 - Add full integration tests for read-only VFS
@@ -633,7 +668,7 @@ jobs:
     - Phase 4 helper coverage includes changed-path and overlap detection for pre-commit conflict checks.
     - Phase 4 integration tests now cover commit overlap blocking and non-overlap commit success across active sessions.
     - Phase 4 RPC coverage now validates per-path overlap operation details and flatten error taxonomy mapping.
-    - Phase 4 auto-merge behavior is not yet enabled; overlap policy is currently conservative blocking.
+    - Phase 4 auto-merge behavior is still partial; scheduler-enabled overlap handling now queues overlapping commits by path instead of immediately rejecting active peers.
     - Phase 5 bootstrap validation: `cargo check -p simgit-py` is green with ABI3 compatibility enabled.
     - Phase 5 packaging flow is configured via `simgit-py/pyproject.toml` (maturin backend).
     - Wheel build/publish commands are documented; runtime wheel build was not executed locally because `maturin` is not installed in this environment.

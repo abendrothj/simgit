@@ -255,11 +255,11 @@ python tests/stress/agent_harness.py \
 - Workspace scaffold
 - Core types + error codes
 - VFS abstraction (FUSE + NFS stubs)
-- Borrow registry (skeleton)
-- Delta store (skeleton)
-- Session DB (skeleton)
-- RPC server (skeleton)
-- CLI (skeleton)
+- Borrow registry (implemented)
+- Delta store (implemented)
+- Session DB (implemented)
+- RPC server (implemented)
+- CLI (implemented)
 - **Validation spikes**: git_reader ✓, overlay_test ✓, fuse_passthrough ✓
 
 ### Phase 1: Read-Only VFS (3 weeks)
@@ -305,7 +305,7 @@ python tests/stress/agent_harness.py \
 - Auto three-way merge (pending)
 - Create commit + update branch
 - Error handling (merge conflicts)
-- Status: 🚧 In progress (core flatten + overlap detection complete)
+- Status: 🚧 In progress (flatten complete; overlap handling now path-scheduled)
 - Implementation highlights:
     - pre-commit overlap detection across active sessions in `session.commit`
     - multi-session commit tests for overlap-block and non-overlap success
@@ -314,10 +314,11 @@ python tests/stress/agent_harness.py \
     - Range-aware conflict detection: byte-range support for write/write overlap detection
     - Commit latency metrics: per-stage histogram (capture_self, capture_peers, conflict_scan, flatten)
     - Conflict cardinality reporting: per-session and per-peer counts
-    - Current behavior for overlapping paths/ranges is conservative block-until-resolved
+    - Path-level commit scheduler (`SIMGIT_COMMIT_WAIT_SECS`) serializes overlapping commits by changed path while preserving disjoint parallelism
+    - Verified Track 3 smoke (8 agents): hotspot-file/disjoint-files/sharded-hotspot all reached 100% success with scheduler enabled
 
 ### Active Todo (1-3)
-1. Phase 4: implement auto three-way merge attempt for non-conflicting overlap cases.
+1. Raise concurrency proof from smoke scale to 20-50 agents and publish before/after latency deltas for scheduler-enabled hotspot runs.
 2. Add a full flatten E2E integration test (delta -> branch -> commit verification).
 3. Start pure-gix flatten migration plan and scaffold (replace temp worktree + git CLI path).
 

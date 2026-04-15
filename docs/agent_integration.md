@@ -88,11 +88,12 @@ python3 tests/stress/agent_harness.py \
 
 Then inspect:
 - `simgit_session_commit_stage_duration_seconds{stage="capture_peers"}`
-- `simgit_session_commit_conflicts_total{kind="active_session_overlap"}`
+- `simgit_session_commit_conflicts_total{kind="active_session_overlap"}` (expected to drop when path scheduling is enabled)
 
 ## Operational Guidance
 
 - Prefer one session per autonomous task.
 - Use deterministic branch names (`feat/<task-id>`) for traceability.
-- On conflict errors, inspect peer/session/path details and retry with a refreshed session.
+- Prefer enabling path scheduling (`SIMGIT_COMMIT_WAIT_SECS > 0`) so overlapping commits queue by path instead of immediate overlap rejection.
+- If scheduling is disabled (`SIMGIT_COMMIT_WAIT_SECS=0`), inspect peer/session/path conflict payloads and retry with a refreshed session.
 - Keep stress runs on test repos; avoid production branches.

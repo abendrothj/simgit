@@ -106,6 +106,12 @@ pub struct Config {
 
     /// Max number of peer sessions to capture concurrently during commit.
     pub commit_peer_capture_concurrency: usize,
+
+    /// How long (seconds) `session.commit` will wait for a conflicting session
+    /// to release its path-level lock before returning a timeout error.  Set to
+    /// 0 to disable path-level scheduling (immediately return -32003 as before).
+    /// Env var: `SIMGIT_COMMIT_WAIT_SECS` (default 30).
+    pub commit_wait_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +205,10 @@ impl Config {
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(8),
+            commit_wait_secs: std::env::var("SIMGIT_COMMIT_WAIT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
         })
     }
 }

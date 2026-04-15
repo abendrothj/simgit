@@ -1,3 +1,4 @@
+mod commit_scheduler;
 mod daemon;
 mod vfs;
 mod borrow;

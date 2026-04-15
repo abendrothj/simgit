@@ -16,6 +16,7 @@ use simgit_sdk::{
 use crate::daemon::AppState;
 use crate::delta::flatten::FlattenError;
 use crate::delta::store::ByteRange;
+use crate::commit_scheduler::CommitWaitTimeout;
 
 /// Dispatch a JSON-RPC method call. Returns `Ok(result)` or `Err(RpcError)`.
 pub async fn dispatch(
@@ -170,93 +171,130 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
     let delta_root = state.config.state_dir.join("deltas");
     let mut auto_merged_paths = BTreeSet::new();
 
-    // Pre-commit conflict check against other active sessions.
-    let mut conflicts = Vec::new();
-    for peer in active_sessions {
-        if peer.session_id == session_id {
-            continue;
-        }
-        let peer_manifest = match state.deltas.load_manifest(peer.session_id) {
-            Ok(m) => m,
-            Err(_) => continue,
+    // Acquire per-path commit slot before the conflict scan.
+    // This serialises sessions that touch the same files, eliminating the
+    // retry-on-conflict loop for hot paths without blocking disjoint sessions.
+    let _commit_guard = if state.config.commit_wait_secs > 0 {
+        let our_paths: Vec<PathBuf> = {
+            let ops = changed_path_ops(&manifest);
+            ops.into_keys().collect()
         };
-        let this_ops = changed_path_ops(&manifest);
-        let peer_ops = changed_path_ops(&peer_manifest);
-        let overlap = compute_conflict_paths(&this_ops, &manifest, &peer_ops, &peer_manifest);
-
-        // Conservative auto-merge: for write/write path conflicts only, attempt a
-        // three-way merge (ours/base/theirs). Clean merges are folded into our
-        // transient manifest for this commit attempt.
-        let mut unresolved = Vec::new();
-        for path in overlap {
-            let merged = try_auto_merge_path(
-                &state.config.repo_path,
-                &delta_root,
-                session_id,
-                &info.base_commit,
-                &manifest,
-                peer.session_id,
-                &peer_manifest,
-                &this_ops,
-                &peer_ops,
-                &path,
-            )
-            .map_err(internal)?;
-            if let Some(bytes) = merged {
-                let merged_hash = write_transient_blob(&delta_root, session_id, &bytes).map_err(internal)?;
-                manifest.writes.insert(path.clone(), merged_hash);
-                // Once auto-merged, this path becomes a synthesized full-file write.
-                manifest.ranges.remove(&path);
-                auto_merged_paths.insert(path);
-            } else {
-                unresolved.push(path);
+        let wait = std::time::Duration::from_secs(state.config.commit_wait_secs);
+        match state.commit_scheduler.begin_commit(&our_paths, Some(wait)).await {
+            Ok(guard) => Some(guard),
+            Err(CommitWaitTimeout) => {
+                return Err(RpcError {
+                    code: ERR_MERGE_CONFLICT,
+                    message: "commit wait timeout: path lock not released in time".to_owned(),
+                    data: Some(serde_json::json!({
+                        "session_id": session_id,
+                        "kind": "commit_wait_timeout",
+                    })),
+                });
             }
         }
+    } else {
+        None
+    };
 
-        if !unresolved.is_empty() {
-            let path_conflicts: Vec<_> = unresolved
-                .iter()
-                .map(|path| {
-                    serde_json::json!({
-                        "path": path,
-                        "ours_ops": ops_for_path(&this_ops, path),
-                        "peer_ops": ops_for_path(&peer_ops, path),
+    // Pre-commit conflict scan against active peers.
+    // When path scheduling is enabled (`commit_wait_secs > 0`), commits that
+    // touch overlapping paths are already serialized by the scheduler. In that
+    // mode we skip active-session overlap rejection to avoid self-conflict with
+    // queued peers that are active but not currently committing.
+    let scheduler_enabled = state.config.commit_wait_secs > 0;
+    if !scheduler_enabled {
+        let mut conflicts = Vec::new();
+        for peer in active_sessions {
+            if peer.session_id == session_id {
+                continue;
+            }
+            let peer_manifest = match state.deltas.load_manifest(peer.session_id) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let this_ops = changed_path_ops(&manifest);
+            let peer_ops = changed_path_ops(&peer_manifest);
+            let overlap = compute_conflict_paths(&this_ops, &manifest, &peer_ops, &peer_manifest);
+
+            // Conservative auto-merge: for write/write path conflicts only, attempt a
+            // three-way merge (ours/base/theirs). Clean merges are folded into our
+            // transient manifest for this commit attempt.
+            let mut unresolved = Vec::new();
+            for path in overlap {
+                let merged = try_auto_merge_path(
+                    &state.config.repo_path,
+                    &delta_root,
+                    session_id,
+                    &info.base_commit,
+                    &manifest,
+                    peer.session_id,
+                    &peer_manifest,
+                    &this_ops,
+                    &peer_ops,
+                    &path,
+                )
+                .map_err(internal)?;
+                if let Some(bytes) = merged {
+                    let merged_hash = write_transient_blob(&delta_root, session_id, &bytes).map_err(internal)?;
+                    manifest.writes.insert(path.clone(), merged_hash);
+                    // Once auto-merged, this path becomes a synthesized full-file write.
+                    manifest.ranges.remove(&path);
+                    auto_merged_paths.insert(path);
+                } else {
+                    unresolved.push(path);
+                }
+            }
+
+            if !unresolved.is_empty() {
+                let path_conflicts: Vec<_> = unresolved
+                    .iter()
+                    .map(|path| {
+                        serde_json::json!({
+                            "path": path,
+                            "ours_ops": ops_for_path(&this_ops, path),
+                            "peer_ops": ops_for_path(&peer_ops, path),
+                        })
                     })
-                })
-                .collect();
-            conflicts.push(serde_json::json!({
-                "session_id": peer.session_id,
-                "task_id": peer.task_id,
-                "paths": unresolved,
-                "path_conflicts": path_conflicts,
-            }));
+                    .collect();
+                conflicts.push(serde_json::json!({
+                    "session_id": peer.session_id,
+                    "task_id": peer.task_id,
+                    "paths": unresolved,
+                    "path_conflicts": path_conflicts,
+                }));
+            }
         }
-    }
-    state
-        .metrics
-        .observe_session_commit_stage("conflict_scan", stage_started.elapsed().as_secs_f64());
-    if !conflicts.is_empty() {
-        let conflicting_paths = conflicts
-            .iter()
-            .filter_map(|conflict| conflict.get("paths"))
-            .filter_map(|paths| paths.as_array())
-            .map(|paths| paths.len())
-            .sum::<usize>();
-        state.metrics.observe_session_commit_conflict(
-            "active_session_overlap",
-            conflicts.len(),
-            conflicting_paths,
-        );
-        return Err(RpcError {
-            code: ERR_MERGE_CONFLICT,
-            message: "pre-commit conflict: overlapping active session paths".to_owned(),
-            data: Some(serde_json::json!({
-                "session_id": session_id,
-                "kind": "active_session_overlap",
-                "conflicts": conflicts,
-                "auto_merged_paths": auto_merged_paths,
-            })),
-        });
+        state
+            .metrics
+            .observe_session_commit_stage("conflict_scan", stage_started.elapsed().as_secs_f64());
+        if !conflicts.is_empty() {
+            let conflicting_paths = conflicts
+                .iter()
+                .filter_map(|conflict| conflict.get("paths"))
+                .filter_map(|paths| paths.as_array())
+                .map(|paths| paths.len())
+                .sum::<usize>();
+            state.metrics.observe_session_commit_conflict(
+                "active_session_overlap",
+                conflicts.len(),
+                conflicting_paths,
+            );
+            return Err(RpcError {
+                code: ERR_MERGE_CONFLICT,
+                message: "pre-commit conflict: overlapping active session paths".to_owned(),
+                data: Some(serde_json::json!({
+                    "session_id": session_id,
+                    "kind": "active_session_overlap",
+                    "conflicts": conflicts,
+                    "auto_merged_paths": auto_merged_paths,
+                })),
+            });
+        }
+    } else {
+        state
+            .metrics
+            .observe_session_commit_stage("conflict_scan", stage_started.elapsed().as_secs_f64());
     }
 
     let stage_started = std::time::Instant::now();
@@ -320,6 +358,11 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
         "branch":     result.branch_name,
         "commit":     result.commit_oid,
     }));
+
+    // Release per-path commit slot so the next waiter can proceed.
+    drop(_commit_guard);
+    // Best-effort GC: prune path entries that have no active waiters.
+    state.commit_scheduler.gc().await;
 
     serde_json::to_value(&updated).map_err(internal)
 }
@@ -1140,6 +1183,7 @@ mod tests {
             metrics_enabled: false,
             metrics_addr: "127.0.0.1:0".to_owned(),
             commit_peer_capture_concurrency: 4,
+            commit_wait_secs: 30,
         });
 
         let db_path = state_dir.join("state.db");
@@ -1162,6 +1206,9 @@ mod tests {
             events,
             vfs,
             metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics")),
+            commit_scheduler: Arc::new(crate::commit_scheduler::CommitScheduler::new(
+                std::time::Duration::from_secs(30),
+            )),
         });
         (state, root)
     }
