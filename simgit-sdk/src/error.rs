@@ -26,4 +26,7 @@ pub enum SdkError {
 
     #[error("quota exceeded: {0}")]
     QuotaExceeded(String),
+
+    #[error("deadline exceeded: {0}")]
+    DeadlineExceeded(String),
 }

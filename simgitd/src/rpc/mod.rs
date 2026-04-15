@@ -69,6 +69,7 @@
 //! - `-32002`: Session not found
 //! - `-32003`: Merge conflict
 //! - `-32004`: Quota/max-session exceeded
+//! - `-32006`: Deadline exceeded (request-level timeout)
 //!
 //! # Example Workflow (via `sg` CLI)
 //!

@@ -110,3 +110,40 @@ Then inspect:
 - If scheduling is disabled (`SIMGIT_COMMIT_WAIT_SECS=0`), inspect peer/session/path conflict payloads and retry with a refreshed session.
 - Flatten is gix-only by default; no engine switch is required in normal operation.
 - Keep stress runs on test repos; avoid production branches.
+
+## Timeout and Adaptive Retry Guidance
+
+`session.commit` now supports request-level deadlines to prevent split-brain behavior between client and daemon. The Rust SDK method `session_commit_with_timeout` sends a `deadline_epoch_ms` to the daemon and applies the same timeout on the client transport.
+
+If the daemon cannot safely start flatten before the deadline, it returns `ERR_DEADLINE_EXCEEDED` (`-32006`) instead of committing late.
+
+```rust
+use std::time::Duration;
+use simgit_sdk::{Client, SdkError};
+
+let client = Client::from_env();
+
+let result = client
+    .session_commit_with_timeout(
+        session.session_id,
+        Some("feat/agent-task-123".into()),
+        Some("agent update".into()),
+        Some(Duration::from_secs(5)),
+    )
+    .await;
+
+match result {
+    Ok(commit) => {
+        let queue_wait = commit.telemetry.scheduler_queue_wait_ms;
+        if queue_wait > 5_000.0 {
+            // High contention signal: back off before next commit attempt.
+        }
+    }
+    Err(SdkError::DeadlineExceeded(_)) => {
+        // Deterministic timeout: create a new session or back off and retry.
+    }
+    Err(other) => return Err(other.into()),
+}
+```
+
+For Python flows, use `SIMGIT_RPC_TIMEOUT_SECS` to bound transport waits today; explicit per-call commit timeout overrides are currently available in the Rust SDK API.

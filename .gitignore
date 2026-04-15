@@ -1,1 +1,10 @@
 /target
+
+# Local environment files
+.env
+
+# Python cache artifacts
+__pycache__/
+
+# Built extension artifacts produced in simgit-py
+simgit-py/simgit/*.abi3.so

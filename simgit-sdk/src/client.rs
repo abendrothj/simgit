@@ -29,6 +29,7 @@ fn decode_rpc_error(err: RpcError) -> Result<SdkError, SdkError> {
             Ok(SdkError::MergeConflict(detail))
         }
         ERR_QUOTA_EXCEEDED => Ok(SdkError::QuotaExceeded(err.message)),
+        ERR_DEADLINE_EXCEEDED => Ok(SdkError::DeadlineExceeded(err.message)),
         _ => Ok(SdkError::Rpc { code: err.code, message: err.message }),
     }
 }
@@ -50,6 +51,22 @@ fn rpc_retry_count() -> u32 {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(2)
+}
+
+fn duration_to_timeout_secs(timeout: Duration) -> u64 {
+    let millis = timeout.as_millis();
+    if millis == 0 {
+        return 1;
+    }
+    ((millis + 999) / 1000) as u64
+}
+
+fn deadline_epoch_ms_from_timeout(timeout: Duration) -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let deadline = now.saturating_add(timeout);
+    i64::try_from(deadline.as_millis()).unwrap_or(i64::MAX)
 }
 
 fn is_retryable_io(e: &std::io::Error) -> bool {
@@ -100,8 +117,19 @@ impl Client {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, SdkError> {
+        self.call_with_timeout(method, params, None).await
+    }
+
+    async fn call_with_timeout(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout_override: Option<Duration>,
+    ) -> Result<serde_json::Value, SdkError> {
         let attempts = rpc_retry_count() + 1;
-        let timeout_secs = rpc_timeout_secs();
+        let timeout_secs = timeout_override
+            .map(duration_to_timeout_secs)
+            .unwrap_or_else(rpc_timeout_secs);
         let mut last_err: Option<SdkError> = None;
 
         for attempt in 1..=attempts {
@@ -251,14 +279,33 @@ impl Client {
         branch_name: Option<String>,
         message:     Option<String>,
     ) -> Result<SessionCommitResult, SdkError> {
+        self.session_commit_with_timeout(session_id, branch_name, message, None)
+            .await
+    }
+
+    /// Flatten the session's delta layer into a git branch and release locks.
+    ///
+    /// `timeout_override` applies to this call only (transport timeout +
+    /// daemon-side `deadline_epoch_ms`), without changing global SDK defaults.
+    pub async fn session_commit_with_timeout(
+        &self,
+        session_id: Uuid,
+        branch_name: Option<String>,
+        message: Option<String>,
+        timeout_override: Option<Duration>,
+    ) -> Result<SessionCommitResult, SdkError> {
+        let effective_timeout = timeout_override.unwrap_or_else(|| Duration::from_secs(rpc_timeout_secs()));
+        let deadline_epoch_ms = deadline_epoch_ms_from_timeout(effective_timeout);
         let result = self
-            .call(
+            .call_with_timeout(
                 "session.commit",
                 serde_json::json!({
                     "session_id":  session_id,
                     "branch_name": branch_name,
                     "message":     message,
+                    "deadline_epoch_ms": deadline_epoch_ms,
                 }),
+                timeout_override,
             )
             .await?;
         Ok(serde_json::from_value(result)?)
@@ -372,7 +419,7 @@ impl Client {
 mod tests {
     use super::decode_rpc_error;
     use crate::error::SdkError;
-    use crate::types::{RpcError, ERR_MERGE_CONFLICT};
+    use crate::types::{RpcError, ERR_DEADLINE_EXCEEDED, ERR_MERGE_CONFLICT};
     use serde_json::json;
     use std::path::PathBuf;
 
@@ -412,6 +459,23 @@ mod tests {
                 assert!(rendered.contains("019d8629-0609-7f02-9290-4a98e6a307ed"));
             }
             other => panic!("expected merge conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_deadline_exceeded_maps_to_explicit_variant() {
+        let err = RpcError {
+            code: ERR_DEADLINE_EXCEEDED,
+            message: "commit deadline exceeded before flatten".to_owned(),
+            data: None,
+        };
+
+        let sdk_error = decode_rpc_error(err).expect("decode deadline");
+        match sdk_error {
+            SdkError::DeadlineExceeded(message) => {
+                assert!(message.contains("deadline exceeded"));
+            }
+            other => panic!("expected deadline exceeded, got {other:?}"),
         }
     }
 }

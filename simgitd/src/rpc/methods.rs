@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use simgit_sdk::{
     RpcError, SessionStatus,
-    ERR_BORROW_CONFLICT, ERR_MERGE_CONFLICT, ERR_QUOTA_EXCEEDED, ERR_SESSION_NOT_FOUND,
+    ERR_BORROW_CONFLICT, ERR_DEADLINE_EXCEEDED, ERR_MERGE_CONFLICT, ERR_QUOTA_EXCEEDED,
+    ERR_SESSION_NOT_FOUND,
 };
 
 use crate::daemon::AppState;
@@ -89,6 +90,7 @@ async fn session_create(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
 async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<serde_json::Value, RpcError> {
     let commit_started = std::time::Instant::now();
     let session_id = uuid_field(&p, "session_id")?;
+    let deadline_epoch_ms = p["deadline_epoch_ms"].as_i64();
     let branch_name = p["branch_name"].as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| format!("simgit/{session_id}"));
@@ -175,6 +177,10 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
     let mut manifest = state.deltas.load_manifest(session_id).map_err(internal)?;
     let delta_root = state.config.state_dir.join("deltas");
     let mut auto_merged_paths = BTreeSet::new();
+
+    if let Some(deadline) = deadline_epoch_ms {
+        check_commit_deadline(session_id, deadline, "pre_lock")?;
+    }
 
     // Acquire per-path commit slot before the conflict scan.
     // This serialises sessions that touch the same files, eliminating the
@@ -309,6 +315,9 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
     }
 
     let stage_started = std::time::Instant::now();
+    if let Some(deadline) = deadline_epoch_ms {
+        check_commit_deadline(session_id, deadline, "pre_flatten")?;
+    }
     // Flatten delta to git branch in a blocking task (heavy git I/O).
     let repo_path = state.config.repo_path.clone();
     let base_commit = info.base_commit.clone();
@@ -991,6 +1000,32 @@ fn not_found(session_id: Uuid) -> RpcError {
     }
 }
 
+fn now_epoch_ms() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(now.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn check_commit_deadline(session_id: Uuid, deadline_epoch_ms: i64, phase: &str) -> Result<(), RpcError> {
+    let now = now_epoch_ms();
+    if now <= deadline_epoch_ms {
+        return Ok(());
+    }
+
+    Err(RpcError {
+        code: ERR_DEADLINE_EXCEEDED,
+        message: format!("commit deadline exceeded before {phase}"),
+        data: Some(serde_json::json!({
+            "session_id": session_id,
+            "kind": "deadline_exceeded",
+            "phase": phase,
+            "deadline_epoch_ms": deadline_epoch_ms,
+            "now_epoch_ms": now,
+        })),
+    })
+}
+
 fn resolve_head(repo: &std::path::Path) -> String {
     gix::open(repo)
         .ok()
@@ -1006,8 +1041,8 @@ fn overlap_paths(a: &BTreeSet<PathBuf>, b: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        changed_path_ops, changed_paths_set, diff_bytes_for_path, flatten_error_to_rpc, ops_for_path,
-        overlap_paths,
+        changed_path_ops, changed_paths_set, diff_bytes_for_path, flatten_error_to_rpc, now_epoch_ms,
+        ops_for_path, overlap_paths,
     };
     use super::{dispatch, session_commit};
     use crate::borrow::BorrowRegistry;
@@ -1020,7 +1055,7 @@ mod tests {
     use crate::events::EventBroker;
     use crate::session::SessionManager;
     use crate::vfs::VfsManager;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1481,6 +1516,108 @@ mod tests {
 
         let merged = run_git_output(&state.config.repo_path, &["show", &format!("{}:merge.txt", branch)]);
         assert_eq!(merged, "line1-ours\nline2\nline3-theirs");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_commit_deadline_exceeded_before_lock() {
+        let (state, root) = build_state_for_commit_tests().await;
+
+        let s1 = state
+            .sessions
+            .create(
+                "task-timeout-lock".to_owned(),
+                Some("agent-timeout-lock".to_owned()),
+                "HEAD".to_owned(),
+                state.config.mnt_dir.join("timeout-lock"),
+                false,
+                8,
+            )
+            .expect("create session");
+        state
+            .deltas
+            .init_session(s1.session_id, &s1.base_commit)
+            .expect("init delta");
+        state
+            .deltas
+            .write_blob(s1.session_id, Path::new("README.md"), b"timeout-lock\n", None)
+            .expect("write blob");
+
+        let res = session_commit(
+            &state,
+            serde_json::json!({
+                "session_id": s1.session_id,
+                "branch_name": "feat/deadline-pre-lock",
+                "message": "deadline pre-lock",
+                "deadline_epoch_ms": 1,
+            }),
+        )
+        .await;
+
+        assert!(res.is_err(), "deadline must fail before lock");
+        let err = res.expect_err("deadline should fail");
+        assert_eq!(err.code, simgit_sdk::ERR_DEADLINE_EXCEEDED);
+        let data = err.data.expect("deadline payload");
+        assert_eq!(data["phase"], "pre_lock");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn session_commit_deadline_exceeded_before_flatten_after_queue_wait() {
+        let (state, root) = build_state_for_commit_tests().await;
+
+        let s1 = state
+            .sessions
+            .create(
+                "task-timeout-flatten".to_owned(),
+                Some("agent-timeout-flatten".to_owned()),
+                "HEAD".to_owned(),
+                state.config.mnt_dir.join("timeout-flatten"),
+                false,
+                8,
+            )
+            .expect("create session");
+        state
+            .deltas
+            .init_session(s1.session_id, &s1.base_commit)
+            .expect("init delta");
+        state
+            .deltas
+            .write_blob(s1.session_id, Path::new("README.md"), b"timeout-flatten\n", None)
+            .expect("write blob");
+
+        let guard = state
+            .commit_scheduler
+            .begin_commit(&[PathBuf::from("README.md")], Some(std::time::Duration::from_secs(30)))
+            .await
+            .expect("acquire contested path");
+
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            drop(guard);
+        });
+
+        let deadline = now_epoch_ms() + 50;
+        let res = session_commit(
+            &state,
+            serde_json::json!({
+                "session_id": s1.session_id,
+                "branch_name": "feat/deadline-pre-flatten",
+                "message": "deadline pre-flatten",
+                "deadline_epoch_ms": deadline,
+            }),
+        )
+        .await;
+
+        let _ = releaser.await;
+
+        assert!(res.is_err(), "deadline must fail before flatten");
+        let err = res.expect_err("deadline should fail");
+        assert_eq!(err.code, simgit_sdk::ERR_DEADLINE_EXCEEDED);
+        let data = err.data.expect("deadline payload");
+        assert_eq!(data["phase"], "pre_flatten");
 
         let _ = std::fs::remove_dir_all(&root);
     }

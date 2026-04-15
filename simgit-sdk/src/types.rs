@@ -304,3 +304,4 @@ pub const ERR_SESSION_NOT_FOUND: i32 = -32002;
 pub const ERR_MERGE_CONFLICT:    i32 = -32003;
 pub const ERR_QUOTA_EXCEEDED:    i32 = -32004;
 pub const ERR_INVALID_PATH:      i32 = -32005;
+pub const ERR_DEADLINE_EXCEEDED: i32 = -32006;
