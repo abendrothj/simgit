@@ -65,30 +65,30 @@ async fn main() -> anyhow::Result<()> {
 
 ## Concurrency Stress Harness
 
-A 50-agent stress harness scaffold is provided at:
+A 50-agent deterministic/LLM harness is provided at:
 
-- `tests/stress/agent_harness.py`
+- `tests/real_agent_harness.py`
 
 Usage:
 
 ```bash
-python3 tests/stress/agent_harness.py --agents 50 --mode abort
+python3 tests/real_agent_harness.py --agents 50 --task-profile disjoint-files
 ```
 
 Use `--mode commit` only when your mounted session paths are writable and your daemon is connected to a disposable test repository.
 
-For conflict-focused benchmarking:
+For overlap-focused benchmarking:
 
 ```bash
-python3 tests/stress/agent_harness.py \
-    --agents 50 --workers 50 --mode commit \
-    --overlap-path hotspot/shared.txt --two-phase-barrier \
-    --socket /tmp/simgit-stress-state/control.sock --json
+python3 tests/real_agent_harness.py \
+    --agents 50 --workers 50 --task-profile hotspot-file --commit-barrier \
+    --socket /tmp/simgit-stress-state/control.sock \
+    --report-out /tmp/simgit-real-agent-hotspot.json
 ```
 
 Then inspect:
-- `simgit_session_commit_stage_duration_seconds{stage="capture_peers"}`
-- `simgit_session_commit_conflicts_total{kind="active_session_overlap"}` (expected to drop when path scheduling is enabled)
+- `simgit_session_commit_stage_duration_seconds{stage="scheduler_queue_wait|flatten|flatten_git_commit"}`
+- `simgit_session_commit_conflicts_total{kind="active_session_overlap"}` (expected to remain low/zero with scheduler enabled)
 
 ## Operational Guidance
 
@@ -96,4 +96,5 @@ Then inspect:
 - Use deterministic branch names (`feat/<task-id>`) for traceability.
 - Prefer enabling path scheduling (`SIMGIT_COMMIT_WAIT_SECS > 0`) so overlapping commits queue by path instead of immediate overlap rejection.
 - If scheduling is disabled (`SIMGIT_COMMIT_WAIT_SECS=0`), inspect peer/session/path conflict payloads and retry with a refreshed session.
+- Flatten is gix-only by default; no engine switch is required in normal operation.
 - Keep stress runs on test repos; avoid production branches.

@@ -67,9 +67,13 @@ Current metrics include:
 - Commit conflict counter by kind (`simgit_session_commit_conflicts_total{kind=...}`)
 - Conflict cardinality histograms (`simgit_session_commit_conflict_paths`, `simgit_session_commit_conflict_peers`)
 
-Recent benchmark baseline (50-agent hotspot barrier) identified `capture_peers` as the dominant
-cost. Parallel peer capture reduced end-to-end p95 from 44.3s to 22.2s while preserving
-correctness (`0/50` successes on intentional full-overlap workloads).
+Latest validated baseline (50-agent deterministic real-agent harness) shows:
+- disjoint: `50/50` success, `0` conflicts, commit p95 `529ms`
+- hotspot: `50/50` success, `0` conflicts, commit p95 `415ms`
+- sharded-hotspot: `50/50` success, `0` conflicts, commit p95 `553ms`
+
+Flatten now runs on a pure `gix` write path (blob/tree/commit/ref update), and path-level
+commit scheduling serializes overlapping writes without dropping commits.
 
 Optional OTLP tracing export (gRPC) is enabled by setting:
 
@@ -190,7 +194,8 @@ simgit/
     ├── delta_store.rs
     ├── e2e_multi_agent.rs
     └── stress/
-        └── agent_harness.py     # 50-agent control-plane stress harness scaffold
+        ├── agent_harness.py      # legacy mock stress harness
+        └── real_agent_harness.py # deterministic/LLM real-agent stress harness
 ```
 
 ## Testing Strategy
@@ -301,11 +306,11 @@ python tests/stress/agent_harness.py \
     - structured conflict payload via `lock.acquire` RPC
 
 ### Phase 4: Flatten & Merge (2 weeks)
-- Convert delta → git tree/blob objects (current impl: worktree-based via git CLI)
+- Convert delta → git tree/blob objects (pure `gix` path)
 - Auto three-way merge (pending)
 - Create commit + update branch
 - Error handling (merge conflicts)
-- Status: 🚧 In progress (flatten complete; overlap handling now path-scheduled)
+- Status: ✅ Completed (gix-only flatten + path scheduler validated)
 - Implementation highlights:
     - pre-commit overlap detection across active sessions in `session.commit`
     - multi-session commit tests for overlap-block and non-overlap success
@@ -315,12 +320,13 @@ python tests/stress/agent_harness.py \
     - Commit latency metrics: per-stage histogram (capture_self, capture_peers, conflict_scan, flatten)
     - Conflict cardinality reporting: per-session and per-peer counts
     - Path-level commit scheduler (`SIMGIT_COMMIT_WAIT_SECS`) serializes overlapping commits by changed path while preserving disjoint parallelism
-    - Verified Track 3 smoke (8 agents): hotspot-file/disjoint-files/sharded-hotspot all reached 100% success with scheduler enabled
+    - Flatten engine migrated to gix-only write path (legacy CLI worktree path removed)
+    - Verified deterministic stress (50 agents): disjoint/hotspot/sharded all reached 100% success, 0 conflicts
 
 ### Active Todo (1-3)
-1. Raise concurrency proof from smoke scale to 20-50 agents and publish before/after latency deltas for scheduler-enabled hotspot runs.
-2. Add a full flatten E2E integration test (delta -> branch -> commit verification).
-3. Start pure-gix flatten migration plan and scaffold (replace temp worktree + git CLI path).
+1. Promote gix-only flatten + 50-agent deterministic stress into nightly SLO automation.
+2. Add Prometheus stage breakdown export for real-agent harness runs (queue wait vs flatten stages).
+3. Extend real-agent regression set with mixed-profile LLM runs and branch integrity checks.
 
 ### Phase 5: CLI & SDK (1 week)
 - All 9 `sg` subcommands

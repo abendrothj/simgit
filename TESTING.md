@@ -464,10 +464,11 @@ Real-agent scenarios capture:
 
 **Track 3 Status (Validated):**
 - Path-level commit scheduling is active when `SIMGIT_COMMIT_WAIT_SECS > 0`.
-- Latest smoke validation (`8 agents`) with scheduling enabled:
-  - `hotspot-file`: `success_rate=1.0`, `total_conflicts=0`
-  - `sharded-hotspot`: `success_rate=1.0`, `total_conflicts=0`
-  - `disjoint-files`: `success_rate=1.0`, `total_conflicts=0`
+- Flatten is now gix-only in production (legacy git CLI worktree flatten path removed).
+- Latest deterministic stress validation (`50 agents`) with scheduling enabled:
+  - `hotspot-file`: `success_rate=1.0`, `total_conflicts=0`, `p95=415ms`
+  - `sharded-hotspot`: `success_rate=1.0`, `total_conflicts=0`, `p95=553ms`
+  - `disjoint-files`: `success_rate=1.0`, `total_conflicts=0`, `p95=529ms`
 
 **Session Management:** RPC client handles session lifecycle; agent implementations focus on edit strategy and return real file edits that are applied in the session mount before commit.
 
@@ -512,6 +513,9 @@ SIMGIT_LLM_API_KEY=... python3 tests/real_agent_harness.py \
 **Commit Scheduler Environment Variable:**
 - `SIMGIT_COMMIT_WAIT_SECS`: enables path-level commit scheduling when `> 0` (default `30`)
 - Set to `0` to disable scheduling and keep immediate overlap rejection semantics
+
+**Flatten Engine:**
+- Flatten runs on gix full-time; no runtime engine toggle is required.
 
 **Report Structure:**
 ```json
