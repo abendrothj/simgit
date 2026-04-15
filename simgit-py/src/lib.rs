@@ -1,7 +1,7 @@
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use simgit_sdk::{Client, DiffResult, SessionInfo};
+use simgit_sdk::{Client, DiffResult, SessionCommitResult, SessionInfo};
 use uuid::Uuid;
 
 fn py_err<E: std::fmt::Display>(e: E) -> PyErr {
@@ -60,6 +60,39 @@ fn diff_result_dict(py: Python<'_>, diff: &DiffResult) -> PyResult<Py<PyDict>> {
     d.set_item("session_id", diff.session_id.to_string())?;
     d.set_item("unified_diff", &diff.unified_diff)?;
     d.set_item("changed_paths", changed_paths)?;
+    Ok(d.unbind())
+}
+
+fn commit_result_dict(py: Python<'_>, result: &SessionCommitResult) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new_bound(py);
+    d.set_item("session_id", result.session.session_id.to_string())?;
+    d.set_item("task_id", &result.session.task_id)?;
+    d.set_item("agent_label", &result.session.agent_label)?;
+    d.set_item("base_commit", &result.session.base_commit)?;
+    d.set_item("created_at", result.session.created_at.to_rfc3339())?;
+    d.set_item("status", format!("{:?}", result.session.status).to_uppercase())?;
+    d.set_item("mount_path", result.session.mount_path.to_string_lossy().to_string())?;
+    d.set_item("branch_name", &result.session.branch_name)?;
+    d.set_item("peers_enabled", result.session.peers_enabled)?;
+
+    let t = PyDict::new_bound(py);
+    t.set_item("total_duration_ms", result.telemetry.total_duration_ms)?;
+    t.set_item("capture_self_queue_wait_ms", result.telemetry.capture_self_queue_wait_ms)?;
+    t.set_item("capture_self_ms", result.telemetry.capture_self_ms)?;
+    t.set_item("capture_peers_queue_wait_ms", result.telemetry.capture_peers_queue_wait_ms)?;
+    t.set_item("capture_peers_execution_ms", result.telemetry.capture_peers_execution_ms)?;
+    t.set_item("capture_peers_ms", result.telemetry.capture_peers_ms)?;
+    t.set_item("scheduler_queue_wait_ms", result.telemetry.scheduler_queue_wait_ms)?;
+    t.set_item("conflict_scan_ms", result.telemetry.conflict_scan_ms)?;
+    t.set_item("flatten_queue_wait_ms", result.telemetry.flatten_queue_wait_ms)?;
+    t.set_item("flatten_ms", result.telemetry.flatten_ms)?;
+    t.set_item("flatten_write_tree_ms", result.telemetry.flatten_write_tree_ms)?;
+    t.set_item("flatten_apply_manifest_ms", result.telemetry.flatten_apply_manifest_ms)?;
+    t.set_item("flatten_ref_update_ms", result.telemetry.flatten_ref_update_ms)?;
+    t.set_item("flatten_commit_object_ms", result.telemetry.flatten_commit_object_ms)?;
+    t.set_item("retry_count", result.telemetry.retry_count)?;
+    d.set_item("telemetry", t)?;
+
     Ok(d.unbind())
 }
 
@@ -158,8 +191,8 @@ impl PySession {
         let client = Client::new(&self.socket_path);
         let session_id = Uuid::parse_str(&self.session_id)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let info = run_async(client.session_commit(session_id, branch_name, message))?;
-        let d = session_info_dict(py, &info)?;
+        let result = run_async(client.session_commit(session_id, branch_name, message))?;
+        let d = commit_result_dict(py, &result)?;
         self.cached_info = Some(d.clone_ref(py));
         Ok(d)
     }

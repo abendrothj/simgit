@@ -250,7 +250,7 @@ impl Client {
         session_id:  Uuid,
         branch_name: Option<String>,
         message:     Option<String>,
-    ) -> Result<SessionInfo, SdkError> {
+    ) -> Result<SessionCommitResult, SdkError> {
         let result = self
             .call(
                 "session.commit",

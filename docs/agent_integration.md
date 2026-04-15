@@ -31,8 +31,20 @@ print("mount:", info["mount_path"])
 diff = session.diff()
 print("changed paths:", diff["changed_paths"])
 
-session.commit(branch_name="feat/agent-task-123", message="agent update")
+result = session.commit(
+    branch_name="feat/agent-task-123",
+    message="agent update",
+)
+
+telemetry = result["telemetry"]
+print("commit duration ms:", telemetry["total_duration_ms"])
+
+# Contention-aware retry/backoff signal from commit scheduler wait.
+if telemetry["scheduler_queue_wait_ms"] > 5000:
+    print("high contention: consider backoff before next commit")
 ```
+
+`Session.commit()` returns session fields plus a `telemetry` dictionary with per-stage timings (milliseconds), including scheduler wait and flatten sub-stages. This is intended for adaptive retries and throughput tuning in agent runners.
 
 ## Rust Example
 

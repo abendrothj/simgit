@@ -77,6 +77,37 @@ pub struct SessionInfo {
     pub peers_enabled: bool,
 }
 
+/// Per-commit telemetry emitted by `session.commit`.
+///
+/// All durations are in milliseconds.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CommitTelemetry {
+    pub total_duration_ms: f64,
+    pub capture_self_queue_wait_ms: f64,
+    pub capture_self_ms: f64,
+    pub capture_peers_queue_wait_ms: f64,
+    pub capture_peers_execution_ms: f64,
+    pub capture_peers_ms: f64,
+    pub scheduler_queue_wait_ms: f64,
+    pub conflict_scan_ms: f64,
+    pub flatten_queue_wait_ms: f64,
+    pub flatten_ms: f64,
+    pub flatten_write_tree_ms: f64,
+    pub flatten_apply_manifest_ms: f64,
+    pub flatten_ref_update_ms: f64,
+    pub flatten_commit_object_ms: f64,
+    pub retry_count: u32,
+}
+
+/// Return shape for `session.commit`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCommitResult {
+    #[serde(flatten)]
+    pub session: SessionInfo,
+    #[serde(default)]
+    pub telemetry: CommitTelemetry,
+}
+
 // ── Merge conflicts ──────────────────────────────────────────────────────────
 
 /// Detailed operation overlap for a single conflicting path.

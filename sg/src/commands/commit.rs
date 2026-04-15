@@ -25,14 +25,16 @@ pub async fn run(cmd: Commit, client: &Client, json: bool) -> Result<()> {
     })?;
     let session_id = session_str.parse::<Uuid>()?;
 
-    let info = client.session_commit(session_id, cmd.branch, cmd.message).await?;
+    let result = client.session_commit(session_id, cmd.branch, cmd.message).await?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&info)?);
+        println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         println!("Committed");
-        println!("  Branch: {}", info.branch_name.as_deref().unwrap_or("(none)"));
-        println!("  Session: {}", info.session_id);
+        println!("  Branch: {}", result.session.branch_name.as_deref().unwrap_or("(none)"));
+        println!("  Session: {}", result.session.session_id);
+        println!("  Duration: {:.1} ms", result.telemetry.total_duration_ms);
+        println!("  Queue Wait: {:.1} ms", result.telemetry.scheduler_queue_wait_ms);
     }
     Ok(())
 }
