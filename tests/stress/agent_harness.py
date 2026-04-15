@@ -373,6 +373,21 @@ def parse_args() -> argparse.Namespace:
         "--report-out",
         help="optional file path to write JSON report",
     )
+    parser.add_argument(
+        "--drunk-profile",
+        default=None,
+        help=(
+            "Run a drunk-agent wave instead of the standard harness. "
+            "Value is a single profile name or a JSON mix dict. "
+            "Available profiles: fast_coder, reasoning, unstable, overthinker, balanced."
+        ),
+    )
+    parser.add_argument(
+        "--drunk-seed",
+        type=int,
+        default=None,
+        help="RNG seed for drunk-agent runs (enables deterministic replay)",
+    )
     return parser.parse_args()
 
 
@@ -408,6 +423,68 @@ def classify_error(error: str | None) -> str:
 def main() -> int:
     args = parse_args()
     started = time.time()
+
+    # ── Drunk-agent fast-path ─────────────────────────────────────────────
+    if args.drunk_profile is not None:
+        _stress_dir = os.path.dirname(os.path.abspath(__file__))
+        if _stress_dir not in sys.path:
+            sys.path.insert(0, _stress_dir)
+        from drunk_agent import run_drunk_wave, list_profiles, profile_for  # noqa: F401
+
+        profile_arg: str | dict
+        praw = args.drunk_profile.strip()
+        if praw.startswith("{"):
+            try:
+                profile_arg = json.loads(praw)
+                for k in profile_arg:
+                    profile_for(k)  # validate
+            except (json.JSONDecodeError, KeyError) as exc:
+                print(f"Invalid --drunk-profile JSON: {exc}", file=sys.stderr)
+                return 2
+        else:
+            try:
+                profile_for(praw)  # validate name
+            except KeyError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            profile_arg = praw
+
+        summary = run_drunk_wave(
+            profile_name=profile_arg,
+            agents=args.agents,
+            socket_path=args.socket,
+            stress_mode=args.stress_mode,
+            overlap_path=args.overlap_path,
+            disjoint_file=args.disjoint_file,
+            workers=args.workers or None,
+            seed=args.drunk_seed,
+        )
+        # Remove timing objects before serialisation
+        for r in summary.get("results", []):
+            r.pop("timing", None)
+
+        if args.json:
+            print(json.dumps(summary, indent=2))
+        else:
+            lat = summary.get("latency_ms", {})
+            print(
+                f"drunk_profile={args.drunk_profile} stress_mode={args.stress_mode} "
+                f"agents={summary['agents']} "
+                f"successes={summary['successes']} failures={summary['failures']} "
+                f"abandoned={summary['abandoned']}"
+            )
+            print(
+                f"latency_ms p50={lat.get('p50',0)} p95={lat.get('p95',0)} "
+                f"p99={lat.get('p99',0)} max={lat.get('max',0)}"
+            )
+
+        if args.report_out:
+            with open(args.report_out, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2)
+            print(f"Report written to {args.report_out}")
+
+        return 0 if summary["failures"] == summary["abandoned"] else 1
+    # ── End drunk fast-path ───────────────────────────────────────────────
 
     if args.agents < 1:
         print("--agents must be >= 1", file=sys.stderr)
