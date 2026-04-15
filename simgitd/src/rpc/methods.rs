@@ -180,9 +180,18 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
             ops.into_keys().collect()
         };
         let wait = std::time::Duration::from_secs(state.config.commit_wait_secs);
+        let sched_start = std::time::Instant::now();
         match state.commit_scheduler.begin_commit(&our_paths, Some(wait)).await {
-            Ok(guard) => Some(guard),
+            Ok(guard) => {
+                state
+                    .metrics
+                    .observe_session_commit_stage("scheduler_queue_wait", sched_start.elapsed().as_secs_f64());
+                Some(guard)
+            }
             Err(CommitWaitTimeout) => {
+                state
+                    .metrics
+                    .observe_session_commit_stage("scheduler_queue_wait", sched_start.elapsed().as_secs_f64());
                 return Err(RpcError {
                     code: ERR_MERGE_CONFLICT,
                     message: "commit wait timeout: path lock not released in time".to_owned(),
@@ -603,17 +612,12 @@ fn build_session_unified_diff(
 }
 
 fn read_base_blob(repo_path: &Path, base_commit: &str, path: &Path) -> Option<Vec<u8>> {
+    let repo = gix::open(repo_path).ok()?;
     let spec = format!("{}:{}", base_commit, path.to_string_lossy());
-    let out = std::process::Command::new("git")
-        .current_dir(repo_path)
-        .args(["show", &spec])
-        .output()
-        .ok()?;
-    if out.status.success() {
-        Some(out.stdout)
-    } else {
-        None
-    }
+    let id = repo.rev_parse_single(spec.as_str()).ok()?;
+    let obj = id.object().ok()?;
+    let blob = obj.try_into_blob().ok()?;
+    Some(blob.data.to_vec())
 }
 
 fn read_delta_blob(
