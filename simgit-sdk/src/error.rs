@@ -29,4 +29,7 @@ pub enum SdkError {
 
     #[error("deadline exceeded: {0}")]
     DeadlineExceeded(String),
+
+    #[error("commit pending: {0}")]
+    CommitPending(String),
 }

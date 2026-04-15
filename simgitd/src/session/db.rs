@@ -22,7 +22,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     status       TEXT    NOT NULL DEFAULT 'ACTIVE',
     mount_path   TEXT    NOT NULL,
     branch_name  TEXT,
-    peers_enabled INTEGER NOT NULL DEFAULT 0
+    peers_enabled INTEGER NOT NULL DEFAULT 0,
+    last_commit_request_id TEXT,
+    last_commit_state      TEXT,
+    last_commit_result     TEXT,
+    last_commit_error      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS locks (
@@ -54,6 +58,7 @@ impl Db {
         let conn = Connection::open(path)
             .with_context(|| format!("open SQLite at {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("apply schema")?;
+        ensure_session_commit_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -62,6 +67,7 @@ impl Db {
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("open in-memory SQLite")?;
         conn.execute_batch(SCHEMA).context("apply schema")?;
+        ensure_session_commit_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -202,6 +208,63 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    pub fn update_commit_request(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        state: &str,
+        result_json: Option<&str>,
+        error_json: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions
+             SET last_commit_request_id=?1,
+                 last_commit_state=?2,
+                 last_commit_result=?3,
+                 last_commit_error=?4
+             WHERE id=?5",
+            params![request_id, state, result_json, error_json, session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_commit_request(&self, session_id: &str) -> Result<Option<CommitRequestRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT last_commit_request_id, last_commit_state, last_commit_result, last_commit_error
+             FROM sessions WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![session_id], |row| {
+            Ok(CommitRequestRow {
+                request_id: row.get(0)?,
+                state: row.get(1)?,
+                result_json: row.get(2)?,
+                error_json: row.get(3)?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
+    }
+}
+
+fn ensure_session_commit_columns(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(sessions)")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let required = [
+        ("last_commit_request_id", "ALTER TABLE sessions ADD COLUMN last_commit_request_id TEXT"),
+        ("last_commit_state", "ALTER TABLE sessions ADD COLUMN last_commit_state TEXT"),
+        ("last_commit_result", "ALTER TABLE sessions ADD COLUMN last_commit_result TEXT"),
+        ("last_commit_error", "ALTER TABLE sessions ADD COLUMN last_commit_error TEXT"),
+    ];
+
+    for (name, ddl) in required {
+        if !rows.iter().any(|existing| existing == name) {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
 }
 
 // ── Raw DB row ────────────────────────────────────────────────────────────────
@@ -243,4 +306,12 @@ pub struct LockRow {
     pub reader_sessions_json: String,
     pub acquired_at:          i64,
     pub ttl_seconds:          Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommitRequestRow {
+    pub request_id: Option<String>,
+    pub state: Option<String>,
+    pub result_json: Option<String>,
+    pub error_json: Option<String>,
 }

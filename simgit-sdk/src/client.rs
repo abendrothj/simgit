@@ -30,6 +30,7 @@ fn decode_rpc_error(err: RpcError) -> Result<SdkError, SdkError> {
         }
         ERR_QUOTA_EXCEEDED => Ok(SdkError::QuotaExceeded(err.message)),
         ERR_DEADLINE_EXCEEDED => Ok(SdkError::DeadlineExceeded(err.message)),
+        ERR_COMMIT_PENDING => Ok(SdkError::CommitPending(err.message)),
         _ => Ok(SdkError::Rpc { code: err.code, message: err.message }),
     }
 }
@@ -80,6 +81,12 @@ fn is_retryable_io(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::UnexpectedEof
             | std::io::ErrorKind::NotFound
     )
+}
+
+enum CommitAttemptError {
+    Unsent(SdkError),
+    SentTransport(SdkError),
+    Response(SdkError),
 }
 
 /// Default socket path: `$XDG_RUNTIME_DIR/simgit/control.sock`
@@ -296,16 +303,85 @@ impl Client {
     ) -> Result<SessionCommitResult, SdkError> {
         let effective_timeout = timeout_override.unwrap_or_else(|| Duration::from_secs(rpc_timeout_secs()));
         let deadline_epoch_ms = deadline_epoch_ms_from_timeout(effective_timeout);
+        let request_id = Uuid::new_v4();
+        let attempts = rpc_retry_count() + 1;
+
+        for attempt in 1..=attempts {
+            let params = serde_json::json!({
+                "session_id":  session_id,
+                "branch_name": branch_name,
+                "message":     message,
+                "deadline_epoch_ms": deadline_epoch_ms,
+                "request_id": request_id,
+            });
+
+            match self.commit_call_once(params, effective_timeout).await {
+                Ok(result) => return Ok(serde_json::from_value(result)?),
+                Err(CommitAttemptError::Response(SdkError::CommitPending(message))) => {
+                    match self
+                        .poll_commit_status(session_id, request_id, effective_timeout)
+                        .await
+                    {
+                        Ok(Some(Ok(result))) => return Ok(result),
+                        Ok(Some(Err(error))) => return Err(error),
+                        Ok(None) => {
+                            if attempt == attempts {
+                                return Err(SdkError::CommitPending(message));
+                            }
+                        }
+                        Err(error) => {
+                            if attempt == attempts {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
+                Err(CommitAttemptError::SentTransport(error)) => {
+                    match self
+                        .poll_commit_status(session_id, request_id, effective_timeout)
+                        .await
+                    {
+                        Ok(Some(Ok(result))) => return Ok(result),
+                        Ok(Some(Err(error_from_status))) => return Err(error_from_status),
+                        Ok(None) => {
+                            if attempt == attempts {
+                                return Err(error);
+                            }
+                        }
+                        Err(status_error) => {
+                            if attempt == attempts {
+                                return Err(status_error);
+                            }
+                        }
+                    }
+                }
+                Err(CommitAttemptError::Unsent(error)) => {
+                    if attempt == attempts {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                Err(CommitAttemptError::Response(error)) => return Err(error),
+            }
+        }
+
+        Err(SdkError::Io(std::io::Error::other(
+            "commit failed after retries",
+        )))
+    }
+
+    pub async fn session_commit_status(
+        &self,
+        session_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<SessionCommitStatus, SdkError> {
         let result = self
-            .call_with_timeout(
-                "session.commit",
+            .call(
+                "commit.status",
                 serde_json::json!({
-                    "session_id":  session_id,
-                    "branch_name": branch_name,
-                    "message":     message,
-                    "deadline_epoch_ms": deadline_epoch_ms,
+                    "session_id": session_id,
+                    "request_id": request_id,
                 }),
-                timeout_override,
             )
             .await?;
         Ok(serde_json::from_value(result)?)
@@ -412,6 +488,118 @@ impl Client {
             return Ok(None);
         }
         Ok(Some(serde_json::from_value(event)?))
+    }
+}
+
+impl Client {
+    async fn commit_call_once(
+        &self,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, CommitAttemptError> {
+        let stream = UnixStream::connect(&self.socket_path)
+            .await
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.kind() == std::io::ErrorKind::ConnectionRefused
+                {
+                    CommitAttemptError::Unsent(SdkError::DaemonNotFound(
+                        self.socket_path.display().to_string(),
+                    ))
+                } else {
+                    CommitAttemptError::Unsent(SdkError::Io(e))
+                }
+            })?;
+
+        let req = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: next_id(),
+            method: "session.commit".into(),
+            params,
+        };
+        let mut payload = serde_json::to_string(&req)
+            .map_err(|e| CommitAttemptError::Unsent(SdkError::Json(e)))?;
+        payload.push('\n');
+
+        let (read_half, mut write_half) = stream.into_split();
+        write_half
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|e| CommitAttemptError::Unsent(SdkError::Io(e)))?;
+        write_half
+            .shutdown()
+            .await
+            .map_err(|e| CommitAttemptError::SentTransport(SdkError::Io(e)))?;
+
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        let read_result = tokio::time::timeout(timeout, reader.read_line(&mut line)).await;
+
+        let bytes = match read_result {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(CommitAttemptError::SentTransport(SdkError::Io(e))),
+            Err(_) => {
+                return Err(CommitAttemptError::SentTransport(SdkError::Io(
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("RPC response timeout ({}s)", duration_to_timeout_secs(timeout)),
+                    ),
+                )));
+            }
+        };
+
+        if bytes == 0 || line.trim().is_empty() {
+            return Err(CommitAttemptError::SentTransport(SdkError::Io(
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty RPC response"),
+            )));
+        }
+
+        let resp: RpcResponse = serde_json::from_str(line.trim())
+            .map_err(|e| CommitAttemptError::SentTransport(SdkError::Json(e)))?;
+
+        if let Some(err) = resp.error {
+            return Err(CommitAttemptError::Response(
+                decode_rpc_error(err).unwrap_or_else(|e| e),
+            ));
+        }
+
+        Ok(resp.result.unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn poll_commit_status(
+        &self,
+        session_id: Uuid,
+        request_id: Uuid,
+        poll_window: Duration,
+    ) -> Result<Option<Result<SessionCommitResult, SdkError>>, SdkError> {
+        let deadline = tokio::time::Instant::now() + poll_window;
+        loop {
+            let status = self.session_commit_status(session_id, request_id).await?;
+            match status.state {
+                CommitRequestState::Success => {
+                    return Ok(Some(Ok(status.result.ok_or_else(|| {
+                        SdkError::Io(std::io::Error::other(
+                            "commit status success missing result payload",
+                        ))
+                    })?)));
+                }
+                CommitRequestState::Failed => {
+                    let error = status.error.ok_or_else(|| {
+                        SdkError::Io(std::io::Error::other(
+                            "commit status failure missing error payload",
+                        ))
+                    })?;
+                    return Ok(Some(Err(decode_rpc_error(error)?)));
+                }
+                CommitRequestState::NotFound => return Ok(None),
+                CommitRequestState::Pending => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
     }
 }
 

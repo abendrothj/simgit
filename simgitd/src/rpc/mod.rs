@@ -47,6 +47,7 @@
 //! - **session.create** — Start a new session
 //! - **session.list** — Query active sessions
 //! - **session.commit** — Flatten and merge
+//! - **commit.status** — Lookup idempotent commit request state
 //! - **session.abort** — Discard changes
 //! - **session.diff** — Diff vs HEAD
 //! - **event.list** — Poll recent broker events
@@ -70,6 +71,7 @@
 //! - `-32003`: Merge conflict
 //! - `-32004`: Quota/max-session exceeded
 //! - `-32006`: Deadline exceeded (request-level timeout)
+//! - `-32007`: Commit request already pending
 //!
 //! # Example Workflow (via `sg` CLI)
 //!

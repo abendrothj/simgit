@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use simgit_sdk::{
-    RpcError, SessionStatus,
-    ERR_BORROW_CONFLICT, ERR_DEADLINE_EXCEEDED, ERR_MERGE_CONFLICT, ERR_QUOTA_EXCEEDED,
-    ERR_SESSION_NOT_FOUND,
+    CommitRequestState, RpcError, SessionStatus,
+    ERR_BORROW_CONFLICT, ERR_COMMIT_PENDING, ERR_DEADLINE_EXCEEDED, ERR_MERGE_CONFLICT,
+    ERR_QUOTA_EXCEEDED, ERR_SESSION_NOT_FOUND,
 };
 
 use crate::daemon::AppState;
@@ -28,6 +28,7 @@ pub async fn dispatch(
     match method {
         "session.create" => session_create(state, params).await,
         "session.commit" => session_commit(state, params).await,
+        "commit.status" => commit_status(state, params).await,
         "session.abort"  => session_abort(state, params).await,
         "session.list"   => session_list(state, params).await,
         "session.diff"   => session_diff(state, params).await,
@@ -90,6 +91,7 @@ async fn session_create(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
 async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<serde_json::Value, RpcError> {
     let commit_started = std::time::Instant::now();
     let session_id = uuid_field(&p, "session_id")?;
+    let request_id = optional_uuid_field(&p, "request_id")?;
     let deadline_epoch_ms = p["deadline_epoch_ms"].as_i64();
     let branch_name = p["branch_name"].as_str()
         .map(str::to_owned)
@@ -99,6 +101,35 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
         .to_owned();
 
     let info = state.sessions.get(session_id).ok_or_else(|| not_found(session_id))?;
+
+    if let Some(request_id) = request_id {
+        let status = state.sessions.commit_status(session_id, request_id).map_err(internal)?;
+        match status.state {
+            CommitRequestState::Success => {
+                let result = status.result.ok_or_else(|| internal("stored commit success missing result"))?;
+                return serde_json::to_value(&result).map_err(internal);
+            }
+            CommitRequestState::Failed => {
+                let error = status.error.ok_or_else(|| internal("stored commit failure missing error"))?;
+                return Err(error);
+            }
+            CommitRequestState::Pending => {
+                return Err(RpcError {
+                    code: ERR_COMMIT_PENDING,
+                    message: "commit request is already in progress".to_owned(),
+                    data: Some(serde_json::json!({
+                        "session_id": session_id,
+                        "request_id": request_id,
+                    })),
+                });
+            }
+            CommitRequestState::NotFound => {
+                state.sessions.record_commit_pending(session_id, request_id).map_err(internal)?;
+            }
+        }
+    }
+
+    let commit_outcome: Result<simgit_sdk::SessionCommitResult, RpcError> = async {
 
     let stage_started = std::time::Instant::now();
     let mut capture_self_queue_wait_secs = 0.0f64;
@@ -408,7 +439,34 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
         },
     };
 
-    serde_json::to_value(&commit_result).map_err(internal)
+    Ok(commit_result)
+    }
+    .await;
+
+    if let Some(request_id) = request_id {
+        match &commit_outcome {
+            Ok(result) => state
+                .sessions
+                .record_commit_success(session_id, request_id, result)
+                .map_err(internal)?,
+            Err(error) => state
+                .sessions
+                .record_commit_failure(session_id, request_id, error)
+                .map_err(internal)?,
+        }
+    }
+
+    match commit_outcome {
+        Ok(result) => serde_json::to_value(&result).map_err(internal),
+        Err(error) => Err(error),
+    }
+}
+
+async fn commit_status(state: &Arc<AppState>, p: serde_json::Value) -> Result<serde_json::Value, RpcError> {
+    let session_id = uuid_field(&p, "session_id")?;
+    let request_id = uuid_field(&p, "request_id")?;
+    let status = state.sessions.commit_status(session_id, request_id).map_err(internal)?;
+    serde_json::to_value(&status).map_err(internal)
 }
 
 fn try_auto_merge_path(
@@ -988,6 +1046,17 @@ fn uuid_field(p: &serde_json::Value, key: &str) -> Result<Uuid, RpcError> {
     })
 }
 
+fn optional_uuid_field(p: &serde_json::Value, key: &str) -> Result<Option<Uuid>, RpcError> {
+    match p.get(key).and_then(|value| value.as_str()) {
+        Some(value) => value.parse::<Uuid>().map(Some).map_err(|_| RpcError {
+            code: -32602,
+            message: format!("invalid UUID for param: {key}"),
+            data: None,
+        }),
+        None => Ok(None),
+    }
+}
+
 fn internal(e: impl std::fmt::Display) -> RpcError {
     RpcError { code: -32603, message: e.to_string(), data: None }
 }
@@ -1041,8 +1110,8 @@ fn overlap_paths(a: &BTreeSet<PathBuf>, b: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        changed_path_ops, changed_paths_set, diff_bytes_for_path, flatten_error_to_rpc, now_epoch_ms,
-        ops_for_path, overlap_paths,
+        changed_path_ops, changed_paths_set, commit_status, diff_bytes_for_path, flatten_error_to_rpc,
+        now_epoch_ms, ops_for_path, overlap_paths,
     };
     use super::{dispatch, session_commit};
     use crate::borrow::BorrowRegistry;
@@ -1618,6 +1687,95 @@ mod tests {
         assert_eq!(err.code, simgit_sdk::ERR_DEADLINE_EXCEEDED);
         let data = err.data.expect("deadline payload");
         assert_eq!(data["phase"], "pre_flatten");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn commit_status_returns_not_found_for_unknown_request() {
+        let (state, root) = build_state_for_commit_tests().await;
+
+        let s1 = state
+            .sessions
+            .create(
+                "task-status-miss".to_owned(),
+                Some("agent-status-miss".to_owned()),
+                "HEAD".to_owned(),
+                state.config.mnt_dir.join("status-miss"),
+                false,
+                8,
+            )
+            .expect("create session");
+        state
+            .deltas
+            .init_session(s1.session_id, &s1.base_commit)
+            .expect("init delta");
+
+        let request_id = Uuid::new_v4();
+        let res = commit_status(
+            &state,
+            serde_json::json!({
+                "session_id": s1.session_id,
+                "request_id": request_id,
+            }),
+        )
+        .await
+        .expect("status response");
+
+        assert_eq!(res["state"], "NOT_FOUND");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn commit_status_returns_success_for_completed_request() {
+        let (state, root) = build_state_for_commit_tests().await;
+
+        let s1 = state
+            .sessions
+            .create(
+                "task-status-hit".to_owned(),
+                Some("agent-status-hit".to_owned()),
+                "HEAD".to_owned(),
+                state.config.mnt_dir.join("status-hit"),
+                false,
+                8,
+            )
+            .expect("create session");
+        state
+            .deltas
+            .init_session(s1.session_id, &s1.base_commit)
+            .expect("init delta");
+        state
+            .deltas
+            .write_blob(s1.session_id, Path::new("README.md"), b"status-hit\n", None)
+            .expect("write blob");
+
+        let request_id = Uuid::new_v4();
+        let commit_res = session_commit(
+            &state,
+            serde_json::json!({
+                "session_id": s1.session_id,
+                "branch_name": "feat/status-hit",
+                "message": "status hit",
+                "request_id": request_id,
+            }),
+        )
+        .await;
+        assert!(commit_res.is_ok(), "commit should succeed");
+
+        let status_res = commit_status(
+            &state,
+            serde_json::json!({
+                "session_id": s1.session_id,
+                "request_id": request_id,
+            }),
+        )
+        .await
+        .expect("status response");
+
+        assert_eq!(status_res["state"], "SUCCESS");
+        assert_eq!(status_res["result"]["branch_name"], "feat/status-hit");
 
         let _ = std::fs::remove_dir_all(&root);
     }

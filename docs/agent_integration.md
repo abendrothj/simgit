@@ -148,3 +148,5 @@ match result {
 ```
 
 Python bindings now expose the same per-call knob on `Session.commit(..., timeout_secs=...)`. Use this for adaptive retries instead of only relying on global `SIMGIT_RPC_TIMEOUT_SECS`.
+
+The SDK now also generates an internal `request_id` for each commit attempt and uses `commit.status` to resolve ambiguous transport failures. If the socket drops after the daemon has accepted the request, the client checks durable session state before retrying so the same commit is not applied twice.

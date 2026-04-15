@@ -11,7 +11,7 @@ use chrono::Utc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use simgit_sdk::{SessionInfo, SessionStatus};
+use simgit_sdk::{CommitRequestState, RpcError, SessionCommitResult, SessionCommitStatus, SessionInfo, SessionStatus};
 
 use super::db::{Db, LockRow, SessionRow};
 
@@ -186,6 +186,99 @@ impl SessionManager {
 
     pub fn list_active(&self) -> Vec<SessionInfo> {
         self.list(Some(SessionStatus::Active))
+    }
+
+    pub fn record_commit_pending(&self, session_id: Uuid, request_id: Uuid) -> Result<()> {
+        self.db.lock().unwrap().update_commit_request(
+            &session_id.to_string(),
+            &request_id.to_string(),
+            "PENDING",
+            None,
+            None,
+        )
+    }
+
+    pub fn record_commit_success(
+        &self,
+        session_id: Uuid,
+        request_id: Uuid,
+        result: &SessionCommitResult,
+    ) -> Result<()> {
+        let result_json = serde_json::to_string(result).context("serialize commit result")?;
+        self.db.lock().unwrap().update_commit_request(
+            &session_id.to_string(),
+            &request_id.to_string(),
+            "SUCCESS",
+            Some(&result_json),
+            None,
+        )
+    }
+
+    pub fn record_commit_failure(
+        &self,
+        session_id: Uuid,
+        request_id: Uuid,
+        error: &RpcError,
+    ) -> Result<()> {
+        let error_json = serde_json::to_string(error).context("serialize commit error")?;
+        self.db.lock().unwrap().update_commit_request(
+            &session_id.to_string(),
+            &request_id.to_string(),
+            "FAILED",
+            None,
+            Some(&error_json),
+        )
+    }
+
+    pub fn commit_status(&self, session_id: Uuid, request_id: Uuid) -> Result<SessionCommitStatus> {
+        let row = self.db.lock().unwrap().load_commit_request(&session_id.to_string())?;
+        let Some(row) = row else {
+            return Ok(SessionCommitStatus {
+                session_id,
+                request_id,
+                state: CommitRequestState::NotFound,
+                result: None,
+                error: None,
+            });
+        };
+
+        if row.request_id.as_deref() != Some(&request_id.to_string()) {
+            return Ok(SessionCommitStatus {
+                session_id,
+                request_id,
+                state: CommitRequestState::NotFound,
+                result: None,
+                error: None,
+            });
+        }
+
+        let state = match row.state.as_deref() {
+            Some("PENDING") => CommitRequestState::Pending,
+            Some("SUCCESS") => CommitRequestState::Success,
+            Some("FAILED") => CommitRequestState::Failed,
+            _ => CommitRequestState::NotFound,
+        };
+
+        let result = row
+            .result_json
+            .as_deref()
+            .map(serde_json::from_str::<SessionCommitResult>)
+            .transpose()
+            .context("parse stored commit result")?;
+        let error = row
+            .error_json
+            .as_deref()
+            .map(serde_json::from_str::<RpcError>)
+            .transpose()
+            .context("parse stored commit error")?;
+
+        Ok(SessionCommitStatus {
+            session_id,
+            request_id,
+            state,
+            result,
+            error,
+        })
     }
 
     // ── Lock persistence ──────────────────────────────────────────────────

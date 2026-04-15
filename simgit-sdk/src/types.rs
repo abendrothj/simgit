@@ -108,6 +108,28 @@ pub struct SessionCommitResult {
     pub telemetry: CommitTelemetry,
 }
 
+/// Durable state for an idempotent commit request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CommitRequestState {
+    Pending,
+    Success,
+    Failed,
+    NotFound,
+}
+
+/// Lookup payload for `commit.status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCommitStatus {
+    pub session_id: Uuid,
+    pub request_id: Uuid,
+    pub state: CommitRequestState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<SessionCommitResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<RpcError>,
+}
+
 // ── Merge conflicts ──────────────────────────────────────────────────────────
 
 /// Detailed operation overlap for a single conflicting path.
@@ -280,7 +302,7 @@ pub struct RpcRequest {
     pub params:  serde_json::Value,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcResponse {
     pub jsonrpc: String,
     pub id:      u64,
@@ -290,7 +312,7 @@ pub struct RpcResponse {
     pub error:   Option<RpcError>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcError {
     pub code:    i32,
     pub message: String,
@@ -305,3 +327,4 @@ pub const ERR_MERGE_CONFLICT:    i32 = -32003;
 pub const ERR_QUOTA_EXCEEDED:    i32 = -32004;
 pub const ERR_INVALID_PATH:      i32 = -32005;
 pub const ERR_DEADLINE_EXCEEDED: i32 = -32006;
+pub const ERR_COMMIT_PENDING:    i32 = -32007;
