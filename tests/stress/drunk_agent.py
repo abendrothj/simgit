@@ -85,8 +85,8 @@ class DrunkAgentProfile:
     name: str
     description: str
 
-    # Time-to-first-token: lognormal(mu, sigma)
-    ttft_mu: float = 5.4       # ln-scale mean → p50 ≈ 220 ms
+    # Time-to-first-token: lognormal(mu, sigma) where median = exp(mu)
+    ttft_mu: float = -1.51     # ln(0.22) → p50 ≈ 220 ms
     ttft_sigma: float = 0.9
 
     # Write duration: exponential(mean_secs)
@@ -116,7 +116,7 @@ _PROFILES: dict[str, DrunkAgentProfile] = {
     "fast_coder": DrunkAgentProfile(
         name="fast_coder",
         description="Fast, cheap model (GPT-4o-mini style). Low latency, small edits, rarely stalls.",
-        ttft_mu=4.8,            # p50 ≈ 120 ms
+        ttft_mu=-2.12,          # ln(0.12) → p50 ≈ 120 ms
         ttft_sigma=0.6,
         write_mean_secs=0.15,
         stall_prob=0.03,
@@ -130,7 +130,7 @@ _PROFILES: dict[str, DrunkAgentProfile] = {
     "reasoning": DrunkAgentProfile(
         name="reasoning",
         description="Heavy reasoning model (o3/DeepSeek style). Long TTFT, large outputs, frequent stalls.",
-        ttft_mu=7.0,            # p50 ≈ 1.1 s
+        ttft_mu=0.095,          # ln(1.1) → p50 ≈ 1.1 s
         ttft_sigma=1.1,
         write_mean_secs=1.5,
         stall_prob=0.30,
@@ -144,7 +144,7 @@ _PROFILES: dict[str, DrunkAgentProfile] = {
     "unstable": DrunkAgentProfile(
         name="unstable",
         description="Flaky agent (OOMed container, poor retry logic). High abandon rate, random double commits.",
-        ttft_mu=5.4,
+        ttft_mu=-1.51,          # ln(0.22) → p50 ≈ 220 ms
         ttft_sigma=0.9,
         write_mean_secs=0.3,
         stall_prob=0.15,
@@ -158,7 +158,7 @@ _PROFILES: dict[str, DrunkAgentProfile] = {
     "overthinker": DrunkAgentProfile(
         name="overthinker",
         description="Multimodal reasoning agent. Extreme write variance, multi-second stalls, large context dumps.",
-        ttft_mu=7.8,            # p50 ≈ 2.4 s
+        ttft_mu=0.875,          # ln(2.4) → p50 ≈ 2.4 s
         ttft_sigma=1.4,
         write_mean_secs=3.0,
         stall_prob=0.50,
@@ -172,7 +172,7 @@ _PROFILES: dict[str, DrunkAgentProfile] = {
     "balanced": DrunkAgentProfile(
         name="balanced",
         description="Mix-model swarm default (GPT-4-turbo style). Moderate latency and payload variance.",
-        ttft_mu=5.4,
+        ttft_mu=-1.51,          # ln(0.22) → p50 ≈ 220 ms
         ttft_sigma=0.9,
         write_mean_secs=0.3,
         stall_prob=0.10,
