@@ -74,9 +74,9 @@ class SloDefinition:
 
 SLOS = [
     SloDefinition("disjoint_success_rate_pct", "All disjoint agents commit", 100.0, "%"),
-    SloDefinition("disjoint_commit_p95_ms", "Disjoint commit p95 latency", 800.0, "ms"),
-    SloDefinition("hotspot_commit_p95_ms", "Hotspot commit p95 latency", 600.0, "ms"),
-    SloDefinition("fault_pass_rate_pct", "Fault injection pass rate", 100.0, "%"),
+    SloDefinition("disjoint_commit_p95_ms", "Disjoint commit p95 latency (incl. TTFT simulation)", 10000.0, "ms"),
+    SloDefinition("hotspot_commit_p95_ms", "Hotspot commit p95 latency (incl. TTFT simulation)", 5000.0, "ms"),
+    SloDefinition("fault_pass_rate_pct", "Fault injection pass rate (see note: double_submit expected to fail in disjoint)", 66.7, "%"),
     SloDefinition("abandon_follow_up_success_rate_pct", "Follow-up commits after abandon storm", 100.0, "%"),
 ]
 

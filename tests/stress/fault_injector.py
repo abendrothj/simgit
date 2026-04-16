@@ -550,10 +550,12 @@ def double_submit_idempotency(
 
         def _one_pair(pair_id: int) -> dict[str, Any]:
             if stress_mode == "hotspot":
-                file_path = "hotspot/shared.txt"
+                # Hotspot: both write to same path on competing branches
+                shared_path = "hotspot/shared.txt"
             else:
-                file_path = f"idempotent/pair_{pair_id}.txt"
-
+                # Disjoint: each slot writes to different path (no contention)
+                shared_path = None
+            
             content = f"pair={pair_id} ts={time.time_ns()}\n".encode()
             outcomes = []
 
@@ -566,7 +568,12 @@ def double_submit_idempotency(
                     )
                     info = s.info()
                     mp = info["mount_path"]
-                    tgt = os.path.join(mp, file_path)
+                    # In disjoint mode, each slot writes to unique path to avoid contention
+                    # In hotspot mode, both write to same path to trigger conflict detection
+                    if shared_path:
+                        tgt = os.path.join(mp, shared_path)
+                    else:
+                        tgt = os.path.join(mp, f"idempotent/pair_{pair_id}_slot_{slot}.txt")
                     os.makedirs(os.path.dirname(tgt), exist_ok=True)
                     with open(tgt, "wb") as f:
                         f.write(content)
@@ -585,12 +592,13 @@ def double_submit_idempotency(
                     outcomes.append({"ok": ok, "error": err})
 
             ok_count = sum(1 for o in outcomes if o["ok"])
-            # In hotspot mode, exactly 1 must succeed.
-            # In disjoint mode, both can succeed (separate branch per agent).
+            # In hotspot mode, exactly 1 must succeed (conflict detection).
+            # In disjoint mode, both must succeed (no contention now that paths differ).
             if stress_mode == "hotspot":
                 pair_passed = ok_count == 1
             else:
-                pair_passed = ok_count >= 1
+                pair_passed = ok_count == 2  # Both should succeed with separate paths
+
 
             return {"pair_id": pair_id, "passed": pair_passed, "outcomes": outcomes}
 
