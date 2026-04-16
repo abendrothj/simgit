@@ -65,30 +65,57 @@ maturin develop -m simgit-py/Cargo.toml
 
 If bindings cannot be imported, stress scripts will fail early.
 
-## Deterministic real-agent stress
+## Control-plane stress harness (used by CI)
 
-Script: tests/real_agent_harness.py
+Script: `tests/stress/agent_harness.py`
 
-### Example: disjoint profile
+This is the harness the nightly SLO gate (`tests/nightly-slo-gate.sh`) runs. It stress-tests session lifecycle and commit scheduling directly via Python bindings — no LLM or external API required.
+
+Two stress modes:
+
+- `disjoint-range` — agents write non-overlapping byte ranges; expects zero conflicts
+- `hotspot` — all agents write the same file; exercises conflict detection and scheduler contention
 
 ```bash
 source .venv/bin/activate
+
+# Disjoint (CI default: 60 agents)
+python3 tests/stress/agent_harness.py \
+  --agents 20 --workers 8 \
+  --stress-mode disjoint-range \
+  --report-out /tmp/simgit-disjoint.json
+
+# Hotspot
+python3 tests/stress/agent_harness.py \
+  --agents 20 --workers 8 \
+  --stress-mode hotspot \
+  --report-out /tmp/simgit-hotspot.json
+```
+
+## Real-agent harness (file writes + optional LLM)
+
+Script: `tests/real_agent_harness.py`
+
+Writes real files inside each session mount before committing, making latency and conflict numbers reflect actual VFS behavior. Can run fully deterministic (no API key) or with a live LLM backend for calibration.
+
+```bash
+source .venv/bin/activate
+
+# Deterministic (no API key needed)
 python3 tests/real_agent_harness.py \
   --agents 50 \
   --task-profile disjoint-files \
   --report-out /tmp/simgit-real-disjoint.json
-```
 
-### Example: hotspot profile
-
-```bash
-source .venv/bin/activate
+# Hotspot profile
 python3 tests/real_agent_harness.py \
   --agents 50 \
   --task-profile hotspot-file \
   --commit-barrier \
   --report-out /tmp/simgit-real-hotspot.json
 ```
+
+Set `SIMGIT_LLM_API_KEY` to enable real LLM-backed agents (see `.env.example`).
 
 ## Track 2 chaos validation
 

@@ -188,9 +188,11 @@ Three layers of test coverage are available:
 
 | Script | Purpose |
 |---|---|
-| `tests/real_agent_harness.py` | Deterministic workload baseline |
-| `tests/stress/drunk_agent.py` | Profile-based non-deterministic timing |
+| `tests/stress/agent_harness.py` | Control-plane stress — disjoint and hotspot modes; **used by CI** |
+| `tests/real_agent_harness.py` | Real file writes + optional LLM backend; latency calibration |
+| `tests/stress/drunk_agent.py` | Profile-based non-deterministic timing (TTFT, stalls, payload variance) |
 | `tests/stress/swarm_runner.py` | Fault injection + SLO gate runner |
+| `tests/stress/soak_runner.py` | Sustained-load soak with daemon RSS memory sampling |
 
 The full chaos suite (Track 2) covers disjoint commits, hotspot contention, transport interruption, abandon storms, and duplicate submit behavior. All SLO gates pass at 20+ concurrent agents. See `docs/track2_chaos_validation.md` for methodology and results.
 
