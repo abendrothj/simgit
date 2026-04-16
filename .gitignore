@@ -3,8 +3,17 @@
 # Local environment files
 .env
 
+# Python virtual environments
+.venv/
+.venv-stress/
+
 # Python cache artifacts
 __pycache__/
+*.pyc
 
 # Built extension artifacts produced in simgit-py
 simgit-py/simgit/*.abi3.so
+simgit-py/simgit/*.dylib.dSYM/
+
+# Internal planning and notes
+plan

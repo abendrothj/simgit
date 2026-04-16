@@ -1,404 +1,213 @@
-# simgit — Borrow Checker for Filesystems
+# simgit
 
-> Rust-style ownership semantics at the filesystem level for safe multi-agent coding pipelines.
+**Concurrent filesystem sessions for multi-agent coding pipelines.**
 
-## Overview
+simgit is a daemon that lets many agents work against the same repository at the same time. Each agent gets an isolated copy-on-write overlay backed by a shared baseline. Path conflicts are detected and reported at commit time. Non-conflicting branches commit in parallel.
 
-**simgit** solves concurrency and isolation in multi-agent coding environments by implementing exclusive-write, shared-read semantics on file paths—like a Rust borrow checker for disk I/O.
+## Run many agents on many branches — simultaneously
 
-Instead of each agent needing its own git worktree copy of the entire repository:
-- **One shared read-only view** of HEAD (zero extra disk space)
-- **Per-agent delta layers** (Copy-on-Write) that capture mutations
-- **Borrow registry** that enforces write exclusivity at session creation time
-- **Atomic flatten** to merge deltas into a new git branch
+The primary use case: three agents, three feature branches, one repository, zero coordination overhead.
 
-## Quick Start
+```python
+import simgit
+import asyncio
 
-### Starting the daemon
+async def run_agent(task_id, branch, label):
+    session = simgit.Session.new(
+        task_id=task_id,
+        socket_path="/tmp/simgit-dev/control.sock",
+        agent_label=label,
+    )
+    mount = session.info()["mount_path"]
 
-```bash
-# Ensure your working repo is initialized
-cd /path/to/repo
-simgitd start
+    # Agent writes files under its private mount — fully isolated
+    # from every other agent's changes
 
-# Or with explicit config:
-simgitd start --repo-path . --mount-dir /vdev --port 9999
+    return session.commit(branch_name=branch, message=f"{label} complete")
+
+async def main():
+    results = await asyncio.gather(
+        run_agent("task-auth",  "feat/auth-refactor",  "agent-1"),
+        run_agent("task-api",   "feat/api-v2",         "agent-2"),
+        run_agent("task-ui",    "feat/ui-components",  "agent-3"),
+    )
 ```
 
-### Creating a session
+Each agent reads from the shared repository baseline and writes to its own overlay. Non-overlapping branches commit in parallel. Overlapping paths are caught at commit time with full context — no corruption, no silent data loss.
 
-```bash
-# Create a new session (returns session UUID)
-sg new --task "implement-feature-x"
+Works with Claude Code agents, custom orchestrators, or any tool that can write files to a path.
 
-# Your app can then mount /vdev/<session-id> and read/write normally.
-# All writes are captured in the delta layer.
+## Why simgit exists
 
-# Check status
-sg status <session-id>
+Classic multi-agent pipelines usually choose one of two expensive options:
 
-# Commit changes to a new branch
-sg commit <session-id> --branch feature-x --message "Added feature X"
+- **One full git worktree per agent** — high disk and I/O overhead that scales poorly
+- **Shared checkout without write isolation** — race-prone, produces corrupted or lost changes
 
-# Or abort (discard all changes)
-sg abort <session-id>
-```
+simgit targets a third design point:
 
-## Observability
+| Property | How simgit achieves it |
+|---|---|
+| Shared reads | All agents read from one repository baseline |
+| Isolated writes | Per-session copy-on-write overlays |
+| Conflict safety | Borrow-checker style exclusivity at commit time |
+| Observability | Structured conflict payloads, commit telemetry, Prometheus metrics |
 
-simgitd can expose Prometheus metrics over an embedded HTTP endpoint.
+## Features
 
-```bash
-# Enabled by default
-export SIMGIT_METRICS_ENABLED=1
-export SIMGIT_METRICS_ADDR=127.0.0.1:9100
-simgitd
-
-# Scrape endpoint
-curl -s http://127.0.0.1:9100/metrics
-```
-
-Current metrics include:
-- RPC request volume (`simgit_rpc_requests_total`) and latency (`simgit_rpc_duration_seconds`)
-- Session lifecycle counters (`simgit_session_creates_total`, `simgit_session_commits_total`, `simgit_session_aborts_total`)
-- Lock conflict counter (`simgit_lock_conflicts_total`)
-- Active gauges (`simgit_active_sessions`, `simgit_active_locks`)
-- Commit-path stage latency histogram (`simgit_session_commit_stage_duration_seconds{stage=...}`)
-- Commit conflict counter by kind (`simgit_session_commit_conflicts_total{kind=...}`)
-- Conflict cardinality histograms (`simgit_session_commit_conflict_paths`, `simgit_session_commit_conflict_peers`)
-
-Latest validated baseline (50-agent deterministic real-agent harness) shows:
-- disjoint: `50/50` success, `0` conflicts, commit p95 `529ms`
-- hotspot: `50/50` success, `0` conflicts, commit p95 `415ms`
-- sharded-hotspot: `50/50` success, `0` conflicts, commit p95 `553ms`
-
-Flatten now runs on a pure `gix` write path (blob/tree/commit/ref update), and path-level
-commit scheduling serializes overlapping writes without dropping commits.
-
-Optional OTLP tracing export (gRPC) is enabled by setting:
-
-```bash
-export SIMGIT_OTLP_ENDPOINT=http://127.0.0.1:4317
-```
-
-For a local dev/test setup with daemon + Prometheus, use the container profile:
-
-```bash
-cd deploy/dev
-docker compose up --build
-```
+- **Session lifecycle** — create, diff, commit, abort, status, garbage collection
+- **Path-level conflict detection** — overlap-aware commit scheduling with structured conflict payloads
+- **Commit telemetry** — per-stage breakdowns and scheduler queue-wait timing
+- **Deadline and idempotency semantics** — safe retry behavior under transport ambiguity
+- **Prometheus metrics** — full session, lock, and commit counter/histogram coverage
+- **OTLP tracing** — optional distributed trace export for orchestrator-level visibility
+- **Python bindings** — PyO3-backed, works with asyncio orchestrators
+- **Rust SDK** — async JSON-RPC client with typed request/response models
+- **`sg` CLI** — interactive session management and inspection
+- **Chaos-validated** — SLO gate suite covering disjoint commits, hotspot contention, transport faults, and abandon storms
 
 ## Architecture
 
+```text
+Agent runner / CLI / SDK
+          │
+          ▼
+  JSON-RPC over Unix socket
+          │
+          ▼
+       simgitd
+   ├── session manager
+   ├── borrow registry
+   ├── delta store
+   ├── commit scheduler
+   ├── git flatten path (gix)
+   ├── metrics + tracing
+   └── VFS backend abstraction
 ```
-Agent → /vdev/<session-id>/ → FUSE/NFS Mount → simgitd daemon
-                                               ├── VFS Router
-                                               ├── Borrow Registry
-                                               ├── Delta Store
-                                               └── Git Integration
-```
 
-- **VFS Mount** (FUSE on Linux; NFS-loopback stub on macOS): Git tree baseline with session delta CoW overlay
-- **Borrow Registry**: Tracks { path → (readers[], writer?) }, enforces write-exclusivity
-- **Delta Store**: Content-addressed delta blobs per session
-- **Session DB**: SQLite table { session_id, task_id, status, locks, delta_refs }
-- **Git Integration**: Serves blobs from HEAD; flattens deltas to branches
+**Core guarantees:**
 
-## Design Decisions (ADR-001)
+- Single-writer safety per conflicting path region at commit time
+- Session isolation until commit finalization
+- Idempotent commit resolution under ambiguous transport outcomes
+- Explicit terminal states for all commit requests (pending → success | failed)
 
-- **Platform**: Both Linux (FUSE) and macOS (NFS-loopback) from day one
-- **Write Granularity**: Path-level lock ownership with range-aware commit conflict checks for write/write overlaps when byte offsets are available
-- **Conflict Resolution**: Auto three-way merge; block on true conflicts
-- **Peer Visibility**: Optional per-session (`--peers` flag) — agents see in-flight changes from siblings
-- **Git Backend**: `gitoxide` (pure Rust, no C dependencies)
-- **Daemon Model**: User-scoped instances (one daemon per user per machine)
-- **SDK**: Rust + Python; CLI wraps daemon via JSON-RPC 2.0 over Unix socket
+## Repository layout
 
-## File Structure
-
-```
+```text
 simgit/
-├── plan                          # Engineering plan + ADRs
-├── README.md                     # This file
-├── Cargo.toml                    # Workspace manifest
-│
-├── simgit-sdk/                   # Public SDK (types, client, errors)
-│   └── src/
-│       ├── lib.rs               # Module re-exports
-│       ├── types.rs             # SessionInfo, LockInfo, etc.
-│       ├── error.rs             # BorrowError, RpcError codes
-│       └── client.rs            # Async JSON-RPC client
-│
-├── simgit-py/                    # Python bindings package (PyO3 + maturin)
-│   ├── pyproject.toml           # Python packaging metadata
-│   ├── README.md                # Build/publish instructions
-│   ├── simgit/__init__.py       # Python package entry
-│   └── src/lib.rs               # PyO3 bindings for Session/Client
-│
-├── simgitd/                      # Main daemon
-│   └── src/
-│       ├── main.rs              # Entry point
-│       ├── config.rs            # Config loading (TOML + env)
-│       ├── daemon.rs            # Daemon loop + signal handling
-│       ├── borrow/              # Borrow registry
-│       │   ├── mod.rs
-│       │   ├── registry.rs      # Exclusive write enforcement
-│       │   └── ttl_sweeper.rs   # Release stale locks (30s timeout)
-│       ├── delta/               # Delta store
-│       │   ├── mod.rs
-│       │   ├── store.rs         # Content-addressed blob storage
-│       │   └── flatten.rs       # Convert delta → git branch
-│       ├── session/             # Session lifecycle
-│       │   ├── mod.rs
-│       │   ├── db.rs            # SQLite persistence
-│       │   ├── manager.rs       # Session creation/cleanup
-│       │   └── recovery.rs      # Crash recovery
-│       ├── rpc/                 # JSON-RPC 2.0 server
-│       │   ├── mod.rs
-│       │   ├── server.rs        # Unix socket listener
-│       │   └── methods.rs       # RPC method handlers
-│       ├── vfs/                 # VFS abstraction layer
-│       │   ├── mod.rs           # VfsManager backend selector
-│       │   ├── fuse_backend.rs  # FUSE implementation (Linux)
-│       │   ├── nfs_backend.rs   # NFS stub (macOS)
-│       │   └── git_resolver.rs  # Git tree traversal + caches
-│       └── events/              # Pub/sub event broker
-│           └── mod.rs           # lock_conflict, peer_commit events
-│
-├── sg/                           # CLI tool
-│   └── src/
-│       ├── main.rs              # Entry + subcommand dispatch
-│       └── commands/            # Subcommands
-│           ├── new.rs           # Create session
-│           ├── commit.rs        # Flatten & merge
-│           ├── abort.rs         # Discard session
-│           ├── status.rs        # Show session state
-│           ├── diff.rs          # Diff session vs HEAD
-│           ├── lock.rs          # List/wait on locks
-│           ├── peer.rs          # Peer commands (`peer ls`, `peer diff`)
-│           ├── gc.rs            # Garbage collect
-│           └── daemon.rs        # Daemon control
-│
-├── spike/                        # Phase 0 validation spikes
-│   ├── git_reader/              # gix blob/tree reading
-│   ├── overlay_test/            # CoW overlay simulation
-│
-├── deploy/                       # Runtime service definitions
-│   ├── systemd/simgitd.service  # Linux user service unit
-│   └── launchd/com.simgit.simgitd.plist # macOS launch agent
-│   └── fuse_passthrough/        # FUSE mount validation
-│
-└── tests/                        # Integration tests (Phase 1+)
-    ├── session_lifecycle.rs
-    ├── borrow_checker.rs
-    ├── delta_store.rs
-    ├── e2e_multi_agent.rs
-    └── stress/
-        ├── agent_harness.py      # legacy mock stress harness
-        └── real_agent_harness.py # deterministic/LLM real-agent stress harness
+├── simgitd/          daemon implementation
+├── simgit-sdk/       Rust SDK (JSON-RPC client + shared types)
+├── simgit-py/        Python bindings (PyO3)
+├── sg/               command-line interface
+├── tests/            Rust integration tests + Python stress tools
+├── docs/             integration and operational documentation
+├── deploy/           local observability/dev deployment profiles
+└── spike/            focused technical spikes and prototypes
 ```
 
-## Testing Strategy
+## Quick start
 
-### Unit Tests (in each module)
+### 1. Build
 
 ```bash
-# Borrow registry: exclusive write enforcement
-cargo test -p simgitd borrow::registry::tests
-
-# Delta store: content integrity
-cargo test -p simgitd delta::store::tests
-
-# Session manager: CRUD + crash recovery
-cargo test -p simgitd session::manager::tests
-
-# RPC methods: error handling + edge cases
-cargo test -p simgitd rpc::methods::tests
+cargo build --workspace
 ```
 
-### Integration Tests
+### 2. Start the daemon
 
 ```bash
-# Full session lifecycle: create → write → commit → verify
-cargo test --test session_lifecycle
+export SIMGIT_REPO=$(pwd)
+export SIMGIT_STATE_DIR=/tmp/simgit-dev
+mkdir -p "$SIMGIT_STATE_DIR"
 
-# Multi-agent concurrency: 5 agents, overlapping paths
-cargo test --test e2e_multi_agent
+./target/debug/simgitd
 ```
 
-### Running All Tests
+The control socket is created at `/tmp/simgit-dev/control.sock`.
+
+### 3. Create and use a session
+
+`sg` is the simgit CLI. In a second shell:
 
 ```bash
-cargo test --workspace
+export SIMGIT_SOCKET=/tmp/simgit-dev/control.sock
+
+sg new --task "demo-task" --label "agent-1"
+# write files under the printed mount path, then:
+
+sg status
+sg diff --session <session-uuid>
+sg commit --session <session-uuid> --branch feat/demo --message "demo"
 ```
 
-### Stress Benchmark (50 agents)
+### 4. Run multiple agents in parallel
 
 ```bash
-# build daemon once
-cargo build -p simgitd
-
-# start disposable daemon instance
-rm -rf /tmp/simgit-bench-state && mkdir -p /tmp/simgit-bench-state
-cd /tmp/simgit-disposable-repo
-SIMGIT_REPO=/tmp/simgit-disposable-repo \
-SIMGIT_STATE_DIR=/tmp/simgit-bench-state \
-/Users/ja/Desktop/projects/simgit/target/debug/simgitd
-
-# run stress harness from workspace root
-cd /Users/ja/Desktop/projects/simgit
 source .venv/bin/activate
-python tests/stress/agent_harness.py \
-    --agents 50 --workers 50 --mode commit \
-    --overlap-path hotspot/shared.txt --two-phase-barrier \
-    --socket /tmp/simgit-bench-state/control.sock --json
+python3 tests/real_agent_harness.py --agents 5 --task-profile disjoint-files
 ```
 
-## Development Workflow
+Each agent gets its own session and commits to its own branch. Use `--task-profile hotspot-file` to observe conflict detection under contention.
 
-### Phase 0: ✅ Complete
-- Workspace scaffold
-- Core types + error codes
-- VFS abstraction (FUSE + NFS stubs)
-- Borrow registry (implemented)
-- Delta store (implemented)
-- Session DB (implemented)
-- RPC server (implemented)
-- CLI (implemented)
-- **Validation spikes**: git_reader ✓, overlay_test ✓, fuse_passthrough ✓
+## Observability
 
-### Phase 1: Read-Only VFS (3 weeks)
-- Git tree traversal via gix
-- Directory listing (merge git tree + delta additions)
-- File attribute serving
-- Inode caching + LRU eviction
-- Read-only blob serving from git
-- Status: ✅ Completed
-
-### Phase 2: Session Delta Store (2 weeks)
-- Write capture (delta layer)
-- Manifest tracking (deletes, renames, writes)
-- Content-addressed blob storage
-- Atomic write-then-rename
-- Status: ✅ Completed (code + macOS NFS validation + Linux tests prepared)
-- Implementation highlights:
-    - Existing-file `write` interception into session delta blobs
-    - `create` interception for new files into session delta blobs
-    - `unlink` and `rename` capture via delta manifest tombstones/renames
-    - Tombstone-aware visibility in `lookup`, `readdir`, `getattr`, `open`, and `read`
-    - Crash-recovery persistence tests for session metadata and delta directories
-    - ACTIVE session mount re-attachment regression via NFS-loopback backend
-    - Linux FUSE integration harness added for create/unlink/rename and remount flows
-    - Delta-aware metadata updates for file size in `getattr`
-- Phase 2 Linux FUSE tests:
-    - `fuse_mount_roundtrip_create_unlink_rename` — Tests create/write/rename/unlink operations
-    - `fuse_mount_can_remount_same_session_path` — Tests mount/unmount/remount idempotency
-    - Status: Harness and CI wiring are in place (`.github/workflows/fuse-linux-integration.yml`); first Linux green run is still pending
-
-### Phase 3: Borrow Checker (2 weeks)
-- Lock acquisition at session creation
-- TTL-based lock release (30s)
-- Conflict detection + reporting
-- Conflict queue (block until resolved)
-- Status: ✅ Completed (core lock/conflict semantics)
-- Implemented highlights:
-    - session-aware `lock.wait` conflict context
-    - structured conflict payload via `lock.acquire` RPC
-
-### Phase 4: Flatten & Merge (2 weeks)
-- Convert delta → git tree/blob objects (pure `gix` path)
-- Auto three-way merge (pending)
-- Create commit + update branch
-- Error handling (merge conflicts)
-- Status: ✅ Completed (gix-only flatten + path scheduler validated)
-- Implementation highlights:
-    - pre-commit overlap detection across active sessions in `session.commit`
-    - multi-session commit tests for overlap-block and non-overlap success
-    - per-path conflict operation reporting (`ours_ops` / `peer_ops`) in overlap payloads
-    - structured flatten failure taxonomy (`missing_delta_blob`, `git_conflict`, `git_operation_failed`, `filesystem_io`)
-    - Range-aware conflict detection: byte-range support for write/write overlap detection
-    - Commit latency metrics: per-stage histogram (capture_self, capture_peers, conflict_scan, flatten)
-    - Conflict cardinality reporting: per-session and per-peer counts
-    - Path-level commit scheduler (`SIMGIT_COMMIT_WAIT_SECS`) serializes overlapping commits by changed path while preserving disjoint parallelism
-    - Flatten engine migrated to gix-only write path (legacy CLI worktree path removed)
-    - Verified deterministic stress (50 agents): disjoint/hotspot/sharded all reached 100% success, 0 conflicts
-
-### Active Todo (1-3)
-1. Promote gix-only flatten + 50-agent deterministic stress into nightly SLO automation.
-2. Add Prometheus stage breakdown export for real-agent harness runs (queue wait vs flatten stages).
-3. Extend real-agent regression set with mixed-profile LLM runs and branch integrity checks.
-
-### Phase 5: CLI & SDK (1 week)
-- All 9 `sg` subcommands
-- Rust SDK (for embedders)
-- Python SDK (for agents that don't link Rust)
-- Status: 🚧 In progress
-- Implemented highlights:
-    - workspace includes initial `simgit-py` PyO3 bindings crate
-    - Python API scaffold exposes `Client` + `Session.new/commit/abort/diff`
-    - Python packaging/publish flow wired with `maturin` (`simgit-py/pyproject.toml`)
-    - agent integration guide and 50-agent stress harness scaffold (`docs/agent_integration.md`, `tests/stress/agent_harness.py`)
-
-### Phase 6: Peer Visibility (1 week)
-- Opt-in `--peers` flag (show in-flight changes)
-- Event broadcasts (lock_acquired, peer_commit)
-- Eventual consistency model
-- Status: ✅ Completed
-- Implemented highlights:
-    - `sg peer diff <session-id>` for inspecting in-flight peer deltas
-    - `event.list` RPC + `sg peer events` for polling recent broker events
-    - `event.subscribe` RPC + `sg peer events --stream` for long-poll event streaming
-    - read-only peer snapshot VFS namespace at `.simgit/peers/<session-id>/` (FUSE backend)
-
-### Phase 7: Performance & Polish (2 weeks)
-- Persistent LRU blob cache
-- Parallel multi-path reads
-- Benchmark + profile
-- Documentation + README
-- Implemented highlights:
-    - packaging artifacts for daemon service management on Linux/macOS (`deploy/systemd/simgitd.service`, `deploy/launchd/com.simgit.simgitd.plist`)
-    - Linux FUSE integration CI workflow (`.github/workflows/fuse-linux-integration.yml`, manual + nightly)
-
-## Building & Running Tests
+### Prometheus
 
 ```bash
-# Build everything
-cargo build
+export SIMGIT_METRICS_ENABLED=1
+export SIMGIT_METRICS_ADDR=127.0.0.1:9100
+./target/debug/simgitd
 
-# Run all unit+integration tests
-cargo test --workspace
-
-# Run a specific test
-cargo test borrow::registry::test_exclusive_write
-
-# Run with logging
-RUST_LOG=debug cargo test -- --nocapture
-
-# Run single-threaded (for debugging)
-cargo test -- --test-threads=1 --nocapture
+curl -s http://127.0.0.1:9100/metrics | head
 ```
 
-## Security & Isolation
+Key series:
 
-- **Borrow Locks**: Enforced on mutating file ops (`write`, `unlink`, `rename`) to prevent data races
-- **Delta Isolation**: Each session's writes are private until flatten
-- **Unix Socket ACL**: RPC socket is mode 0600 (user-only)
-- **Session Expiry**: 30-second TTL on locks; cleanup on daemon restart
-- **Path Canonicalization**: Prevent directory traversal via symlinks
+| Metric | Description |
+|---|---|
+| `simgit_rpc_requests_total` | RPC call volume by method |
+| `simgit_rpc_duration_seconds` | RPC latency histogram |
+| `simgit_active_sessions` | Live session count |
+| `simgit_active_locks` | Active borrow locks |
+| `simgit_session_commit_stage_duration_seconds` | Per-stage commit latency |
+| `simgit_session_commit_conflicts_total` | Conflict event count |
+| `simgit_session_commit_conflict_paths` | Conflicting paths per event |
+| `simgit_session_commit_conflict_peers` | Peer sessions involved in conflicts |
 
-## Future Work (Post-Phase 7)
+### Tracing (OTLP)
 
-- **Byte-range lock acquisition API** (explicit lock primitives to complement current range-aware commit conflict detection)
-- **NFS real implementation** (full NFSv3 XDR server for macOS)
-- **Network daemon** (daemon runs on central server, agents mount via TCP NFS)
-- **Git-native format** (store deltas as git patches for better review UX)
-- **CI integration** (trigger automated evals on flatten)
+```bash
+export SIMGIT_OTLP_ENDPOINT=http://127.0.0.1:4317
+./target/debug/simgitd
+```
 
-## Contributing
+## Testing and validation
 
-Tests + docs required for all PRs. Run `cargo test --workspace && cargo doc --no-deps --open` before submitting.
+Three layers of test coverage are available:
 
-Linux-specific FUSE mount integration tests are wired in CI via `Linux FUSE Integration` workflow.
+| Script | Purpose |
+|---|---|
+| `tests/real_agent_harness.py` | Deterministic workload baseline |
+| `tests/stress/drunk_agent.py` | Profile-based non-deterministic timing |
+| `tests/stress/swarm_runner.py` | Fault injection + SLO gate runner |
+
+The full chaos suite (Track 2) covers disjoint commits, hotspot contention, transport interruption, abandon storms, and duplicate submit behavior. All SLO gates pass at 20+ concurrent agents. See `docs/track2_chaos_validation.md` for methodology and results.
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [`docs/agent_integration.md`](docs/agent_integration.md) | Concurrent workflow patterns, SDK usage, retries, deadlines, idempotency |
+| [`TESTING.md`](TESTING.md) | Unit, integration, and stress test execution guide |
+| [`docs/track2_chaos_validation.md`](docs/track2_chaos_validation.md) | Chaos run methodology, SLO definitions, and outcomes |
+
+## Security notes
+
+- Run stress tests against disposable repositories only — commits are real and irreversible.
+- Set explicit timeout/deadline policies for commit-heavy orchestrators.
+- Treat commit retries as semantic operations, not transparent transport retries.
+- Apply queue-aware backoff when `scheduler_queue_wait_ms` rises under contention.
 
 ## License
 
