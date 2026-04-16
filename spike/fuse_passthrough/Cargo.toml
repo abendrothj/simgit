@@ -2,6 +2,7 @@
 name    = "fuse_passthrough"
 version.workspace = true
 edition.workspace = true
+publish = false
 
 [[bin]]
 name = "fuse_passthrough"

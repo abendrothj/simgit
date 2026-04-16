@@ -1,5 +1,5 @@
 [package]
-name        = "sg"
+name        = "simgit-cli"
 description = "simgit CLI — session management and borrow status"
 version.workspace     = true
 edition.workspace     = true
