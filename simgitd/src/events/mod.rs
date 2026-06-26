@@ -158,6 +158,7 @@ impl EventBroker {
 #[cfg(test)]
 mod tests {
     use super::EventBroker;
+    use std::time::Duration;
     use uuid::Uuid;
 
     #[test]
@@ -178,5 +179,162 @@ mod tests {
         let s1_only = broker.recent(Some(s1), 10);
         assert_eq!(s1_only.len(), 2);
         assert!(s1_only.iter().all(|e| e.source_session == s1));
+    }
+
+    #[tokio::test]
+    async fn global_subscriber_receives_all_published_events() {
+        let broker = EventBroker::new();
+        let s1 = Uuid::now_v7();
+        let mut rx = broker.subscribe_global();
+
+        broker.publish(s1, "peer_commit", serde_json::json!({"branch": "feat/x"}));
+        broker.publish(s1, "lock_acquired", serde_json::json!({"path": "b.txt"}));
+
+        let e1 = rx.recv().await.expect("first event");
+        assert_eq!(e1.kind, "peer_commit");
+        assert_eq!(e1.source_session, s1);
+
+        let e2 = rx.recv().await.expect("second event");
+        assert_eq!(e2.kind, "lock_acquired");
+    }
+
+    #[tokio::test]
+    async fn session_subscriber_receives_events_from_that_session_only() {
+        let broker = EventBroker::new();
+        let s1 = Uuid::now_v7();
+        let s2 = Uuid::now_v7();
+        let mut rx = broker.subscribe_session(s1);
+
+        broker.publish(s1, "session1_event", serde_json::json!({}));
+        broker.publish(s2, "session2_event", serde_json::json!({}));
+        broker.publish(s1, "session1_again", serde_json::json!({}));
+
+        let e1 = rx.recv().await.expect("first event");
+        assert_eq!(e1.kind, "session1_event");
+        assert_eq!(e1.source_session, s1);
+
+        let e2 = rx.recv().await.expect("second event");
+        assert_eq!(e2.kind, "session1_again");
+        assert_eq!(e2.source_session, s1);
+    }
+
+    #[tokio::test]
+    async fn global_subscriber_receives_same_event_as_session_subscriber() {
+        let broker = EventBroker::new();
+        let s1 = Uuid::now_v7();
+        let mut global_rx = broker.subscribe_global();
+        let mut session_rx = broker.subscribe_session(s1);
+
+        broker.publish(s1, "confirm_delivery", serde_json::json!({"seq": 1}));
+
+        let global_event = global_rx.recv().await.expect("global should receive");
+        let session_event = session_rx.recv().await.expect("session should receive");
+        assert_eq!(global_event.kind, "confirm_delivery");
+        assert_eq!(session_event.kind, "confirm_delivery");
+        assert_eq!(global_event.emitted_at, session_event.emitted_at,
+            "global and session subscribers should see the same event timestamp");
+    }
+
+    #[tokio::test]
+    async fn multiple_subscribers_all_receive_each_event() {
+        let broker = EventBroker::new();
+        let s1 = Uuid::now_v7();
+        let mut rx1 = broker.subscribe_global();
+        let mut rx2 = broker.subscribe_global();
+        let mut rx3 = broker.subscribe_global();
+
+        broker.publish(s1, "broadcast_test", serde_json::json!({"n": 42}));
+
+        for (i, rx) in [&mut rx1, &mut rx2, &mut rx3].iter_mut().enumerate() {
+            let event = rx.recv().await.map_err(|_| format!("subscriber {i} failed"));
+            let event = event.expect("all subscribers should receive the event");
+            assert_eq!(event.kind, "broadcast_test");
+        }
+    }
+
+    #[tokio::test]
+    async fn published_events_are_recorded_in_history_regardless_of_subscribers() {
+        let broker = EventBroker::new();
+        let s1 = Uuid::now_v7();
+
+        broker.publish(s1, "evt1", serde_json::json!({"id": 1}));
+        broker.publish(s1, "evt2", serde_json::json!({"id": 2}));
+        broker.publish(s1, "evt3", serde_json::json!({"id": 3}));
+
+        let recent = broker.recent(None, 10);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].kind, "evt1");
+        assert_eq!(recent[2].kind, "evt3");
+    }
+
+    #[test]
+    fn history_capacity_drops_oldest_events() {
+        let broker = EventBroker::new();
+        let s1 = Uuid::now_v7();
+
+        // Publish more events than the history capacity (256).
+        for i in 0..300 {
+            broker.publish(s1, "evt", serde_json::json!({"idx": i}));
+        }
+
+        let recent = broker.recent(None, 500);
+        assert_eq!(recent.len(), 256, "history should be capped at capacity");
+
+        // The first event (idx 0) should have been dropped; the first retained
+        // should be idx 44 = 300 - 256.
+        let first_idx = recent[0].payload["idx"].as_u64().expect("idx field");
+        assert_eq!(first_idx, 44, "oldest retained event should be at index 300-256");
+    }
+
+    #[test]
+    fn recent_limit_respects_cap() {
+        let broker = EventBroker::new();
+        let s1 = Uuid::now_v7();
+
+        for i in 0..50 {
+            broker.publish(s1, "evt", serde_json::json!({"idx": i}));
+        }
+
+        let subset = broker.recent(None, 10);
+        assert_eq!(subset.len(), 10);
+        assert_eq!(subset[0].payload["idx"], serde_json::json!(40));
+        assert_eq!(subset[9].payload["idx"], serde_json::json!(49));
+    }
+
+    #[tokio::test]
+    async fn publish_without_active_subscribers_does_not_panic() {
+        let broker = EventBroker::new();
+        let s1 = Uuid::now_v7();
+
+        // No subscribers for this session yet — should be a no-op.
+        broker.publish(s1, "lonely_event", serde_json::json!({}));
+
+        // Subscribe after publish — should receive nothing (no replay).
+        let mut rx = broker.subscribe_global();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Publish a new event and verify it arrives.
+        broker.publish(s1, "new_event", serde_json::json!({}));
+        let event = rx.recv().await.expect("subsequent event should be received");
+        assert_eq!(event.kind, "new_event");
+    }
+
+    #[tokio::test]
+    async fn dropped_subscriber_does_not_block_publish() {
+        let broker = EventBroker::new();
+        let s1 = Uuid::now_v7();
+
+        // Subscribe and immediately drop the receiver.
+        let rx = broker.subscribe_global();
+        drop(rx);
+
+        // Publish must still succeed (broadcast handles lagged/closed receivers).
+        broker.publish(s1, "after_drop", serde_json::json!({}));
+
+        // A second subscriber should still receive events normally.
+        let mut rx2 = broker.subscribe_global();
+        broker.publish(s1, "post_drop", serde_json::json!({}));
+        let event = rx2.recv().await.expect("second subscriber should receive");
+        assert_eq!(event.kind, "post_drop");
     }
 }
