@@ -256,8 +256,9 @@ pub async fn run(cfg: Config) -> Result<()> {
         }
     }
 
-    // Start TTL sweeper.
-    crate::borrow::ttl_sweeper::spawn(Arc::clone(&state.borrows));
+    // Start TTL sweeper with graceful-shutdown signal.
+    let (sweeper_shutdown_tx, sweeper_shutdown_rx) = tokio::sync::watch::channel(false);
+    crate::borrow::ttl_sweeper::spawn(Arc::clone(&state.borrows), sweeper_shutdown_rx);
 
     // Start RPC server.
     let rpc = RpcServer::new(state.clone());
@@ -287,6 +288,9 @@ pub async fn run(cfg: Config) -> Result<()> {
             Ok::<(), std::io::Error>(())
         } => { info!("received SIGTERM, shutting down"); }
     }
+
+    // Signal TTL sweeper to stop before unmounting (avoid races).
+    let _ = sweeper_shutdown_tx.send(true);
 
     // Graceful shutdown: unmount all active sessions.
     state.vfs.unmount_all().await;
