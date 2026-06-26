@@ -181,7 +181,14 @@ async fn session_commit(state: &Arc<AppState>, p: serde_json::Value) -> Result<s
             join_set.spawn_blocking(move || {
                 let queue_wait = queued_at.elapsed();
                 let started = std::time::Instant::now();
-                state_clone.vfs.capture_mount_delta(&peer_clone).ok();
+                if let Err(e) = state_clone.vfs.capture_mount_delta(&peer_clone) {
+                    tracing::warn!(
+                        peer_session = %peer_clone.session_id,
+                        peer_task   = %peer_clone.task_id,
+                        error       = %e,
+                        "failed to capture delta for peer session during commit"
+                    );
+                }
                 (queue_wait, started.elapsed())
             });
         }
