@@ -114,6 +114,30 @@ pub struct Config {
     pub commit_wait_secs: u64,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        let vfs_backend = if cfg!(target_os = "macos") {
+            VfsBackend::NfsLoopback
+        } else {
+            VfsBackend::Fuse
+        };
+        Self {
+            repo_path: PathBuf::from("."),
+            state_dir: PathBuf::default(),
+            mnt_dir: PathBuf::default(),
+            max_sessions: 256,
+            max_delta_bytes: 2 * 1024 * 1024 * 1024,
+            lock_ttl_seconds: 3600,
+            session_recovery_ttl_seconds: 86400,
+            vfs_backend,
+            metrics_enabled: true,
+            metrics_addr: "127.0.0.1:9100".to_owned(),
+            commit_peer_capture_concurrency: 8,
+            commit_wait_secs: 30,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VfsBackend {
     /// FUSE (Linux primary).
