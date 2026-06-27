@@ -17,4 +17,3 @@ uuid.workspace        = true
 chrono.workspace      = true
 anyhow.workspace      = true
 thiserror.workspace   = true
-libc.workspace        = true

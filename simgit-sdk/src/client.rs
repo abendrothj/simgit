@@ -89,18 +89,34 @@ enum CommitAttemptError {
     Response(SdkError),
 }
 
-/// Default socket path: `$XDG_RUNTIME_DIR/simgit/control.sock`
-/// Falls back to `/tmp/simgit-<uid>/control.sock`.
+/// Default socket path: `<state_dir>/control.sock`
+///
+/// The state directory is resolved in the same priority order as the daemon's
+/// `config.rs::default_state_dir()` so that the CLI and daemon agree on where
+/// the control socket lives:
+///
+/// 1. `$SIMGIT_STATE_DIR/control.sock` — explicit override via env var
+/// 2. `$XDG_STATE_HOME/simgit/control.sock` — XDG base directory convention
+/// 3. `$HOME/.local/state/simgit/control.sock` — traditional fallback
+/// 4. `/tmp/simgit/control.sock` — catch-all fallback
 pub fn default_socket_path() -> PathBuf {
-    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("simgit").join("control.sock");
+    if let Ok(dir) = std::env::var("SIMGIT_STATE_DIR") {
+        return PathBuf::from(dir).join("control.sock");
     }
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/simgit-{uid}/control.sock"))
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(xdg).join("simgit").join("control.sock");
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    if !home.is_empty() {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("simgit")
+            .join("control.sock");
+    }
+    PathBuf::from("/tmp/simgit/control.sock")
 }
 
-// Re-export libc just for the uid call above — not part of the public API.
-extern crate libc;
 
 /// Stateless client; each method opens a fresh socket connection.
 /// For high-frequency call sites, consider wrapping in a connection pool.
