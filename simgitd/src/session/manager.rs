@@ -86,28 +86,40 @@ impl SessionManager {
         peers:        bool,
         max_sessions: usize,
     ) -> Result<SessionInfo> {
-        // Enforce max-sessions limit.
-        let active_count = {
-            let cache = self.cache.lock().unwrap();
-            cache.values().filter(|s| s.status == SessionStatus::Active).count()
-        };
-        if active_count >= max_sessions {
-            bail!("max sessions ({max_sessions}) reached; cannot create a new session");
-        }
-
         let session_id = Uuid::now_v7();
         let created_at = Utc::now();
 
-        let info = SessionInfo {
-            session_id,
-            task_id:      task_id.clone(),
-            agent_label:  agent_label.clone(),
-            base_commit:  base_commit.clone(),
-            created_at,
-            status:       SessionStatus::Active,
-            mount_path:   mount_path.clone(),
-            branch_name:  None,
-            peers_enabled: peers,
+        // Hold the cache lock across the max-sessions check AND the insert
+        // to prevent a TOCTOU race where concurrent creates both see the
+        // same pre-insertion count and both proceed past the limit.
+        //
+        // The cache lock is released before the DB write to maintain the
+        // lock ordering (DB is acquired after cache) that other methods
+        // such as update_status() rely on.
+        let info = {
+            let mut cache = self.cache.lock().unwrap();
+            let active_count = cache
+                .values()
+                .filter(|s| s.status == SessionStatus::Active)
+                .count();
+            if active_count >= max_sessions {
+                bail!("max sessions ({max_sessions}) reached; cannot create a new session");
+            }
+
+            let info = SessionInfo {
+                session_id,
+                task_id: task_id.clone(),
+                agent_label: agent_label.clone(),
+                base_commit: base_commit.clone(),
+                created_at,
+                status: SessionStatus::Active,
+                mount_path: mount_path.clone(),
+                branch_name: None,
+                peers_enabled: peers,
+            };
+
+            cache.insert(session_id, info.clone());
+            info
         };
 
         self.db.lock().unwrap().upsert_session(
@@ -122,7 +134,6 @@ impl SessionManager {
             peers,
         )?;
 
-        self.cache.lock().unwrap().insert(session_id, info.clone());
         info!(id = %session_id, task = %task_id, "session created");
         Ok(info)
     }
