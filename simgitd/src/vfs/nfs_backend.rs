@@ -217,8 +217,8 @@ impl SessionVfsOps for NfsSession {
                 size: 0,
                 perm: 0o755,
                 nlink: 2,
-                uid: unsafe { libc::getuid() },
-                gid: unsafe { libc::getgid() },
+                uid: crate::platform::current_uid(),
+                gid: crate::platform::current_gid(),
             });
         }
 
@@ -237,8 +237,8 @@ impl SessionVfsOps for NfsSession {
                 size: meta.size,
                 perm: meta.perm,
                 nlink: 1,
-                uid: unsafe { libc::getuid() },
-                gid: unsafe { libc::getgid() },
+                uid: crate::platform::current_uid(),
+                gid: crate::platform::current_gid(),
             });
         }
 
@@ -272,8 +272,8 @@ impl SessionVfsOps for NfsSession {
                         size: delta_bytes.len() as u64,
                         perm: entry.perm,
                         nlink: 1,
-                        uid: unsafe { libc::getuid() },
-                        gid: unsafe { libc::getgid() },
+                        uid: crate::platform::current_uid(),
+                        gid: crate::platform::current_gid(),
                     });
                 }
                 Ok(None) => {}
@@ -286,8 +286,8 @@ impl SessionVfsOps for NfsSession {
             size: entry.size,
             perm: entry.perm,
             nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: crate::platform::current_uid(),
+            gid: crate::platform::current_gid(),
         })
     }
 
@@ -997,7 +997,6 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
                     &self.cfg.repo_path,
                     session.initial_branch.as_deref(),
                     session.session_id,
-                    &session.socket_path,
                 )
                 .ok()
             } else {

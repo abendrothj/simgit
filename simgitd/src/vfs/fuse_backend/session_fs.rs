@@ -20,9 +20,9 @@ use crate::vfs::session_ops::{
     DirTreeError, SessionVfsOps, VfsAttr, VfsDirEntry, VfsFileKind, VfsOpError,
 };
 
-pub(super) const TTL: Duration = Duration::from_secs(1);
-pub(super) const SIMGIT_META_DIR: &str = ".simgit";
-pub(super) const SIMGIT_PEERS_DIR: &str = ".simgit/peers";
+pub const TTL: Duration = Duration::from_secs(1);
+pub const SIMGIT_META_DIR: &str = ".simgit";
+pub const SIMGIT_PEERS_DIR: &str = ".simgit/peers";
 
 /// FUSE filesystem handler for a single session.
 ///
@@ -92,19 +92,19 @@ pub(super) const SIMGIT_PEERS_DIR: &str = ".simgit/peers";
 /// - After TTL, attributes are re-fetched (cache miss cost: ~1ms)
 /// - No write-through guarantees (Phase 1 read-only, so N/A)
 
-pub(super) struct SessionFs {
-    pub(super) session_id: Uuid,
-    pub(super) peers_enabled: bool,
-    pub(super) cfg: Arc<Config>,
-    pub(super) base_commit: String,
-    pub(super) deltas: Arc<DeltaStore>,
-    pub(super) borrows: Arc<BorrowRegistry>,
-    pub(super) tree_cache: Arc<TreeCache>,
-    pub(super) blob_cache: Arc<BlobCache>,
-    pub(super) inode_map: Arc<InodeMap>,
-    pub(super) virtual_inos: Arc<Mutex<HashMap<u64, PathBuf>>>,
-    pub(super) virtual_paths: Arc<Mutex<HashMap<PathBuf, u64>>>,
-    pub(super) next_virtual_ino: Arc<AtomicU64>,
+pub struct SessionFs {
+    pub session_id: Uuid,
+    pub peers_enabled: bool,
+    pub cfg: Arc<Config>,
+    pub base_commit: String,
+    pub deltas: Arc<DeltaStore>,
+    pub borrows: Arc<BorrowRegistry>,
+    pub tree_cache: Arc<TreeCache>,
+    pub blob_cache: Arc<BlobCache>,
+    pub inode_map: Arc<InodeMap>,
+    pub virtual_inos: Arc<Mutex<HashMap<u64, PathBuf>>>,
+    pub virtual_paths: Arc<Mutex<HashMap<PathBuf, u64>>>,
+    pub next_virtual_ino: Arc<AtomicU64>,
 }
 
 impl SessionFs {
@@ -121,7 +121,7 @@ impl SessionFs {
     /// - `cfg`: Daemon configuration
     /// - `base_commit`: Git commit hash to serve as read-only tree (e.g., HEAD)
     /// - `repo`: Open git repository handle
-    pub(super) fn new(
+    pub fn new(
         session_id: Uuid,
         peers_enabled: bool,
         cfg: Arc<Config>,
@@ -145,7 +145,7 @@ impl SessionFs {
         }
     }
 
-    pub(super) fn ensure_virtual_ino(&self, path: &std::path::Path) -> u64 {
+    pub fn ensure_virtual_ino(&self, path: &std::path::Path) -> u64 {
         if let Some(ino) = self.virtual_paths.lock().unwrap().get(path).copied() {
             return ino;
         }
@@ -161,11 +161,11 @@ impl SessionFs {
         ino
     }
 
-    pub(super) fn virtual_path_of(&self, ino: u64) -> Option<PathBuf> {
+    pub fn virtual_path_of(&self, ino: u64) -> Option<PathBuf> {
         self.virtual_inos.lock().unwrap().get(&ino).cloned()
     }
 
-    pub(super) fn active_peer_ids(&self) -> Vec<Uuid> {
+    pub fn active_peer_ids(&self) -> Vec<Uuid> {
         if !self.peers_enabled {
             return Vec::new();
         }
@@ -180,7 +180,7 @@ impl SessionFs {
         peers
     }
 
-    pub(super) fn peer_children(
+    pub fn peer_children(
         &self,
         peer_session: Uuid,
         dir: &std::path::Path,
@@ -218,7 +218,7 @@ impl SessionFs {
         out
     }
 
-    pub(super) fn peer_file_bytes(
+    pub fn peer_file_bytes(
         &self,
         peer_session: Uuid,
         rel: &std::path::Path,
@@ -302,8 +302,8 @@ impl SessionVfsOps for SessionFs {
                 size: 0,
                 perm: 0o755,
                 nlink: 2,
-                uid: unsafe { libc::getuid() },
-                gid: unsafe { libc::getgid() },
+                uid: crate::platform::current_uid(),
+                gid: crate::platform::current_gid(),
             });
         }
 
@@ -316,8 +316,8 @@ impl SessionVfsOps for SessionFs {
                 size: meta.size,
                 perm: meta.perm,
                 nlink: 1,
-                uid: unsafe { libc::getuid() },
-                gid: unsafe { libc::getgid() },
+                uid: crate::platform::current_uid(),
+                gid: crate::platform::current_gid(),
             });
         }
 
@@ -349,8 +349,8 @@ impl SessionVfsOps for SessionFs {
                         size: delta_bytes.len() as u64,
                         perm: entry.perm,
                         nlink: 1,
-                        uid: unsafe { libc::getuid() },
-                        gid: unsafe { libc::getgid() },
+                        uid: crate::platform::current_uid(),
+                        gid: crate::platform::current_gid(),
                     });
                 }
                 Ok(None) => {}
@@ -363,8 +363,8 @@ impl SessionVfsOps for SessionFs {
             size: entry.size,
             perm: entry.perm,
             nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: crate::platform::current_uid(),
+            gid: crate::platform::current_gid(),
         })
     }
 

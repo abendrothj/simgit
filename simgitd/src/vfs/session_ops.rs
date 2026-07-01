@@ -114,8 +114,8 @@ impl Default for VfsAttr {
             size: 0,
             perm: 0o644,
             nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: crate::platform::current_uid(),
+            gid: crate::platform::current_gid(),
         }
     }
 }
