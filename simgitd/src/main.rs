@@ -1,13 +1,14 @@
-mod commit_scheduler;
-mod daemon;
-mod vfs;
 mod borrow;
-mod delta;
-mod session;
-mod rpc;
-mod events;
+mod commit_scheduler;
 mod config;
+mod daemon;
+mod delta;
+mod events;
+mod git_proxy;
 mod metrics;
+mod rpc;
+mod session;
+mod vfs;
 
 use anyhow::Result;
 use opentelemetry::global;
@@ -41,9 +42,10 @@ fn init_tracing() -> Result<()> {
             .build()?;
 
         let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-            .with_resource(opentelemetry_sdk::Resource::new(vec![
-                KeyValue::new("service.name", "simgitd"),
-            ]))
+            .with_resource(opentelemetry_sdk::Resource::new(vec![KeyValue::new(
+                "service.name",
+                "simgitd",
+            )]))
             .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
             .build();
 
@@ -56,9 +58,7 @@ fn init_tracing() -> Result<()> {
             .with(tracing_opentelemetry::layer().with_tracer(tracer))
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .init();
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
     }
 
     Ok(())

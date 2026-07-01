@@ -52,6 +52,8 @@ pub enum SessionStatus {
 ///     mount_path: PathBuf::from("/vdev/session-id"),
 ///     branch_name: None,
 ///     peers_enabled: false,
+///     git_proxy_enabled: true,
+///     initial_branch: None,
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +77,22 @@ pub struct SessionInfo {
     /// Whether this session opted into peer visibility (`--peers` flag).
     /// When true, agents can see in-flight writes from sibling sessions.
     pub peers_enabled: bool,
+    /// Whether to create a synthetic `.git` directory at the mount root
+    /// so that `git status`, `git diff`, `git log`, etc. work inside the
+    /// session mount as if it were a real git working tree.
+    ///
+    /// Enabled by default; set to `false` to disable (useful for
+    /// minimal-overhead sessions or when git CLI is not available).
+    #[serde(default = "default_git_proxy_enabled")]
+    pub git_proxy_enabled: bool,
+    /// Optional branch name for the session's synthetic HEAD.
+    /// When `None`, HEAD is in detached mode pointing to `base_commit`.
+    #[serde(default)]
+    pub initial_branch: Option<String>,
+}
+
+fn default_git_proxy_enabled() -> bool {
+    true
 }
 
 /// Per-commit telemetry emitted by `session.commit`.
@@ -188,9 +206,7 @@ impl fmt::Display for MergeConflictDetail {
         write!(
             f,
             "merge conflict for session {} on paths [{}] against active session(s): {}",
-            self.session_id,
-            paths,
-            peers
+            self.session_id, paths, peers
         )
     }
 }
@@ -297,34 +313,34 @@ pub struct DiffResult {
 pub struct RpcRequest {
     /// Always "2.0" for JSON-RPC 2.0 compliance.
     pub jsonrpc: String,
-    pub id:      u64,
-    pub method:  String,
-    pub params:  serde_json::Value,
+    pub id: u64,
+    pub method: String,
+    pub params: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcResponse {
     pub jsonrpc: String,
-    pub id:      u64,
+    pub id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub result:  Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error:   Option<RpcError>,
+    pub error: Option<RpcError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcError {
-    pub code:    i32,
+    pub code: i32,
     pub message: String,
-    pub data:    Option<serde_json::Value>,
+    pub data: Option<serde_json::Value>,
 }
 
 // ── RPC error codes ───────────────────────────────────────────────────────────
 
-pub const ERR_BORROW_CONFLICT:   i32 = -32001;
+pub const ERR_BORROW_CONFLICT: i32 = -32001;
 pub const ERR_SESSION_NOT_FOUND: i32 = -32002;
-pub const ERR_MERGE_CONFLICT:    i32 = -32003;
-pub const ERR_QUOTA_EXCEEDED:    i32 = -32004;
-pub const ERR_INVALID_PATH:      i32 = -32005;
+pub const ERR_MERGE_CONFLICT: i32 = -32003;
+pub const ERR_QUOTA_EXCEEDED: i32 = -32004;
+pub const ERR_INVALID_PATH: i32 = -32005;
 pub const ERR_DEADLINE_EXCEEDED: i32 = -32006;
-pub const ERR_COMMIT_PENDING:    i32 = -32007;
+pub const ERR_COMMIT_PENDING: i32 = -32007;

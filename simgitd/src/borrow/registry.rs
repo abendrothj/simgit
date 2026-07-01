@@ -22,7 +22,7 @@ use crate::session::SessionManager;
 
 #[derive(Debug, Default, Clone)]
 struct LockEntry {
-    writer:  Option<Uuid>,
+    writer: Option<Uuid>,
     readers: HashSet<Uuid>,
     acquired_at: chrono::DateTime<Utc>,
     ttl_seconds: Option<u64>,
@@ -37,7 +37,10 @@ pub struct BorrowRegistry {
 
 impl BorrowRegistry {
     pub fn new(sessions: Arc<SessionManager>) -> Self {
-        Self { sessions, locks: Mutex::new(HashMap::new()) }
+        Self {
+            sessions,
+            locks: Mutex::new(HashMap::new()),
+        }
     }
 
     // ── Read acquisition ──────────────────────────────────────────────────
@@ -47,13 +50,22 @@ impl BorrowRegistry {
     pub fn acquire_read(&self, session_id: Uuid, path: &Path) {
         let (writer, readers, acquired_at, ttl_seconds) = {
             let mut locks = self.locks.lock().unwrap();
-            let entry = locks
-                .entry(path.to_owned())
-                .or_insert_with(|| LockEntry { acquired_at: Utc::now(), ..Default::default() });
+            let entry = locks.entry(path.to_owned()).or_insert_with(|| LockEntry {
+                acquired_at: Utc::now(),
+                ..Default::default()
+            });
             entry.readers.insert(session_id);
-            (entry.writer, entry.readers.clone(), entry.acquired_at, entry.ttl_seconds)
+            (
+                entry.writer,
+                entry.readers.clone(),
+                entry.acquired_at,
+                entry.ttl_seconds,
+            )
         };
-        if let Err(e) = self.sessions.persist_lock(path, writer, &readers, acquired_at, ttl_seconds) {
+        if let Err(e) = self
+            .sessions
+            .persist_lock(path, writer, &readers, acquired_at, ttl_seconds)
+        {
             warn!(path = %path.display(), err = %e, "failed to persist read lock to SQLite");
         }
     }
@@ -72,26 +84,31 @@ impl BorrowRegistry {
     ) -> Result<(), BorrowError> {
         // Separate enum so we can drop the MutexGuard before calling into SessionManager.
         enum Outcome {
-            Granted { readers: HashSet<Uuid>, acquired_at: chrono::DateTime<Utc>, ttl: Option<u64> },
+            Granted {
+                readers: HashSet<Uuid>,
+                acquired_at: chrono::DateTime<Utc>,
+                ttl: Option<u64>,
+            },
             Reentrant,
             Conflict(BorrowError),
         }
 
         let outcome = {
             let mut locks = self.locks.lock().unwrap();
-            let entry = locks
-                .entry(path.to_owned())
-                .or_insert_with(|| LockEntry { acquired_at: Utc::now(), ..Default::default() });
+            let entry = locks.entry(path.to_owned()).or_insert_with(|| LockEntry {
+                acquired_at: Utc::now(),
+                ..Default::default()
+            });
 
             match &entry.writer {
                 None => {
-                    entry.writer       = Some(session_id);
-                    entry.acquired_at  = Utc::now();
-                    entry.ttl_seconds  = ttl_seconds;
+                    entry.writer = Some(session_id);
+                    entry.acquired_at = Utc::now();
+                    entry.ttl_seconds = ttl_seconds;
                     Outcome::Granted {
-                        readers:     entry.readers.clone(),
+                        readers: entry.readers.clone(),
                         acquired_at: entry.acquired_at,
-                        ttl:         ttl_seconds,
+                        ttl: ttl_seconds,
                     }
                 }
                 Some(w) if *w == session_id => {
@@ -100,32 +117,45 @@ impl BorrowRegistry {
                 }
                 Some(holder_id) => {
                     // Conflict — build a structured error.
-                    let holder_id   = *holder_id;
+                    let holder_id = *holder_id;
                     let acquired_at = entry.acquired_at;
-                    let ttl         = entry.ttl_seconds.map(std::time::Duration::from_secs);
-                    let holder = self.sessions.get_info_blocking(holder_id).unwrap_or_else(|| {
-                        SessionInfo {
-                            session_id:    holder_id,
-                            task_id:       "<unknown>".into(),
-                            agent_label:   None,
-                            base_commit:   String::new(),
-                            created_at:    Utc::now(),
-                            status:        simgit_sdk::SessionStatus::Active,
-                            mount_path:    PathBuf::new(),
-                            branch_name:   None,
+                    let ttl = entry.ttl_seconds.map(std::time::Duration::from_secs);
+                    let holder = self
+                        .sessions
+                        .get_info_blocking(holder_id)
+                        .unwrap_or_else(|| SessionInfo {
+                            session_id: holder_id,
+                            task_id: "<unknown>".into(),
+                            agent_label: None,
+                            base_commit: String::new(),
+                            created_at: Utc::now(),
+                            status: simgit_sdk::SessionStatus::Active,
+                            mount_path: PathBuf::new(),
+                            branch_name: None,
                             peers_enabled: false,
-                        }
-                    });
-                    Outcome::Conflict(BorrowError { path: path.to_owned(), holder, acquired_at, ttl })
+                            git_proxy_enabled: false,
+                            initial_branch: None,
+                        });
+                    Outcome::Conflict(BorrowError {
+                        path: path.to_owned(),
+                        holder,
+                        acquired_at,
+                        ttl,
+                    })
                 }
             }
         }; // MutexGuard on self.locks dropped here
 
         match outcome {
-            Outcome::Granted { readers, acquired_at, ttl } => {
-                if let Err(e) = self.sessions.persist_lock(
-                    path, Some(session_id), &readers, acquired_at, ttl,
-                ) {
+            Outcome::Granted {
+                readers,
+                acquired_at,
+                ttl,
+            } => {
+                if let Err(e) =
+                    self.sessions
+                        .persist_lock(path, Some(session_id), &readers, acquired_at, ttl)
+                {
                     warn!(path = %path.display(), err = %e, "failed to persist write lock to SQLite");
                 }
                 Ok(())
@@ -146,9 +176,7 @@ impl BorrowRegistry {
 
             let affected: Vec<PathBuf> = locks
                 .iter()
-                .filter(|(_, e)| {
-                    e.writer == Some(session_id) || e.readers.contains(&session_id)
-                })
+                .filter(|(_, e)| e.writer == Some(session_id) || e.readers.contains(&session_id))
                 .map(|(p, _)| p.clone())
                 .collect();
 
@@ -165,7 +193,7 @@ impl BorrowRegistry {
             let mut to_update = Vec::new();
             for path in affected {
                 match locks.get(&path) {
-                    None        => to_delete.push(path),
+                    None => to_delete.push(path),
                     Some(entry) => to_update.push((path, entry.clone())),
                 }
             }
@@ -206,8 +234,13 @@ impl BorrowRegistry {
         let mut locks = self.locks.lock().unwrap();
         for row in &rows {
             let path = PathBuf::from(&row.path);
-            let writer = row.writer_session.as_deref().and_then(|s| s.parse::<Uuid>().ok());
-            let readers: HashSet<Uuid> = match serde_json::from_str::<Vec<String>>(&row.reader_sessions_json) {
+            let writer = row
+                .writer_session
+                .as_deref()
+                .and_then(|s| s.parse::<Uuid>().ok());
+            let readers: HashSet<Uuid> = match serde_json::from_str::<Vec<String>>(
+                &row.reader_sessions_json,
+            ) {
                 Ok(ids) => ids.iter().filter_map(|s| s.parse::<Uuid>().ok()).collect(),
                 Err(e) => {
                     warn!(
@@ -234,7 +267,12 @@ impl BorrowRegistry {
             };
             locks.insert(
                 path,
-                LockEntry { writer, readers, acquired_at, ttl_seconds: row.ttl_seconds },
+                LockEntry {
+                    writer,
+                    readers,
+                    acquired_at,
+                    ttl_seconds: row.ttl_seconds,
+                },
             );
         }
         tracing::info!("restored {} borrow lock(s) from SQLite", locks.len());
@@ -248,15 +286,13 @@ impl BorrowRegistry {
         let locks = self.locks.lock().unwrap();
         locks
             .iter()
-            .filter(|(p, _)| {
-                path_prefix.map_or(true, |prefix| p.starts_with(prefix))
-            })
+            .filter(|(p, _)| path_prefix.map_or(true, |prefix| p.starts_with(prefix)))
             .map(|(p, e)| LockInfo {
-                path:            p.clone(),
-                writer_session:  e.writer,
+                path: p.clone(),
+                writer_session: e.writer,
                 reader_sessions: e.readers.iter().copied().collect(),
-                acquired_at:     e.acquired_at,
-                ttl_seconds:     e.ttl_seconds,
+                acquired_at: e.acquired_at,
+                ttl_seconds: e.ttl_seconds,
             })
             .collect()
     }
@@ -264,9 +300,9 @@ impl BorrowRegistry {
     /// Returns `true` if `path` is free to write (no other session holds it).
     pub fn is_write_free(&self, path: &Path, caller: Uuid) -> bool {
         let locks = self.locks.lock().unwrap();
-        locks.get(path).map_or(true, |e| {
-            e.writer.is_none() || e.writer == Some(caller)
-        })
+        locks
+            .get(path)
+            .map_or(true, |e| e.writer.is_none() || e.writer == Some(caller))
     }
 
     /// Force-release all locks held by `session` (used by TTL sweeper).
@@ -352,13 +388,17 @@ mod tests {
         let s2 = test_uuid(2);
         let path = Path::new("/src/main.rs");
 
-        reg.acquire_write(s1, path, None).expect("s1 should acquire write lock");
+        reg.acquire_write(s1, path, None)
+            .expect("s1 should acquire write lock");
 
         let err = reg
             .acquire_write(s2, path, None)
             .expect_err("s2 should be blocked by s1's write lock");
 
-        assert_eq!(err.holder.session_id, s1, "error must name the actual holder");
+        assert_eq!(
+            err.holder.session_id, s1,
+            "error must name the actual holder"
+        );
         assert_eq!(err.path, path);
     }
 
@@ -369,7 +409,8 @@ mod tests {
         let path = Path::new("/src/lib.rs");
 
         reg.acquire_write(s1, path, None).expect("first acquire");
-        reg.acquire_write(s1, path, None).expect("re-entrant acquire must succeed");
+        reg.acquire_write(s1, path, None)
+            .expect("re-entrant acquire must succeed");
     }
 
     // ── Readers ───────────────────────────────────────────────────────────
@@ -387,7 +428,10 @@ mod tests {
         reg.acquire_read(r3, path);
 
         let locks = reg.list(None);
-        let lock = locks.iter().find(|l| l.path == path).expect("lock entry must exist");
+        let lock = locks
+            .iter()
+            .find(|l| l.path == path)
+            .expect("lock entry must exist");
         assert!(lock.writer_session.is_none(), "no writer should exist");
         assert!(lock.reader_sessions.contains(&r1));
         assert!(lock.reader_sessions.contains(&r2));
@@ -434,13 +478,21 @@ mod tests {
         let s2 = test_uuid(2);
         let path = Path::new("/src/handler.rs");
 
-        reg.acquire_write(s1, path, None).expect("s1 acquires write lock");
-        assert!(!reg.is_write_free(path, s2), "path must be locked after s1 acquires");
+        reg.acquire_write(s1, path, None)
+            .expect("s1 acquires write lock");
+        assert!(
+            !reg.is_write_free(path, s2),
+            "path must be locked after s1 acquires"
+        );
 
         reg.release_session(s1);
-        assert!(reg.is_write_free(path, s2), "path must be free after s1 releases");
+        assert!(
+            reg.is_write_free(path, s2),
+            "path must be free after s1 releases"
+        );
 
-        reg.acquire_write(s2, path, None).expect("s2 must be able to acquire after s1 releases");
+        reg.acquire_write(s2, path, None)
+            .expect("s2 must be able to acquire after s1 releases");
     }
 
     #[test]
@@ -455,9 +507,18 @@ mod tests {
         reg.release_session(r1);
 
         let locks = reg.list(None);
-        let lock = locks.iter().find(|l| l.path == path).expect("lock entry must still exist for r2");
-        assert!(!lock.reader_sessions.contains(&r1), "r1 must be removed after release");
-        assert!(lock.reader_sessions.contains(&r2), "r2 must still be present");
+        let lock = locks
+            .iter()
+            .find(|l| l.path == path)
+            .expect("lock entry must still exist for r2");
+        assert!(
+            !lock.reader_sessions.contains(&r1),
+            "r1 must be removed after release"
+        );
+        assert!(
+            lock.reader_sessions.contains(&r2),
+            "r2 must still be present"
+        );
     }
 
     #[test]

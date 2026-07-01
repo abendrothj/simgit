@@ -335,6 +335,41 @@ pub trait SessionVfsOps {
     fn read_symlink_target(&self, id: u64) -> Result<Vec<u8>, VfsOpError>;
 }
 
+/// Notify the git proxy of a file operation so the synthetic `.git/index`
+/// stays in sync with the session's delta state.  Call this after every
+/// successful `write`, `create`, `unlink`, or `rename` in a SessionVfsOps
+/// implementation.  The proxy reference is optional; if `None` (git proxy
+/// disabled), this is a no-op.
+pub fn notify_git_proxy(proxy: &Option<crate::git_proxy::GitProxy>, op: GitProxyOp) {
+    let Some(proxy) = proxy else { return };
+    match op {
+        GitProxyOp::Write { path, content } => {
+            let _ = proxy.update_index_on_write(path, content);
+        }
+        GitProxyOp::Delete { path } => {
+            let _ = proxy.update_index_on_delete(path);
+        }
+        GitProxyOp::Rename { from, to } => {
+            let _ = proxy.update_index_on_rename(from, to);
+        }
+    }
+}
+
+/// Operation that the git proxy needs to know about.
+pub enum GitProxyOp<'a> {
+    Write {
+        path: &'a std::path::Path,
+        content: &'a [u8],
+    },
+    Delete {
+        path: &'a std::path::Path,
+    },
+    Rename {
+        from: &'a std::path::Path,
+        to: &'a std::path::Path,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests for shared helpers
 // ---------------------------------------------------------------------------

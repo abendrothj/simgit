@@ -122,6 +122,17 @@ impl super::VfsBackendTrait for FuseBackend {
             session.base_commit.clone(),
             Arc::clone(&self.deltas),
             Arc::clone(&self.borrows),
+            if session.git_proxy_enabled {
+                crate::git_proxy::GitProxy::bootstrap(
+                    &mount_path,
+                    &session.base_commit,
+                    &self.cfg.repo_path,
+                    session.initial_branch.as_deref(),
+                )
+                .ok()
+            } else {
+                None
+            },
         );
 
         let mut config = fuser::Config::default();

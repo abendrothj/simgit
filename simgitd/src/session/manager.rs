@@ -11,12 +11,15 @@ use chrono::Utc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use simgit_sdk::{CommitRequestState, RpcError, SessionCommitResult, SessionCommitStatus, SessionInfo, SessionStatus};
+use simgit_sdk::{
+    CommitRequestState, RpcError, SessionCommitResult, SessionCommitStatus, SessionInfo,
+    SessionStatus,
+};
 
 use super::db::{Db, LockRow, SessionRow};
 
 pub struct SessionManager {
-    db:    Mutex<Db>,
+    db: Mutex<Db>,
     /// In-memory cache for hot-path reads (lock conflict messages, etc.)
     cache: Mutex<HashMap<Uuid, SessionInfo>>,
     #[cfg(test)]
@@ -79,17 +82,20 @@ impl SessionManager {
 
     pub fn create(
         &self,
-        task_id:      String,
-        agent_label:  Option<String>,
-        base_commit:  String,
-        mount_path:   PathBuf,
-        peers:        bool,
+        task_id: String,
+        agent_label: Option<String>,
+        base_commit: String,
+        mount_path: PathBuf,
+        peers: bool,
         max_sessions: usize,
     ) -> Result<SessionInfo> {
         // Enforce max-sessions limit.
         let active_count = {
             let cache = self.cache.lock().unwrap();
-            cache.values().filter(|s| s.status == SessionStatus::Active).count()
+            cache
+                .values()
+                .filter(|s| s.status == SessionStatus::Active)
+                .count()
         };
         if active_count >= max_sessions {
             bail!("max sessions ({max_sessions}) reached; cannot create a new session");
@@ -100,14 +106,16 @@ impl SessionManager {
 
         let info = SessionInfo {
             session_id,
-            task_id:      task_id.clone(),
-            agent_label:  agent_label.clone(),
-            base_commit:  base_commit.clone(),
+            task_id: task_id.clone(),
+            agent_label: agent_label.clone(),
+            base_commit: base_commit.clone(),
             created_at,
-            status:       SessionStatus::Active,
-            mount_path:   mount_path.clone(),
-            branch_name:  None,
+            status: SessionStatus::Active,
+            mount_path: mount_path.clone(),
+            branch_name: None,
             peers_enabled: peers,
+            git_proxy_enabled: true,
+            initial_branch: None,
         };
 
         self.db.lock().unwrap().upsert_session(
@@ -143,16 +151,15 @@ impl SessionManager {
 
     fn update_status(
         &self,
-        session_id:  Uuid,
-        status:      SessionStatus,
+        session_id: Uuid,
+        status: SessionStatus,
         branch_name: Option<&str>,
     ) -> Result<SessionInfo> {
         let status_str = format!("{status:?}").to_uppercase();
-        self.db.lock().unwrap().update_status(
-            &session_id.to_string(),
-            &status_str,
-            branch_name,
-        )?;
+        self.db
+            .lock()
+            .unwrap()
+            .update_status(&session_id.to_string(), &status_str, branch_name)?;
         let mut cache = self.cache.lock().unwrap();
         let info = cache
             .get_mut(&session_id)
@@ -231,7 +238,11 @@ impl SessionManager {
     }
 
     pub fn commit_status(&self, session_id: Uuid, request_id: Uuid) -> Result<SessionCommitStatus> {
-        let row = self.db.lock().unwrap().load_commit_request(&session_id.to_string())?;
+        let row = self
+            .db
+            .lock()
+            .unwrap()
+            .load_commit_request(&session_id.to_string())?;
         let Some(row) = row else {
             return Ok(SessionCommitStatus {
                 session_id,
@@ -289,9 +300,9 @@ impl SessionManager {
     /// the lock table survives daemon restarts.
     pub fn persist_lock(
         &self,
-        path:        &Path,
-        writer:      Option<Uuid>,
-        readers:     &HashSet<Uuid>,
+        path: &Path,
+        writer: Option<Uuid>,
+        readers: &HashSet<Uuid>,
         acquired_at: chrono::DateTime<Utc>,
         ttl_seconds: Option<u64>,
     ) -> Result<()> {
@@ -301,7 +312,8 @@ impl SessionManager {
         }
 
         let reader_ids: Vec<String> = readers.iter().map(|u| u.to_string()).collect();
-        let readers_json = serde_json::to_string(&reader_ids).context("serialize reader_sessions")?;
+        let readers_json =
+            serde_json::to_string(&reader_ids).context("serialize reader_sessions")?;
         let writer_str = writer.map(|u| u.to_string());
         self.db.lock().unwrap().upsert_lock(
             &path.to_string_lossy(),
@@ -319,10 +331,7 @@ impl SessionManager {
             bail!("injected remove_lock failure");
         }
 
-        self.db
-            .lock()
-            .unwrap()
-            .delete_lock(&path.to_string_lossy())
+        self.db.lock().unwrap().delete_lock(&path.to_string_lossy())
     }
 
     /// Load all persisted lock rows from SQLite (called on startup by `BorrowRegistry`).
@@ -333,15 +342,15 @@ impl SessionManager {
     // ── Crash recovery ────────────────────────────────────────────────────
 
     /// Re-attach VFS mounts for sessions that were ACTIVE before a crash.
-    pub async fn recover_active_sessions(
-        &self,
-        state: &crate::daemon::AppState,
-    ) -> Result<()> {
+    pub async fn recover_active_sessions(&self, state: &crate::daemon::AppState) -> Result<()> {
         let active = self.list_active();
         if active.is_empty() {
             return Ok(());
         }
-        warn!("{} active session(s) found from previous run — recovering", active.len());
+        warn!(
+            "{} active session(s) found from previous run — recovering",
+            active.len()
+        );
         let recovery_ttl = state.config.session_recovery_ttl_seconds;
         for session in active {
             // If the session age exceeds the recovery TTL, mark it stale rather
@@ -374,26 +383,29 @@ impl SessionManager {
 }
 
 fn row_to_uuid(row: &SessionRow) -> Result<Uuid> {
-    row.id.parse::<Uuid>().with_context(|| format!("parse session UUID: {}", row.id))
+    row.id
+        .parse::<Uuid>()
+        .with_context(|| format!("parse session UUID: {}", row.id))
 }
 
 fn row_to_info(row: &SessionRow) -> Result<SessionInfo> {
     Ok(SessionInfo {
-        session_id:    row.id.parse()?,
-        task_id:       row.task_id.clone(),
-        agent_label:   row.agent_label.clone(),
-        base_commit:   row.base_commit.clone(),
-        created_at:    chrono::DateTime::from_timestamp(row.created_at, 0)
-            .unwrap_or_else(Utc::now),
-        status:        match row.status.as_str() {
-            "ACTIVE"    => SessionStatus::Active,
+        session_id: row.id.parse()?,
+        task_id: row.task_id.clone(),
+        agent_label: row.agent_label.clone(),
+        base_commit: row.base_commit.clone(),
+        created_at: chrono::DateTime::from_timestamp(row.created_at, 0).unwrap_or_else(Utc::now),
+        status: match row.status.as_str() {
+            "ACTIVE" => SessionStatus::Active,
             "COMMITTED" => SessionStatus::Committed,
-            "ABORTED"   => SessionStatus::Aborted,
-            _            => SessionStatus::Stale,
+            "ABORTED" => SessionStatus::Aborted,
+            _ => SessionStatus::Stale,
         },
-        mount_path:    PathBuf::from(&row.mount_path),
-        branch_name:   row.branch_name.clone(),
+        mount_path: PathBuf::from(&row.mount_path),
+        branch_name: row.branch_name.clone(),
         peers_enabled: row.peers_enabled,
+        git_proxy_enabled: true,
+        initial_branch: None,
     })
 }
 
@@ -407,8 +419,8 @@ mod tests {
     use crate::events::EventBroker;
     use crate::vfs::VfsManager;
     use simgit_sdk::SessionStatus;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -448,7 +460,9 @@ mod tests {
             info.session_id
         };
 
-        let reopened = SessionManager::open(&db_path).await.expect("reopen manager");
+        let reopened = SessionManager::open(&db_path)
+            .await
+            .expect("reopen manager");
         let active = reopened.list(Some(SessionStatus::Active));
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].session_id, created_session_id);
@@ -482,7 +496,9 @@ mod tests {
             info.session_id
         };
 
-        let reopened = SessionManager::open(&db_path).await.expect("reopen manager");
+        let reopened = SessionManager::open(&db_path)
+            .await
+            .expect("reopen manager");
         let info = reopened.get(session_id).expect("session exists");
         assert_eq!(info.status, SessionStatus::Committed);
         assert_eq!(info.branch_name.as_deref(), Some("feat/test"));
@@ -496,10 +512,7 @@ mod tests {
     #[tokio::test]
     async fn recover_active_sessions_mounts_session_paths() {
         let db_path = temp_db_path();
-        let state_root = db_path
-            .parent()
-            .expect("db has parent")
-            .join("state-root");
+        let state_root = db_path.parent().expect("db has parent").join("state-root");
         let mnt_dir = state_root.join("mnt");
         let repo_path = state_root.join("repo");
         std::fs::create_dir_all(&mnt_dir).expect("create mnt dir");
@@ -554,12 +567,18 @@ mod tests {
             )
             .expect("create active session");
 
-        assert!(!info.mount_path.exists(), "mount path should not exist before recovery mount");
+        assert!(
+            !info.mount_path.exists(),
+            "mount path should not exist before recovery mount"
+        );
         sessions
             .recover_active_sessions(&state)
             .await
             .expect("recover active sessions");
-        assert!(info.mount_path.exists(), "recover should mount active session path");
+        assert!(
+            info.mount_path.exists(),
+            "recover should mount active session path"
+        );
 
         state.vfs.unmount_all().await;
         let _ = std::fs::remove_file(&db_path);
@@ -601,7 +620,11 @@ mod tests {
         };
 
         // Re-open the manager and restore locks — simulating a daemon restart.
-        let manager2 = Arc::new(SessionManager::open(&db_path).await.expect("reopen manager"));
+        let manager2 = Arc::new(
+            SessionManager::open(&db_path)
+                .await
+                .expect("reopen manager"),
+        );
         let registry2 = crate::borrow::BorrowRegistry::new(Arc::clone(&manager2));
 
         // Before restore, the in-memory table should be empty.
@@ -633,7 +656,10 @@ mod tests {
 
         // Verify SQLite row is also removed.
         let rows = manager2.load_all_locks().expect("load locks after release");
-        assert!(rows.is_empty(), "SQLite locks table should be empty after release");
+        assert!(
+            rows.is_empty(),
+            "SQLite locks table should be empty after release"
+        );
 
         let _ = std::fs::remove_file(&db_path);
         if let Some(parent) = db_path.parent() {
