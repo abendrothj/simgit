@@ -64,6 +64,9 @@ simgit targets a third design point:
 - **Python bindings** — PyO3-backed, works with asyncio orchestrators
 - **Rust SDK** — async JSON-RPC client with typed request/response models
 - **`sg` CLI** — interactive session management and inspection
+- **Transparent git proxy** — synthetic `.git` index makes `git status`,
+  `git diff`, `git log`, and `git commit` work inside session mounts,
+  enabling drop-in replacement of `git worktree add` for LLM agents
 - **Chaos-validated** — SLO gate suite covering disjoint commits, hotspot contention, transport faults, and abandon storms
 
 ## Architecture
