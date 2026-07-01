@@ -82,7 +82,7 @@ mod tree;
 #[cfg(all(test, target_os = "linux"))]
 mod linux_integration_tests;
 
-use session_fs::SessionFs;
+pub(super) use session_fs::SessionFs;
 
 /// FUSE backend driver (Linux).
 ///
@@ -124,7 +124,6 @@ impl super::VfsBackendTrait for FuseBackend {
                 &self.cfg.repo_path,
                 session.initial_branch.as_deref(),
                 session.session_id,
-                &session.socket_path,
             )
             .ok();
         }
