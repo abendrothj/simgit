@@ -143,10 +143,21 @@ impl CommitScheduler {
                 Err(_elapsed) => {
                     // Drop already-held guards before returning so peers can proceed.
                     drop(guards);
-                    // Also remove partially-created entries from registry to avoid
-                    // unbounded growth: the paths we *didn't* lock won't have a
-                    // guard, so future calls will re-create them as needed.
-                    let _ = i; // already used above in loop
+                    // Remove registry entries for paths we never locked (i..).
+                    // These entries exist in the registry (created by or_insert_with above)
+                    // but have no guard, no waiter, and Arc::strong_count == 1.
+                    // Without this cleanup the registry grows unboundedly under
+                    // load when timeouts are frequent.
+                    {
+                        let mut registry = self.registry.lock().await;
+                        for p in sorted.iter().skip(i) {
+                            if let Some(mtx) = registry.get(p) {
+                                if Arc::strong_count(mtx) == 1 {
+                                    registry.remove(p);
+                                }
+                            }
+                        }
+                    }
                     return Err(CommitWaitTimeout);
                 }
             }
@@ -237,6 +248,42 @@ mod tests {
         let pos_end1   = events.iter().position(|&e| e == "end-1").unwrap();
         let pos_start2 = events.iter().position(|&e| e == "start-2").unwrap();
         assert!(pos_end1 < pos_start2, "h2 should wait for h1: {events:?}");
+    }
+
+    #[tokio::test]
+    async fn timeout_removes_unlocked_paths_from_registry() {
+        let sched = CommitScheduler::new(Duration::from_millis(50));
+
+        // Acquire lock on "shared.txt" so the next attempt times out.
+        let guard = sched
+            .begin_commit(&[PathBuf::from("shared.txt")], Some(Duration::ZERO))
+            .await
+            .expect("first acquire should succeed");
+
+        let paths = vec![
+            PathBuf::from("alpha.txt"),
+            PathBuf::from("shared.txt"),
+            PathBuf::from("omega.txt"),
+        ];
+
+        let result = sched.begin_commit(&paths, Some(Duration::from_millis(10))).await;
+        assert!(result.is_err(), "should time out on shared.txt after locking alpha.txt");
+
+        drop(guard);
+        sched.gc().await;
+
+        // After GC the registry should contain only "shared.txt" (someone
+        // might wait on it later).  The unlocked "alpha.txt" entry was
+        // removed on the timeout path (strong_count == 1).
+        let registry = sched.registry.lock().await;
+        assert!(
+            !registry.contains_key(Path::new("alpha.txt")),
+            "alpha.txt was never locked — should be cleaned up on timeout"
+        );
+        assert!(
+            !registry.contains_key(Path::new("omega.txt")),
+            "omega.txt was never locked — should be cleaned up on timeout"
+        );
     }
 
     #[tokio::test]
