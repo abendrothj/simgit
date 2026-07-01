@@ -5,9 +5,6 @@ members = [
     "sg",
     "simgit-sdk",
     "simgit-py",
-    "spike/fuse_passthrough",
-    "spike/git_reader",
-    "spike/overlay_test",
 ]
 
 [workspace.package]

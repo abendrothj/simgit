@@ -578,17 +578,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fuse_passthrough"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fuser",
- "libc",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "fuser"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -710,14 +699,6 @@ name = "gimli"
 version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
-
-[[package]]
-name = "git_reader"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gix",
-]
 
 [[package]]
 name = "gix"
@@ -2321,14 +2302,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "overlay_test"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "sha2",
-]
-
-[[package]]
 name = "page_size"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2820,22 +2793,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sg"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "serde",
- "serde_json",
- "simgit-sdk",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2906,6 +2863,22 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "simgit-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "serde",
+ "serde_json",
+ "simgit-sdk",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

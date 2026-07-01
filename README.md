@@ -102,8 +102,7 @@ simgit/
 ├── sg/               command-line interface
 ├── tests/            Rust integration tests + Python stress tools
 ├── docs/             integration and operational documentation
-├── deploy/           local observability/dev deployment profiles
-└── spike/            focused technical spikes and prototypes
+└── deploy/           local observability/dev deployment profiles
 ```
 
 ## Quick start
