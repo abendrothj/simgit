@@ -33,8 +33,4 @@ opentelemetry         = "0.27"
 opentelemetry_sdk     = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp    = { version = "0.27", features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.28"
-
-# NFS-loopback support (macOS primary, optional on Linux)
-[target.'cfg(target_os = "macos")'.dependencies]
-onc-rpc   = "0.3"
-xdr-codec = "0.4"
+nfsserve              = "0.11"

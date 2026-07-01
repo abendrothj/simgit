@@ -287,7 +287,7 @@ impl Filesystem for SessionFs {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        match SessionVfsOps::readlink(self, ino.0) {
+        match SessionVfsOps::read_symlink_target(self, ino.0) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(to_errno(e)),
         }

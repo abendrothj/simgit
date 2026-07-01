@@ -206,9 +206,9 @@ impl VfsManager {
     ) -> Self {
         let backend: Box<dyn VfsBackendTrait> = match cfg.vfs_backend {
             VfsBackend::Fuse => Box::new(fuse_backend::FuseBackend::new(cfg, deltas, borrows)),
-            VfsBackend::NfsLoopback => {
-                Box::new(nfs_backend::NfsLoopbackBackend::new(cfg, deltas, metrics))
-            }
+            VfsBackend::NfsLoopback => Box::new(nfs_backend::NfsLoopbackBackend::new(
+                cfg, deltas, borrows, metrics,
+            )),
         };
         Self {
             backend,

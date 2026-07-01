@@ -332,7 +332,7 @@ pub trait SessionVfsOps {
 
     /// Read symlink target.  Returns `NotFound` if the ID does not refer to a
     /// symlink.
-    fn readlink(&self, id: u64) -> Result<Vec<u8>, VfsOpError>;
+    fn read_symlink_target(&self, id: u64) -> Result<Vec<u8>, VfsOpError>;
 }
 
 // ---------------------------------------------------------------------------
