@@ -51,7 +51,7 @@ CREATE INDEX IF NOT EXISTS read_log_path    ON read_log(path);
 
 /// A single-writer connection used by `SessionManager`.
 pub struct Db {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Db {
