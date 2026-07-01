@@ -6,6 +6,7 @@ mod delta;
 mod events;
 mod git_proxy;
 mod metrics;
+mod platform;
 mod rpc;
 mod session;
 mod vfs;

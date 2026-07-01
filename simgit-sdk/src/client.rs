@@ -1,10 +1,10 @@
-//! Async client over the simgitd Unix domain socket (JSON-RPC 2.0).
+//! Async client over TCP loopback to the simgitd daemon (JSON-RPC 2.0).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
+use tokio::net::TcpStream;
 use uuid::Uuid;
 
 use crate::error::SdkError;
@@ -89,32 +89,75 @@ enum CommitAttemptError {
     Response(SdkError),
 }
 
-/// Default socket path: `$XDG_RUNTIME_DIR/simgit/control.sock`
-/// Falls back to `/tmp/simgit-<uid>/control.sock`.
-pub fn default_socket_path() -> PathBuf {
-    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("simgit").join("control.sock");
-    }
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/simgit-{uid}/control.sock"))
+/// Read the TCP port from the port file and return a `TcpStream` connected to
+/// the daemon on loopback.
+async fn connect_to_daemon(port_file: &Path) -> Result<TcpStream, SdkError> {
+    let port_str = std::fs::read_to_string(port_file)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                SdkError::DaemonNotFound(port_file.display().to_string())
+            } else {
+                SdkError::Io(e)
+            }
+        })?
+        .trim()
+        .to_owned();
+    let port: u16 = port_str.parse().map_err(|_| {
+        SdkError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid port in {}: {port_str}", port_file.display()),
+        ))
+    })?;
+    TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                SdkError::DaemonNotFound(port_file.display().to_string())
+            } else {
+                SdkError::Io(e)
+            }
+        })
 }
 
-// Re-export libc just for the uid call above — not part of the public API.
-extern crate libc;
+/// Default port-file path.
+///
+/// Unix: `$XDG_RUNTIME_DIR/simgit/control.port` or `/tmp/simgit-<uid>/control.port`.
+/// Windows: `%LOCALAPPDATA%\simgit\control.port`.
+pub fn default_port_file() -> PathBuf {
+    #[cfg(unix)]
+    {
+        if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+            return PathBuf::from(runtime).join("simgit").join("control.port");
+        }
+        let uid = unsafe { libc::getuid() };
+        PathBuf::from(format!("/tmp/simgit-{uid}/control.port"))
+    }
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var("LOCALAPPDATA")
+            .unwrap_or_else(|_| r"C:\Users\Default\AppData\Local".to_owned());
+        PathBuf::from(local_app_data).join("simgit").join("control.port")
+    }
+}
 
-/// Stateless client; each method opens a fresh socket connection.
-/// For high-frequency call sites, consider wrapping in a connection pool.
+/// Legacy alias for backwards compatibility.
+/// Prefer [`default_port_file`] in new code.
+pub fn default_socket_path() -> PathBuf {
+    default_port_file()
+}
+
+/// Stateless client; each method opens a fresh TCP connection.
 pub struct Client {
-    socket_path: PathBuf,
+    port_file: PathBuf,
 }
 
 impl Client {
-    pub fn new(socket_path: impl AsRef<Path>) -> Self {
-        Self { socket_path: socket_path.as_ref().to_owned() }
+    pub fn new(port_file: impl AsRef<Path>) -> Self {
+        Self { port_file: port_file.as_ref().to_owned() }
     }
 
     pub fn from_env() -> Self {
-        Self::new(default_socket_path())
+        Self::new(default_port_file())
     }
 
     // ── low-level RPC ────────────────────────────────────────────────────────
@@ -140,22 +183,15 @@ impl Client {
         let mut last_err: Option<SdkError> = None;
 
         for attempt in 1..=attempts {
-            let stream = match UnixStream::connect(&self.socket_path).await {
+            let stream = match connect_to_daemon(&self.port_file).await {
                 Ok(stream) => stream,
                 Err(e) => {
-                    let err = if e.kind() == std::io::ErrorKind::NotFound
-                        || e.kind() == std::io::ErrorKind::ConnectionRefused
-                    {
-                        SdkError::DaemonNotFound(self.socket_path.display().to_string())
-                    } else {
-                        SdkError::Io(e)
-                    };
-                    if attempt < attempts {
+                    if attempt < attempts && matches!(e, SdkError::Io(ref io) if is_retryable_io(io)) {
                         tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
-                        last_err = Some(err);
+                        last_err = Some(e);
                         continue;
                     }
-                    return Err(err);
+                    return Err(e);
                 }
             };
 
@@ -257,7 +293,6 @@ impl Client {
 
     // ── session methods ──────────────────────────────────────────────────────
 
-    /// Create a new agent session. Returns the session and its mount path.
     pub async fn session_create(
         &self,
         task_id:      impl Into<String>,
@@ -279,7 +314,6 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
-    /// Flatten the session's delta layer into a git branch and release locks.
     pub async fn session_commit(
         &self,
         session_id:  Uuid,
@@ -290,10 +324,6 @@ impl Client {
             .await
     }
 
-    /// Flatten the session's delta layer into a git branch and release locks.
-    ///
-    /// `timeout_override` applies to this call only (transport timeout +
-    /// daemon-side `deadline_epoch_ms`), without changing global SDK defaults.
     pub async fn session_commit_with_timeout(
         &self,
         session_id: Uuid,
@@ -387,14 +417,12 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
-    /// Discard the session's delta layer and release all locks.
     pub async fn session_abort(&self, session_id: Uuid) -> Result<(), SdkError> {
         self.call("session.abort", serde_json::json!({ "session_id": session_id }))
             .await?;
         Ok(())
     }
 
-    /// List sessions, optionally filtered by status.
     pub async fn session_list(
         &self,
         status: Option<SessionStatus>,
@@ -405,7 +433,6 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
-    /// Return the unified diff of an in-flight session.
     pub async fn session_diff(&self, session_id: Uuid) -> Result<DiffResult, SdkError> {
         let result = self
             .call("session.diff", serde_json::json!({ "session_id": session_id }))
@@ -415,7 +442,6 @@ impl Client {
 
     // ── lock methods ─────────────────────────────────────────────────────────
 
-    /// List current locks, optionally filtered by path prefix.
     pub async fn lock_list(
         &self,
         path: Option<&Path>,
@@ -426,7 +452,6 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
-    /// Long-poll until the write lock on `path` is free (or timeout elapses).
     pub async fn lock_wait(
         &self,
         path:       &Path,
@@ -441,7 +466,6 @@ impl Client {
         Ok(result["acquired"].as_bool().unwrap_or(false))
     }
 
-    /// List recent events, optionally filtered by source session.
     pub async fn event_list(
         &self,
         session_id: Option<Uuid>,
@@ -459,9 +483,6 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
-    /// Wait for the next event from a source session (or global stream).
-    ///
-    /// Returns `Ok(None)` on timeout.
     pub async fn event_subscribe(
         &self,
         session_id: Option<Uuid>,
@@ -491,24 +512,22 @@ impl Client {
     }
 }
 
+// ── commit helpers (private) ──────────────────────────────────────────────
+
 impl Client {
     async fn commit_call_once(
         &self,
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, CommitAttemptError> {
-        let stream = UnixStream::connect(&self.socket_path)
+        let stream = connect_to_daemon(&self.port_file)
             .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound
-                    || e.kind() == std::io::ErrorKind::ConnectionRefused
-                {
-                    CommitAttemptError::Unsent(SdkError::DaemonNotFound(
-                        self.socket_path.display().to_string(),
-                    ))
-                } else {
-                    CommitAttemptError::Unsent(SdkError::Io(e))
+            .map_err(|e| match e {
+                SdkError::DaemonNotFound(msg) => {
+                    CommitAttemptError::Unsent(SdkError::DaemonNotFound(msg))
                 }
+                SdkError::Io(io) => CommitAttemptError::Unsent(SdkError::Io(io)),
+                other => CommitAttemptError::Unsent(other),
             })?;
 
         let req = RpcRequest {

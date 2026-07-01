@@ -129,8 +129,8 @@ pub struct AppState {
     pub vfs: Arc<VfsManager>,
     pub metrics: Arc<Metrics>,
     pub commit_scheduler: Arc<CommitScheduler>,
-    /// Path to the daemon's control socket.
-    pub socket_path: PathBuf,
+    /// Path to the daemon's control port file.
+    pub port_file: PathBuf,
 }
 
 /// Run the simgitd daemon until shutdown signal.
@@ -212,7 +212,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         vfs,
         metrics,
         commit_scheduler,
-        socket_path: cfg.state_dir.join("control.sock"),
+        port_file: cfg.state_dir.join("control.port"),
     };
 
     // Recover any sessions that were ACTIVE before a previous crash.
@@ -275,8 +275,8 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     // Start RPC server.
     let rpc = RpcServer::new(state.clone());
-    let socket_path = cfg.state_dir.join("control.sock");
-    let rpc_handle = tokio::spawn(async move { rpc.serve(&socket_path).await });
+    let port_file = cfg.state_dir.join("control.port");
+    let rpc_handle = tokio::spawn(async move { rpc.serve(&port_file).await });
 
     let metrics_handle = if cfg.metrics_enabled {
         let addr = cfg.metrics_addr.clone();
@@ -291,18 +291,14 @@ pub async fn run(cfg: Config) -> Result<()> {
     };
 
     info!(
-        "simgitd ready — socket at {}",
-        cfg.state_dir.join("control.sock").display()
+        "simgitd ready — port file at {}",
+        cfg.state_dir.join("control.port").display()
     );
 
-    // Wait for SIGINT or SIGTERM.
+    // Wait for shutdown signal.
     tokio::select! {
         _ = signal::ctrl_c() => { info!("received SIGINT, shutting down"); }
-        Ok(()) = async {
-            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
-            sigterm.recv().await;
-            Ok::<(), std::io::Error>(())
-        } => { info!("received SIGTERM, shutting down"); }
+        Ok(()) = crate::platform::wait_for_termination_signal() => { info!("received SIGTERM, shutting down"); }
     }
 
     // Graceful shutdown: unmount all active sessions.

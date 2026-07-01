@@ -1,4 +1,8 @@
-//! JSON-RPC 2.0 server over a Unix domain socket.
+//! JSON-RPC 2.0 server over TCP loopback.
+//!
+//! Binds on `127.0.0.1:0` (random port).  Writes the assigned port number to a
+//! discovery file so clients can connect.  This works identically on Linux,
+//! macOS, and Windows — no platform-specific IPC primitives needed.
 //!
 //! Each connection is handled in its own Tokio task.
 //! Each request is a newline-terminated JSON object; the response is too.
@@ -9,7 +13,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, warn};
 
 use simgit_sdk::{RpcRequest, RpcResponse, RpcError};
@@ -26,20 +30,31 @@ impl RpcServer {
         Self { state }
     }
 
-    pub async fn serve(self, socket_path: &Path) -> Result<()> {
-        // Remove stale socket from previous run.
-        let _ = std::fs::remove_file(socket_path);
+    /// Start the RPC server on a random TCP port bound to loopback.
+    ///
+    /// Writes the assigned port to `port_file` so clients can discover it.
+    /// The file is secured to current-user-only where the platform supports it.
+    pub async fn serve(self, port_file: &Path) -> Result<()> {
+        // Remove stale file from previous run.
+        let _ = std::fs::remove_file(port_file);
 
-        // Restrict socket to owner only.
-        let listener = UnixListener::bind(socket_path)?;
-        secure_socket(socket_path)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
 
-        tracing::info!(path = %socket_path.display(), "RPC socket listening");
+        // Write port number to discovery file.
+        if let Some(parent) = port_file.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(port_file, addr.port().to_string())?;
+        crate::platform::secure_rpc_endpoint(port_file)?;
+
+        tracing::info!(port = addr.port(), file = %port_file.display(), "RPC server listening");
 
         let state = Arc::new(self.state);
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => {
+                Ok((stream, peer)) => {
+                    tracing::debug!(%peer, "RPC connection accepted");
                     let state = Arc::clone(&state);
                     tokio::spawn(handle_connection(stream, state));
                 }
@@ -49,7 +64,7 @@ impl RpcServer {
     }
 }
 
-async fn handle_connection(stream: UnixStream, state: Arc<AppState>) {
+async fn handle_connection(stream: TcpStream, state: Arc<AppState>) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -145,14 +160,4 @@ fn error_response(id: u64, code: i32, message: String, data: Option<serde_json::
         result:  None,
         error:   Some(RpcError { code, message, data }),
     }
-}
-
-/// Set Unix socket permissions to 0600 (owner r/w only).
-fn secure_socket(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path)?;
-    let mut perms = meta.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
 }
