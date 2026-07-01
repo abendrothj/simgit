@@ -75,7 +75,6 @@ use crate::borrow::BorrowRegistry;
 use crate::config::Config;
 use crate::delta::DeltaStore;
 
-mod bytes;
 mod filesystem_impl;
 mod session_fs;
 mod tree;
