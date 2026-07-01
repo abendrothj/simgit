@@ -19,21 +19,22 @@
 //!    ↑↓
 //! sg CLI ← invokes subcommands (init, new, commit, abort, status, lock, peer, gc, daemon)
 //!    ↓
-//! RPC Client ← connects to simgitd via Unix socket
+//! RPC Client ← connects to simgitd via TCP loopback (port from control.port)
 //!    ↓
 //! simgitd ← processes requests, manages sessions/locks/VFS
 //! ```
 //!
-//! ## Socket Path
+//! ## Port File Discovery
 //!
-//! By default, `sg` connects to the daemon socket at:
-//! - Linux: `$XDG_RUNTIME_DIR/simgitd.sock`
-//! - macOS: `$HOME/.local/state/simgit/simgitd.sock`
+//! By default, `sg` reads the TCP port from the daemon's discovery file at:
+//! - Linux: `$XDG_RUNTIME_DIR/simgit/control.port`
+//! - macOS: `$HOME/.local/state/simgit/control.port`
+//! - Windows: `%LOCALAPPDATA%\simgit\control.port`
 //!
 //! Override with:
 //! ```bash
-//! sg --socket /custom/path/sock <command>
-//! export SIMGIT_SOCKET=/custom/path/sock  # env var
+//! sg --socket /custom/path/control.port <command>
+//! export SIMGIT_SOCKET=/custom/path/control.port  # env var
 //! ```
 //!
 //! ## Output Formats
@@ -109,7 +110,7 @@ use anyhow::Result;
 ///
 /// # Global Options
 ///
-/// - `--socket <PATH>`: Custom daemon socket path (defaults to `$XDG_RUNTIME_DIR/simgitd.sock`)
+/// - `--socket <PATH>`: Override the port-file path (defaults to platform-specific `control.port` location)
 /// - `--json`: Output in JSON format (for machine parsing)
 ///
 /// # Subcommands
@@ -118,7 +119,7 @@ use anyhow::Result;
 #[derive(Parser)]
 #[command(name = "sg", about = "simgit — borrow-checked filesystem sessions for AI agents")]
 struct Cli {
-    /// Override the daemon socket path.
+    /// Override the daemon port-file path (reads TCP port from this file).
     #[arg(long, env = "SIMGIT_SOCKET", global = true)]
     socket: Option<String>,
 
@@ -202,7 +203,7 @@ enum Commands {
 /// # Example
 ///
 /// ```bash
-/// sg --socket /tmp/test.sock new --branch feature-x
+/// sg --socket /tmp/simgit-dev/control.port new --branch feature-x
 /// # Returns exit code 0 if successful, non-zero if failed
 /// ```
 #[tokio::main]

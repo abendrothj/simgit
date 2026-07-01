@@ -24,7 +24,7 @@ Canonical command used:
 ```bash
 source .venv/bin/activate
 python3 tests/stress/swarm_runner.py \
-  --socket /tmp/simgit-track2/control.sock \
+  --socket /tmp/simgit-track2/control.port \
   --disjoint-agents 20 \
   --hotspot-agents 20 \
   --profile-mix '{"fast_coder":10,"reasoning":5,"unstable":3,"overthinker":2}' \

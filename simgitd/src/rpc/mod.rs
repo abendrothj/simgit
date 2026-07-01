@@ -1,12 +1,13 @@
-//! JSON-RPC 2.0 server over Unix domain socket.
+//! JSON-RPC 2.0 server over TCP loopback.
 //!
 //! # Overview
 //!
 //! The RPC server is the daemon's public interface. All CLI commands and SDK calls
-//! communicate via JSON-RPC 2.0 over a Unix domain socket, enabling:
+//! communicate via JSON-RPC 2.0 over TCP loopback (127.0.0.1:random port, discovered
+//! via a `control.port` file), enabling:
 //!
 //! - **Language-agnostic**: Python, Node.js, Go agents can all use the same interface
-//! - **Secure**: Unix socket ACL (mode 0600) restricts to current user
+//! - **Secure**: TCP loopback (127.0.0.1) restricts to current machine
 //! - **Simple**: Newline-delimited JSON (no length prefixes)
 //! - **Async**: All methods are non-blocking (backed by tokio)
 //!
