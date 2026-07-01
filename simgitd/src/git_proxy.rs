@@ -235,14 +235,16 @@ impl GitProxy {
 
 /// List all (mode, oid, path) entries in the tree of `commitish`.
 fn list_tree_entries(repo_path: &Path, commitish: &str) -> Result<Vec<(String, String, String)>> {
+    let treeish = format!("{commitish}^{{tree}}");
     let output = std::process::Command::new("git")
         .current_dir(repo_path)
-        .args(["ls-tree", "-r", commitish])
+        .args(["ls-tree", "-r", &treeish])
         .output()
-        .with_context(|| format!("git ls-tree -r {commitish}"))?;
+        .with_context(|| format!("git ls-tree -r {treeish}"))?;
 
     if !output.status.success() {
-        anyhow::bail!("git ls-tree -r failed for {commitish}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git ls-tree -r failed for {treeish}: {stderr}");
     }
 
     let mut entries = Vec::new();
@@ -361,11 +363,17 @@ mod tests {
     use super::*;
 
     fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("simgit-gitproxy-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "simgit-gitproxy-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
     }
+
+    static NEXT_TEMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn init_git_repo(path: &Path) {
         let output = std::process::Command::new("git")
@@ -438,6 +446,7 @@ mod tests {
 
         // Write a new version of the file into the mount.
         let new_content = "fn main() { println!(\"hello\"); }\n";
+        fs::create_dir_all(mount.join("src")).unwrap();
         fs::write(mount.join("src/main.rs"), new_content).unwrap();
 
         // Update the index to reflect our delta.
@@ -469,6 +478,9 @@ mod tests {
 
         let mount = temp_dir();
         let proxy = GitProxy::bootstrap(&mount, &base, &repo, Some("main")).expect("bootstrap");
+
+        // Create the file in the working tree so we can "delete" it.
+        fs::write(mount.join("delete_me.txt"), "to be removed\n").unwrap();
 
         // Delete the file from the mount.
         fs::remove_file(mount.join("delete_me.txt")).unwrap();
