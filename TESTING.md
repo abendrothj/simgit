@@ -133,7 +133,7 @@ This runner executes:
 ```bash
 source .venv/bin/activate
 python3 tests/stress/swarm_runner.py \
-  --socket /tmp/simgit-track2/control.sock \
+  --port-file /tmp/simgit-track2/control.port \
   --disjoint-agents 20 \
   --hotspot-agents 20 \
   --profile-mix '{"fast_coder":10,"reasoning":5,"unstable":3,"overthinker":2}' \
@@ -193,7 +193,7 @@ High-value metrics:
 - Pin profile mix and agent counts in CI jobs.
 - Capture JSON reports for every stress run.
 - Keep daemon state directory ephemeral per run.
-- Use explicit socket paths in scripts and env variables.
+- Use explicit port-file paths in scripts and env variables.
 
 ## CI recommendations
 
@@ -207,8 +207,8 @@ Minimum CI gate set:
 
 ## Failure triage checklist
 
-1. Confirm daemon process and control socket exist.
-2. Verify SIMGIT_SOCKET and runner --socket point to the same path.
+1. Confirm daemon process and control.port file exist.
+2. Verify SIMGIT_PORT_FILE and runner --port-file point to the same path.
 3. Validate venv contains current simgit bindings.
 4. Inspect stress JSON report first, daemon logs second.
 5. Differentiate transport-level failure from semantic commit failure.

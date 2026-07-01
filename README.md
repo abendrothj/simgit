@@ -15,7 +15,6 @@ import asyncio
 async def run_agent(task_id, branch, label):
     session = simgit.Session.new(
         task_id=task_id,
-        socket_path="/tmp/simgit-dev/control.sock",
         agent_label=label,
     )
     mount = session.info()["mount_path"]
@@ -76,7 +75,7 @@ simgit targets a third design point:
 Agent runner / CLI / SDK
           │
           ▼
-  JSON-RPC over Unix socket
+  JSON-RPC over TCP loopback (port via control.port)
           │
           ▼
        simgitd
@@ -107,6 +106,7 @@ borrow-checking guarantee through the shared `SessionVfsOps` trait:
 | macOS (default) | Embedded NFSv3 server (`nfsserve`) | Yes — every NFSv3 `WRITE` RPC goes through `SessionVfsOps::write()` → `BorrowRegistry` | None (no install, no kernel extension, no macFUSE) |
 | macOS (opt-in) | FUSE via `SIMGIT_BACKEND=fuse` | Yes — identical to Linux FUSE path | One-time install: `brew install --cask macfuse` or `brew install fuse-t` |
 | macOS 15.4+ (future) | FSKit native provider | Yes — Apple's user-space FS framework, no kernel extension | One-time System Settings toggle; requires paid Apple Developer account to sign |
+| Windows | WinFSP (`winfsp_wrs`) | Yes — every WinFSP write callback goes through `SessionVfsOps::write()` → `BorrowRegistry` | One-time install of WinFSP runtime (MSI or `choco install winfsp`) |
 
 The nightly SLO/chaos suite currently runs on macOS with the NFSv3 backend. Linux
 FUSE correctness is covered by a separate integration suite that gates PRs
@@ -144,14 +144,14 @@ mkdir -p "$SIMGIT_STATE_DIR"
 ./target/debug/simgitd
 ```
 
-The control socket is created at `/tmp/simgit-dev/control.sock`.
+The daemon writes its TCP port number to `/tmp/simgit-dev/control.port`.
 
 ### 3. Create and use a session
 
 `sg` is the simgit CLI. In a second shell:
 
 ```bash
-export SIMGIT_SOCKET=/tmp/simgit-dev/control.sock
+export SIMGIT_PORT_FILE=/tmp/simgit-dev/control.port
 
 sg new --task "demo-task" --label "agent-1"
 # write files under the printed mount path, then:

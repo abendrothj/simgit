@@ -76,7 +76,6 @@ If agents don't need `git` subprocess support, set:
 ```python
 session = simgit.Session.new(
     task_id="agent-task-123",
-    socket_path=SOCKET,
     agent_label="planner-1",
     git_proxy_enabled=False,   # skips .git/ bootstrap
 )
@@ -104,12 +103,11 @@ simgit's primary design goal is letting multiple agents work against the same re
 import simgit
 import asyncio
 
-SOCKET = "/tmp/simgit-dev/control.sock"
+PORT_FILE = "/tmp/simgit-dev/control.port"
 
 async def agent_task(task_id: str, branch: str, label: str, write_fn):
     session = simgit.Session.new(
         task_id=task_id,
-        socket_path=SOCKET,
         agent_label=label,
     )
     mount = session.info()["mount_path"]
@@ -144,7 +142,7 @@ use simgit_sdk::Client;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = Client::new("/tmp/simgit-dev/control.sock");
+    let client = Client::new("/tmp/simgit-dev/control.port");
 
     // Spawn sessions concurrently.
     let (s1, s2, s3) = tokio::try_join!(
@@ -182,11 +180,11 @@ async fn main() -> anyhow::Result<()> {
 
 ### Using with Claude Code agents
 
-Assign each Claude Code agent instance a distinct session mount path via `SIMGIT_SOCKET` and session creation. The agents never need to know about each other — isolation and conflict detection are handled entirely by the daemon.
+Assign each Claude Code agent instance a distinct session mount path via `SIMGIT_PORT_FILE` and session creation. The agents never need to know about each other — isolation and conflict detection are handled entirely by the daemon.
 
 ```bash
 # Agent 1 shell
-export SIMGIT_SOCKET=/tmp/simgit-dev/control.sock
+export SIMGIT_PORT_FILE=/tmp/simgit-dev/control.port
 sg new --task "auth-refactor" --label "claude-agent-1"
 # work under the printed mount path, then:
 sg commit --session <uuid> --branch feat/auth-refactor --message "auth refactor"
@@ -224,18 +222,21 @@ An agent task should follow this lifecycle:
 
 This pattern keeps correctness decisions explicit and observable.
 
-## Transport and socket discipline
+## Transport and port discovery
 
-Always ensure daemon and client agree on socket path.
+The daemon binds a TCP listener on `127.0.0.1:0` (random port) and writes the
+assigned port number to a discovery file.  Clients read this file to connect.
+No platform-specific IPC primitives — works identically on Linux, macOS, and
+Windows.
 
 Recommended approach:
 
 ```bash
 export SIMGIT_STATE_DIR=/tmp/simgit-dev
-export SIMGIT_SOCKET=/tmp/simgit-dev/control.sock
+export SIMGIT_PORT_FILE=/tmp/simgit-dev/control.port
 ```
 
-Pass socket path explicitly from orchestrator config rather than relying on default heuristics.
+Pass port-file path explicitly from orchestrator config rather than relying on default heuristics.
 
 ## Python usage
 
@@ -246,7 +247,6 @@ import simgit
 
 session = simgit.Session.new(
     task_id="agent-task-123",
-    socket_path="/tmp/simgit-dev/control.sock",
     agent_label="planner-1",
 )
 
@@ -285,7 +285,7 @@ use simgit_sdk::{Client, SdkError};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = Client::new("/tmp/simgit-dev/control.sock");
+    let client = Client::new("/tmp/simgit-dev/control.port");
 
     let session = client
         .session_create("agent-task-123", Some("planner-1".into()), None, false)

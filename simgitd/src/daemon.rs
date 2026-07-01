@@ -32,7 +32,7 @@
 //!       ├─ DeltaStore::new() ← CoW blob storage
 //!       ├─ EventBroker::new() ← Pub/sub for agents
 //!       ├─ VfsManager::new() ← Backend selection (FUSE/NFS)
-//!       ├─ RpcServer::new() ← Unix socket listener
+//!       ├─ RpcServer::new() ← TCP loopback listener (port written to control.port)
 //!       ├─ spawn(ttl_sweeper) ← Background TTL cleanup task
 //!       ├─ spawn(rpc_server) ← Background RPC listener task
 //!       ├─ signal::ctrl_c() or signal::unix::SIGTERM
@@ -57,7 +57,7 @@
 //! # Thread Model
 //!
 //! - **Main task**: Waits for signals (blocks until shutdown)
-//! - **RPC task**: Listens on Unix socket, spawns handler tasks per request
+//! - **RPC task**: Listens on TCP loopback (127.0.0.1:random port), spawns handler tasks per request
 //! - **TTL sweeper task**: Background cleanup of expired locks (30s interval)
 //! - **FUSE/NFS tasks** (per session): Spawned by VFS backend, die when mount unmounts
 //!

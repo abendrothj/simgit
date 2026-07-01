@@ -1,9 +1,9 @@
-//! Virtual filesystem layer — abstracts FUSE (Linux) and NFS-loopback (macOS) backends.
+//! Virtual filesystem layer — abstracts FUSE (Linux), NFS-loopback (macOS), and WinFSP (Windows) backends.
 //!
 //! # Overview
 //!
 //! The VFS layer presents a unified interface for mounting read-only git trees + delta CoW overlays.
-//! It abstracts platform-specific details (FUSE XDR, NFS RPC) behind a simple trait:
+//! It abstracts platform-specific details (FUSE XDR, NFS RPC, WinFSP callbacks) behind a simple trait:
 //!
 //! ```ignore
 //! pub trait VfsBackendTrait {
@@ -15,7 +15,8 @@
 //! # Supported Platforms
 //!
 //! - **Linux**: FUSE (via `fuser` crate, all distros)
-//! - **macOS**: NFS-loopback stub (Phase 0); full NFSv3 server (Phase 1+)
+//! - **macOS**: NFS-loopback (full NFSv3 server via `nfsserve`)
+//! - **Windows**: WinFSP (via `winfsp_wrs` crate, requires WinFSP runtime)
 //!
 //! # Architecture
 //!
@@ -195,7 +196,8 @@ impl VfsManager {
     ///
     /// Backend selection:
     /// - Linux: Always FUSE (or explicitly configured)
-    /// - macOS: Always NFS-loopback (kernel extension disabled)
+    /// - macOS: Always NFS-loopback
+    /// - Windows: Always WinFSP (requires WinFSP runtime)
     ///
     /// # Panics
     ///

@@ -6,7 +6,7 @@
 //! - Repository location (git workspace to serve)
 //! - State directory (SQLite database, delta blobs, sockets)
 //! - Session limits and quotas
-//! - VFS backend selection (FUSE vs. NFS-loopback)
+//! - VFS backend selection (FUSE, NFS-loopback, or WinFSP)
 //!
 //! # Configuration Sources
 //!
@@ -26,7 +26,7 @@
 //!
 //! # Directory Structure
 //!
-//! ```text\n//! $state_dir/\n//!   ├── db.sqlite         (sessions, locks, metadata)\n//!   ├── blobs/             (delta content-addressed storage)\n//!   │   └── <hash>/\n//!   ├── mnt/               (session mount points)\n//!   │   ├── <session-id>/\n//!   │   └── <session-id>/\n//!   └── simgitd.sock      (control socket)\n//! ```
+//! ```text\n//! $state_dir/\n//!   ├── db.sqlite         (sessions, locks, metadata)\n//!   ├── blobs/             (delta content-addressed storage)\n//!   │   └── <hash>/\n//!   ├── mnt/               (session mount points)\n//!   │   ├── <session-id>/\n//!   │   └── <session-id>/\n//!   └── control.port      (TCP port discovery file)\n//! ```
 //!
 //! # Phase Roadmap
 //!
@@ -174,6 +174,7 @@ impl Config {
     /// Auto-detected by platform:
     /// - Linux: FUSE
     /// - macOS: NFS-loopback
+    /// - Windows: WinFSP
     /// - Other: FUSE (requires user configuration)
     ///
     /// # Returns

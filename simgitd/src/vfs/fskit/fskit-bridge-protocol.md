@@ -11,8 +11,8 @@ extension (`FSKitExt.appex`, written in Swift) and the simgitd daemon
   option (passed through `FSLoadOptions.parameters`).
 - **Framing:** length-prefixed messages. Each message is a 4-byte
   big-endian length followed by that many bytes of payload.
-- **Payload format:** JSON-RPC 2.0 (same protocol as the daemon's Unix
-  socket control interface), with an extended set of VFS methods.
+- **Payload format:** JSON-RPC 2.0 (same protocol as the daemon's TCP
+  loopback control interface), with an extended set of VFS methods.
 - **Lifetime:** one connection per mount.  The extension connects on
   first FSKit operation and keeps the TCP socket open until unmount.
 

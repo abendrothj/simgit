@@ -54,7 +54,7 @@ pub enum SessionStatus {
 ///     peers_enabled: false,
 ///     git_proxy_enabled: true,
 ///     initial_branch: None,
-///     socket_path: PathBuf::from("/tmp/simgit-dev/control.sock"),
+///     socket_path: PathBuf::new(),
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,8 +90,9 @@ pub struct SessionInfo {
     /// When `None`, HEAD is in detached mode pointing to `base_commit`.
     #[serde(default)]
     pub initial_branch: Option<String>,
-    /// Path to the daemon's control socket (used by the git-proxy pre-commit
-    /// hook to route `git commit` → `sg commit`).
+    /// Deprecated — the daemon now uses TCP loopback with port discovery via
+    /// a `control.port` file.  Retained for backwards compatibility with older
+    /// serialized session records; always `PathBuf::new()` in current daemon.
     #[serde(default)]
     pub socket_path: PathBuf,
 }
@@ -313,7 +314,7 @@ pub struct DiffResult {
 
 /// JSON-RPC 2.0 request envelope.
 ///
-/// Used for all daemon→client communication over the Unix socket.
+/// Used for all daemon↔client communication over TCP loopback.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RpcRequest {
     /// Always "2.0" for JSON-RPC 2.0 compliance.
