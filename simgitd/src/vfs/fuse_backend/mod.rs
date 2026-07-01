@@ -115,6 +115,20 @@ impl super::VfsBackendTrait for FuseBackend {
         let mount_path = session.mount_path.clone();
         std::fs::create_dir_all(&mount_path)?;
 
+        // Bootstrap synthetic .git if enabled (fire-and-forget, doesn't need
+        // to be passed to SessionFs — git commands read .git/ directly).
+        if session.git_proxy_enabled {
+            crate::git_proxy::GitProxy::bootstrap(
+                &mount_path,
+                &session.base_commit,
+                &self.cfg.repo_path,
+                session.initial_branch.as_deref(),
+                session.session_id,
+                &session.socket_path,
+            )
+            .ok();
+        }
+
         let fs = SessionFs::new(
             session.session_id,
             session.peers_enabled,
@@ -122,19 +136,6 @@ impl super::VfsBackendTrait for FuseBackend {
             session.base_commit.clone(),
             Arc::clone(&self.deltas),
             Arc::clone(&self.borrows),
-            if session.git_proxy_enabled {
-                crate::git_proxy::GitProxy::bootstrap(
-                    &mount_path,
-                    &session.base_commit,
-                    &self.cfg.repo_path,
-                    session.initial_branch.as_deref(),
-                    session.session_id,
-                    &session.socket_path,
-                )
-                .ok()
-            } else {
-                None
-            },
         );
 
         let mut config = fuser::Config::default();

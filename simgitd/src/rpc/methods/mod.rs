@@ -20,7 +20,7 @@ mod test_support;
 use commit::{commit_status, session_commit};
 use events::{event_list, event_subscribe};
 use locks::{lock_acquire, lock_contention, lock_list, lock_wait};
-use session::{session_abort, session_create, session_diff, session_list};
+use session::{session_abort, session_create, session_diff, session_list, session_set_base};
 
 /// Dispatch a JSON-RPC method call. Returns `Ok(result)` or `Err(RpcError)`.
 pub async fn dispatch(
@@ -35,6 +35,7 @@ pub async fn dispatch(
         "session.abort" => session_abort(state, params).await,
         "session.list" => session_list(state, params).await,
         "session.diff" => session_diff(state, params).await,
+        "session.set-base" => session_set_base(state, params).await,
         "event.list" => event_list(state, params).await,
         "event.subscribe" => event_subscribe(state, params).await,
         "lock.acquire" => lock_acquire(state, params).await,

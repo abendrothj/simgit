@@ -105,7 +105,6 @@ pub(super) struct SessionFs {
     pub(super) virtual_inos: Arc<Mutex<HashMap<u64, PathBuf>>>,
     pub(super) virtual_paths: Arc<Mutex<HashMap<PathBuf, u64>>>,
     pub(super) next_virtual_ino: Arc<AtomicU64>,
-    pub(super) git_proxy: Option<crate::git_proxy::GitProxy>,
 }
 
 impl SessionFs {
@@ -129,7 +128,6 @@ impl SessionFs {
         base_commit: String,
         deltas: Arc<DeltaStore>,
         borrows: Arc<BorrowRegistry>,
-        git_proxy: Option<crate::git_proxy::GitProxy>,
     ) -> Self {
         Self {
             session_id,
@@ -144,7 +142,6 @@ impl SessionFs {
             virtual_inos: Arc::new(Mutex::new(HashMap::new())),
             virtual_paths: Arc::new(Mutex::new(HashMap::new())),
             next_virtual_ino: Arc::new(AtomicU64::new(1u64 << 62)),
-            git_proxy,
         }
     }
 
@@ -447,14 +444,6 @@ impl SessionVfsOps for SessionFs {
                 )
                 .map_err(|_| VfsOpError::Io)?;
 
-            crate::vfs::session_ops::notify_git_proxy(
-                &self.git_proxy,
-                crate::vfs::session_ops::GitProxyOp::Write {
-                    path: &meta.path,
-                    content: &current,
-                },
-            );
-
             self.inode_map.update_delta_size(id, current.len() as u64);
             return Ok(data.len() as u64);
         }
@@ -498,14 +487,6 @@ impl SessionVfsOps for SessionFs {
                 }),
             )
             .map_err(|_| VfsOpError::Io)?;
-
-        crate::vfs::session_ops::notify_git_proxy(
-            &self.git_proxy,
-            crate::vfs::session_ops::GitProxyOp::Write {
-                path: &path,
-                content: &current,
-            },
-        );
 
         self.inode_map.update_delta_size(id, current.len() as u64);
 
@@ -635,14 +616,6 @@ impl SessionVfsOps for SessionFs {
             .write_blob(self.session_id, &path, &[], None)
             .map_err(|_| VfsOpError::Io)?;
 
-        crate::vfs::session_ops::notify_git_proxy(
-            &self.git_proxy,
-            crate::vfs::session_ops::GitProxyOp::Write {
-                path: &path,
-                content: &[],
-            },
-        );
-
         let ino = self.inode_map.allocate();
         let perm = ((mode as u16) & 0o7777) | 0o100000;
         self.inode_map.insert_delta_file(ino, path, 0, perm);
@@ -699,10 +672,6 @@ impl SessionVfsOps for SessionFs {
         self.deltas
             .mark_deleted(self.session_id, &path)
             .map_err(|_| VfsOpError::Io)?;
-        crate::vfs::session_ops::notify_git_proxy(
-            &self.git_proxy,
-            crate::vfs::session_ops::GitProxyOp::Delete { path: &path },
-        );
         Ok(())
     }
 
@@ -795,13 +764,6 @@ impl SessionVfsOps for SessionFs {
         let _ = self
             .deltas
             .record_rename(self.session_id, &old_path, &new_path);
-        crate::vfs::session_ops::notify_git_proxy(
-            &self.git_proxy,
-            crate::vfs::session_ops::GitProxyOp::Rename {
-                from: &old_path,
-                to: &new_path,
-            },
-        );
         Ok(())
     }
 
@@ -941,15 +903,7 @@ mod tests {
         deltas
             .init_session(session_id, "HEAD")
             .expect("init_session should succeed");
-        SessionFs::new(
-            session_id,
-            false,
-            cfg,
-            "HEAD".to_owned(),
-            deltas,
-            borrows,
-            None,
-        )
+        SessionFs::new(session_id, false, cfg, "HEAD".to_owned(), deltas, borrows)
     }
 
     #[test]

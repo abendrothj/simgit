@@ -5,8 +5,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use std::path::PathBuf;
-
 use crate::borrow::BorrowRegistry;
 use crate::config::{Config, VfsBackend};
 use crate::daemon::AppState;

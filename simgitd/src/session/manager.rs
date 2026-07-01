@@ -147,6 +147,21 @@ impl SessionManager {
         self.update_status(session_id, SessionStatus::Aborted, None)
     }
 
+    /// Update the session's base commit (called when `git checkout` changes
+    /// the working tree inside the session mount).
+    pub fn set_base_commit(&self, session_id: Uuid, new_base: &str) -> Result<()> {
+        self.db
+            .lock()
+            .unwrap()
+            .update_session_base(session_id, new_base)?;
+        if let Ok(mut cache) = self.cache.lock() {
+            if let Some(info) = cache.get_mut(&session_id) {
+                info.base_commit = new_base.to_owned();
+            }
+        }
+        Ok(())
+    }
+
     pub fn mark_stale(&self, session_id: Uuid) -> Result<SessionInfo> {
         self.update_status(session_id, SessionStatus::Stale, None)
     }
@@ -408,6 +423,7 @@ fn row_to_info(row: &SessionRow) -> Result<SessionInfo> {
         peers_enabled: row.peers_enabled,
         git_proxy_enabled: true,
         initial_branch: None,
+        socket_path: PathBuf::new(),
     })
 }
 
@@ -457,6 +473,7 @@ mod tests {
                     std::env::temp_dir().join("simgit-mount-a"),
                     false,
                     8,
+                    std::path::PathBuf::new(),
                 )
                 .expect("create session");
             info.session_id
@@ -490,6 +507,7 @@ mod tests {
                     std::env::temp_dir().join("simgit-mount-b"),
                     false,
                     8,
+                    std::path::PathBuf::new(),
                 )
                 .expect("create session");
             manager
@@ -556,6 +574,7 @@ mod tests {
             commit_scheduler: Arc::new(crate::commit_scheduler::CommitScheduler::new(
                 std::time::Duration::from_secs(30),
             )),
+            socket_path: std::path::PathBuf::new(),
         };
 
         let info = sessions
@@ -566,6 +585,7 @@ mod tests {
                 mnt_dir.join("recover-session"),
                 false,
                 16,
+                std::path::PathBuf::new(),
             )
             .expect("create active session");
 
@@ -608,6 +628,7 @@ mod tests {
                     std::env::temp_dir().join("simgit-lock-mount"),
                     false,
                     8,
+                    std::path::PathBuf::new(),
                 )
                 .expect("create session");
 

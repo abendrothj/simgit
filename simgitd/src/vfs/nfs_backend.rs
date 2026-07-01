@@ -410,13 +410,6 @@ impl SessionVfsOps for NfsSession {
             )
             .map_err(|_| VfsOpError::Io)?;
 
-        crate::vfs::session_ops::notify_git_proxy(
-            &self.git_proxy,
-            crate::vfs::session_ops::GitProxyOp::Write {
-                path: &path,
-                content: &current,
-            },
-        );
 
         if meta.is_some() {
             self.inode_map.update_delta_size(id, current.len() as u64);
@@ -558,13 +551,6 @@ impl SessionVfsOps for NfsSession {
             .write_blob(self.session_id, &path, &[], None)
             .map_err(|_| VfsOpError::Io)?;
 
-        crate::vfs::session_ops::notify_git_proxy(
-            &self.git_proxy,
-            crate::vfs::session_ops::GitProxyOp::Write {
-                path: &path,
-                content: &[],
-            },
-        );
 
         let ino = self.inode_map.allocate();
         let perm = ((mode as u16) & 0o7777) | 0o100000;
@@ -624,10 +610,6 @@ impl SessionVfsOps for NfsSession {
         self.deltas
             .mark_deleted(self.session_id, &path)
             .map_err(|_| VfsOpError::Io)?;
-        crate::vfs::session_ops::notify_git_proxy(
-            &self.git_proxy,
-            crate::vfs::session_ops::GitProxyOp::Delete { path: &path },
-        );
         Ok(())
     }
 
@@ -722,13 +704,6 @@ impl SessionVfsOps for NfsSession {
         let _ = self
             .deltas
             .record_rename(self.session_id, &old_path, &new_path);
-        crate::vfs::session_ops::notify_git_proxy(
-            &self.git_proxy,
-            crate::vfs::session_ops::GitProxyOp::Rename {
-                from: &old_path,
-                to: &new_path,
-            },
-        );
         Ok(())
     }
 

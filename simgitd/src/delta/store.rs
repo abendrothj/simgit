@@ -33,7 +33,7 @@ pub struct DeltaManifest {
     /// base commit OID (hex) this delta was forked from.
     pub base_commit: String,
     /// path → SHA-256 hex of new content
-    pub writes:  HashMap<PathBuf, String>,
+    pub writes: HashMap<PathBuf, String>,
     /// paths deleted in this session
     pub deletes: HashSet<PathBuf>,
     /// renames: (from, to)
@@ -45,10 +45,10 @@ pub struct DeltaManifest {
 }
 
 pub struct DeltaStore {
-    root:            PathBuf,
+    root: PathBuf,
     /// Maximum bytes of delta blobs per session. `u64::MAX` = unlimited.
     max_delta_bytes: u64,
-    manifest_locks:  Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    manifest_locks: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
 }
 
 impl DeltaStore {
@@ -147,7 +147,31 @@ impl DeltaStore {
             std::fs::create_dir_all(self.objects_dir(session_id))
                 .with_context(|| format!("create objects dir for session {session_id}"))?;
 
-            let manifest = DeltaManifest { base_commit: base_commit.to_owned(), ..Default::default() };
+            let manifest = DeltaManifest {
+                base_commit: base_commit.to_owned(),
+                ..Default::default()
+            };
+            self.write_manifest(session_id, &manifest)
+        })
+    }
+
+    /// Reset a session's delta state for a new base commit (called when
+    /// `git checkout` changes the working tree inside the session mount).
+    /// Clears the delta manifest and reinitializes it with the new base.
+    pub fn reset_session(&self, session_id: Uuid, new_base: &str) -> Result<()> {
+        self.with_session_lock(session_id, || {
+            // Remove old delta blobs.
+            let session_dir = self.session_dir(session_id);
+            if session_dir.exists() {
+                // Best-effort: delete old blobs. If we can't (e.g. files are
+                // locked by a running FUSE mount), just reset the manifest.
+                let _ = std::fs::remove_dir_all(self.objects_dir(session_id));
+            }
+            // Reinitialize with fresh manifest.
+            let manifest = DeltaManifest {
+                base_commit: new_base.to_owned(),
+                ..Default::default()
+            };
             self.write_manifest(session_id, &manifest)
         })
     }
@@ -162,7 +186,13 @@ impl DeltaStore {
     ///
     /// Returns an error if adding this blob would push the session's total
     /// unique-blob size over `max_delta_bytes`.
-    pub fn write_blob(&self, session_id: Uuid, path: &Path, content: &[u8], range: Option<ByteRange>) -> Result<String> {
+    pub fn write_blob(
+        &self,
+        session_id: Uuid,
+        path: &Path,
+        content: &[u8],
+        range: Option<ByteRange>,
+    ) -> Result<String> {
         self.with_session_lock(session_id, || {
             // Compute content hash for deduplication and integrity.
             let hash = hex::encode(Sha256::digest(content));
@@ -181,7 +211,9 @@ impl DeltaStore {
                         anyhow::bail!(
                             "delta quota exceeded for session {session_id}: \
                              {} bytes used + {} bytes new > {} bytes limit",
-                            used, new_size, self.max_delta_bytes
+                            used,
+                            new_size,
+                            self.max_delta_bytes
                         );
                     }
                 }
@@ -200,7 +232,9 @@ impl DeltaStore {
             manifest.writes.insert(path.to_owned(), hash.clone());
             match range {
                 Some(r) => manifest.ranges.entry(path.to_owned()).or_default().push(r),
-                None    => { manifest.ranges.remove(path); }
+                None => {
+                    manifest.ranges.remove(path);
+                }
             }
             self.write_manifest(session_id, &manifest)?;
 
@@ -221,10 +255,13 @@ impl DeltaStore {
 
         let hash = match manifest.writes.get(path) {
             Some(h) => h.clone(),
-            None    => return Ok(None), // not in this delta; fall through to git
+            None => return Ok(None), // not in this delta; fall through to git
         };
 
-        let blob_path = self.objects_dir(session_id).join(&hash[..2]).join(&hash[2..]);
+        let blob_path = self
+            .objects_dir(session_id)
+            .join(&hash[..2])
+            .join(&hash[2..]);
         let data = std::fs::read(&blob_path)
             .with_context(|| format!("read blob {hash} for session {session_id}"))?;
 
@@ -370,7 +407,9 @@ mod tests {
         let old_path = Path::new("src/old.rs");
         let new_path = Path::new("src/new.rs");
 
-        store.init_session(session_id, "HEAD").expect("init session");
+        store
+            .init_session(session_id, "HEAD")
+            .expect("init session");
         store
             .write_blob(session_id, old_path, b"hello", None)
             .expect("write old path");
@@ -384,12 +423,10 @@ mod tests {
         let manifest = store.load_manifest(session_id).expect("load manifest");
         assert!(manifest.writes.contains_key(new_path));
         assert!(manifest.deletes.contains(old_path));
-        assert!(
-            manifest
-                .renames
-                .iter()
-                .any(|(from, to)| from == old_path && to == new_path)
-        );
+        assert!(manifest
+            .renames
+            .iter()
+            .any(|(from, to)| from == old_path && to == new_path));
 
         let bytes = store
             .read_blob(session_id, new_path)
@@ -397,7 +434,9 @@ mod tests {
             .expect("renamed path has bytes");
         assert_eq!(bytes, b"hello");
 
-        let old = store.read_blob(session_id, old_path).expect("read old path");
+        let old = store
+            .read_blob(session_id, old_path)
+            .expect("read old path");
         assert!(old.is_none());
 
         let _ = std::fs::remove_dir_all(&root);
@@ -449,7 +488,10 @@ mod tests {
             .write_blob(session_id, Path::new("big.txt"), content, None)
             .expect_err("write should fail when quota exceeded");
 
-        assert!(err.to_string().contains("quota exceeded"), "error must mention quota exceeded");
+        assert!(
+            err.to_string().contains("quota exceeded"),
+            "error must mention quota exceeded"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -6,6 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use uuid::Uuid;
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -55,8 +56,8 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)
-            .with_context(|| format!("open SQLite at {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("open SQLite at {}", path.display()))?;
         conn.execute_batch(SCHEMA).context("apply schema")?;
         ensure_session_commit_columns(&conn)?;
         Ok(Self { conn })
@@ -74,14 +75,14 @@ impl Db {
     /// Upsert a session row.
     pub fn upsert_session(
         &self,
-        id:           &str,
-        task_id:      &str,
-        agent_label:  Option<&str>,
-        base_commit:  &str,
-        created_at:   i64,
-        status:       &str,
-        mount_path:   &str,
-        branch_name:  Option<&str>,
+        id: &str,
+        task_id: &str,
+        agent_label: Option<&str>,
+        base_commit: &str,
+        created_at: i64,
+        status: &str,
+        mount_path: &str,
+        branch_name: Option<&str>,
         peers_enabled: bool,
     ) -> Result<()> {
         self.conn.execute(
@@ -102,15 +103,20 @@ impl Db {
     }
 
     /// Update only the status (and optionally the branch_name) of a session.
-    pub fn update_status(
-        &self,
-        id:          &str,
-        status:      &str,
-        branch_name: Option<&str>,
-    ) -> Result<()> {
+    pub fn update_status(&self, id: &str, status: &str, branch_name: Option<&str>) -> Result<()> {
         self.conn.execute(
             "UPDATE sessions SET status=?1, branch_name=COALESCE(?2, branch_name) WHERE id=?3",
             params![status, branch_name, id],
+        )?;
+        Ok(())
+    }
+
+    /// Update the base commit for a session (called when `git checkout`
+    /// changes the working tree inside the session mount).
+    pub fn update_session_base(&self, session_id: Uuid, new_base: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET base_commit=?1 WHERE id=?2",
+            params![new_base, session_id.to_string()],
         )?;
         Ok(())
     }
@@ -121,7 +127,9 @@ impl Db {
             "SELECT id,task_id,agent_label,base_commit,created_at,status,mount_path,branch_name,peers_enabled
              FROM sessions WHERE status=?1",
         )?;
-        let rows = stmt.query_map(params![status], row_to_session)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt
+            .query_map(params![status], row_to_session)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -141,7 +149,9 @@ impl Db {
             "SELECT id,task_id,agent_label,base_commit,created_at,status,mount_path,branch_name,peers_enabled
              FROM sessions ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map([], row_to_session)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = stmt
+            .query_map([], row_to_session)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -186,7 +196,8 @@ impl Db {
 
     /// Delete a lock row for `path` (called when the entry becomes empty after release).
     pub fn delete_lock(&self, path: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM locks WHERE path=?1", params![path])?;
+        self.conn
+            .execute("DELETE FROM locks WHERE path=?1", params![path])?;
         Ok(())
     }
 
@@ -198,11 +209,11 @@ impl Db {
         let rows = stmt
             .query_map([], |row| {
                 Ok(LockRow {
-                    path:                 row.get(0)?,
-                    writer_session:       row.get(1)?,
+                    path: row.get(0)?,
+                    writer_session: row.get(1)?,
                     reader_sessions_json: row.get(2)?,
-                    acquired_at:          row.get(3)?,
-                    ttl_seconds:          row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    acquired_at: row.get(3)?,
+                    ttl_seconds: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -253,10 +264,22 @@ fn ensure_session_commit_columns(conn: &Connection) -> Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let required = [
-        ("last_commit_request_id", "ALTER TABLE sessions ADD COLUMN last_commit_request_id TEXT"),
-        ("last_commit_state", "ALTER TABLE sessions ADD COLUMN last_commit_state TEXT"),
-        ("last_commit_result", "ALTER TABLE sessions ADD COLUMN last_commit_result TEXT"),
-        ("last_commit_error", "ALTER TABLE sessions ADD COLUMN last_commit_error TEXT"),
+        (
+            "last_commit_request_id",
+            "ALTER TABLE sessions ADD COLUMN last_commit_request_id TEXT",
+        ),
+        (
+            "last_commit_state",
+            "ALTER TABLE sessions ADD COLUMN last_commit_state TEXT",
+        ),
+        (
+            "last_commit_result",
+            "ALTER TABLE sessions ADD COLUMN last_commit_result TEXT",
+        ),
+        (
+            "last_commit_error",
+            "ALTER TABLE sessions ADD COLUMN last_commit_error TEXT",
+        ),
     ];
 
     for (name, ddl) in required {
@@ -271,27 +294,27 @@ fn ensure_session_commit_columns(conn: &Connection) -> Result<()> {
 
 #[derive(Debug, Clone)]
 pub struct SessionRow {
-    pub id:           String,
-    pub task_id:      String,
-    pub agent_label:  Option<String>,
-    pub base_commit:  String,
-    pub created_at:   i64,
-    pub status:       String,
-    pub mount_path:   String,
-    pub branch_name:  Option<String>,
+    pub id: String,
+    pub task_id: String,
+    pub agent_label: Option<String>,
+    pub base_commit: String,
+    pub created_at: i64,
+    pub status: String,
+    pub mount_path: String,
+    pub branch_name: Option<String>,
     pub peers_enabled: bool,
 }
 
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
     Ok(SessionRow {
-        id:           row.get(0)?,
-        task_id:      row.get(1)?,
-        agent_label:  row.get(2)?,
-        base_commit:  row.get(3)?,
-        created_at:   row.get(4)?,
-        status:       row.get(5)?,
-        mount_path:   row.get(6)?,
-        branch_name:  row.get(7)?,
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        agent_label: row.get(2)?,
+        base_commit: row.get(3)?,
+        created_at: row.get(4)?,
+        status: row.get(5)?,
+        mount_path: row.get(6)?,
+        branch_name: row.get(7)?,
         peers_enabled: row.get::<_, i64>(8)? != 0,
     })
 }
@@ -299,13 +322,13 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
 /// A single row from the `locks` table.
 #[derive(Debug, Clone)]
 pub struct LockRow {
-    pub path:                String,
-    pub writer_session:      Option<String>,
+    pub path: String,
+    pub writer_session: Option<String>,
     /// Raw JSON string from `reader_sessions` column (e.g. `["uuid1","uuid2"]`).
     /// Callers should parse this with serde_json and handle errors explicitly.
     pub reader_sessions_json: String,
-    pub acquired_at:          i64,
-    pub ttl_seconds:          Option<u64>,
+    pub acquired_at: i64,
+    pub ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

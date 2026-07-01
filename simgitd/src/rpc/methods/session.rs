@@ -68,6 +68,34 @@ pub(super) async fn session_create(
     serde_json::to_value(&info).map_err(internal)
 }
 
+// ── session.set-base ──────────────────────────────────────────────────────────
+
+pub(super) async fn session_set_base(
+    state: &Arc<AppState>,
+    p: serde_json::Value,
+) -> Result<serde_json::Value, RpcError> {
+    let session_id = uuid_field(&p, "session_id")?;
+    let new_base = str_field(&p, "commit")?;
+
+    // Update the session's base commit.
+    state
+        .sessions
+        .set_base_commit(session_id, &new_base)
+        .map_err(|e| RpcError {
+            code: -32603,
+            message: e.to_string(),
+            data: None,
+        })?;
+
+    // Clear the delta manifest — the working tree now reflects the new base.
+    // Subsequent writes create fresh deltas relative to the new commit.
+    if let Err(e) = state.deltas.reset_session(session_id, &new_base) {
+        tracing::warn!(session = %session_id, err = %e, "failed to reset delta for new base");
+    }
+
+    Ok(serde_json::json!({ "ok": true, "base_commit": new_base }))
+}
+
 // ── session.abort ─────────────────────────────────────────────────────────────
 
 pub(super) async fn session_abort(
