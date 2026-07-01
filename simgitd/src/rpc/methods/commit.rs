@@ -735,8 +735,7 @@ mod tests {
                 "HEAD".to_owned(),
                 state.config.mnt_dir.join("s1"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create s1");
         state
@@ -756,8 +755,7 @@ mod tests {
                 "HEAD".to_owned(),
                 state.config.mnt_dir.join("s2"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create s2");
         state
@@ -807,8 +805,7 @@ mod tests {
                 "HEAD".to_owned(),
                 state.config.mnt_dir.join("sa"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create s1");
         state
@@ -828,8 +825,7 @@ mod tests {
                 "HEAD".to_owned(),
                 state.config.mnt_dir.join("sb"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create s2");
         state
@@ -883,8 +879,7 @@ mod tests {
                 "HEAD".into(),
                 state.config.mnt_dir.join("sr1"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create s1");
         state
@@ -909,8 +904,7 @@ mod tests {
                 "HEAD".into(),
                 state.config.mnt_dir.join("sr2"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create s2");
         state
@@ -960,8 +954,7 @@ mod tests {
                 "HEAD".into(),
                 state.config.mnt_dir.join("so1"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create s1");
         state
@@ -986,8 +979,7 @@ mod tests {
                 "HEAD".into(),
                 state.config.mnt_dir.join("so2"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create s2");
         state
@@ -1034,8 +1026,7 @@ mod tests {
                 "HEAD".into(),
                 state.config.mnt_dir.join("sm1"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create s1");
         state
@@ -1060,8 +1051,7 @@ mod tests {
                 "HEAD".into(),
                 state.config.mnt_dir.join("sm2"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create s2");
         state
@@ -1115,8 +1105,7 @@ mod tests {
                 "HEAD".to_owned(),
                 state.config.mnt_dir.join("timeout-lock"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create session");
         state
@@ -1165,8 +1154,7 @@ mod tests {
                 "HEAD".to_owned(),
                 state.config.mnt_dir.join("timeout-flatten"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create session");
         state
@@ -1232,8 +1220,7 @@ mod tests {
                 "HEAD".to_owned(),
                 state.config.mnt_dir.join("status-miss"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create session");
         state
@@ -1269,8 +1256,7 @@ mod tests {
                 "HEAD".to_owned(),
                 state.config.mnt_dir.join("status-hit"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create session");
         state
@@ -1323,8 +1309,7 @@ mod tests {
                 "HEAD".to_owned(),
                 state.config.mnt_dir.join("flat-e2e"),
                 false,
-                8,
-                std::path::PathBuf::new(),
+                8
             )
             .expect("create session");
         state

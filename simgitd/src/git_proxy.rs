@@ -49,7 +49,6 @@ impl GitProxy {
         repo_path: &Path,
         initial_branch: Option<&str>,
         session_id: Uuid,
-        socket_path: &Path,
     ) -> Result<Self> {
         let git_dir = mount_path.join(".git");
 
@@ -268,8 +267,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/sock"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -311,8 +309,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/sock"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -368,8 +365,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/s"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -401,8 +397,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/s"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -431,8 +426,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/s"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -473,8 +467,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/s"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -500,8 +493,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/s"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -532,8 +524,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/s"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -575,8 +566,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/s"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -606,8 +596,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/s"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -635,8 +624,7 @@ mod tests {
             &base,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/s"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 
@@ -678,8 +666,7 @@ mod tests {
             &feature_head,
             &repo,
             Some("main"),
-            Uuid::now_v7(),
-            Path::new("/tmp/s"),
+            Uuid::now_v7()
         )
         .expect("bootstrap");
 

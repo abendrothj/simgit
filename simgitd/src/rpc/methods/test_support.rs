@@ -97,7 +97,7 @@ pub(super) async fn build_state_for_commit_tests() -> (Arc<AppState>, std::path:
         commit_scheduler: Arc::new(crate::commit_scheduler::CommitScheduler::new(
             std::time::Duration::from_secs(30),
         )),
-        socket_path: PathBuf::new(),
+        port_file: PathBuf::new(),
     });
     (state, root)
 }

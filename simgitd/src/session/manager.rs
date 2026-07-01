@@ -43,6 +43,13 @@ impl SessionManager {
         Ok(mgr)
     }
 
+    /// Access the underlying database connection for test-only operations
+    /// like back-dating session timestamps to test TTL logic.
+    #[cfg(test)]
+    pub fn db_conn(&self) -> std::sync::MutexGuard<'_, Db> {
+        self.db.lock().unwrap()
+    }
+
     /// Create an in-memory `SessionManager` for unit tests.
     ///
     /// Backed by an in-memory SQLite database (`:memory:`), so there is no disk
@@ -69,7 +76,17 @@ impl SessionManager {
         self.fail_remove_lock.store(fail, Ordering::Relaxed);
     }
 
+    #[cfg(not(test))]
     fn warm_cache(&self) -> Result<()> {
+        self.do_warm_cache()
+    }
+
+    #[cfg(test)]
+    pub fn warm_cache(&self) -> Result<()> {
+        self.do_warm_cache()
+    }
+
+    fn do_warm_cache(&self) -> Result<()> {
         let rows = self.db.lock().unwrap().load_all()?;
         let mut cache = self.cache.lock().unwrap();
         for row in rows {
@@ -88,7 +105,6 @@ impl SessionManager {
         mount_path: PathBuf,
         peers: bool,
         max_sessions: usize,
-        socket_path: PathBuf,
     ) -> Result<SessionInfo> {
         // Enforce max-sessions limit.
         let active_count = {
@@ -117,7 +133,7 @@ impl SessionManager {
             peers_enabled: peers,
             git_proxy_enabled: true,
             initial_branch: None,
-            socket_path,
+            socket_path: PathBuf::new(),
         };
 
         self.db.lock().unwrap().upsert_session(
@@ -436,6 +452,8 @@ mod tests {
     use crate::delta::DeltaStore;
     use crate::events::EventBroker;
     use crate::vfs::VfsManager;
+    use chrono;
+    use rusqlite;
     use simgit_sdk::SessionStatus;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -473,7 +491,6 @@ mod tests {
                     std::env::temp_dir().join("simgit-mount-a"),
                     false,
                     8,
-                    std::path::PathBuf::new(),
                 )
                 .expect("create session");
             info.session_id
@@ -507,7 +524,6 @@ mod tests {
                     std::env::temp_dir().join("simgit-mount-b"),
                     false,
                     8,
-                    std::path::PathBuf::new(),
                 )
                 .expect("create session");
             manager
@@ -529,23 +545,24 @@ mod tests {
         }
     }
 
+    /// Verify recovery correctly finds active sessions and marks those past
+    /// TTL as stale — without triggering OS-level mount operations (which
+    /// may need root or cause platform dialogs on macOS NFS).
     #[tokio::test]
-    async fn recover_active_sessions_mounts_session_paths() {
+    async fn recover_active_sessions_marks_past_ttl_sessions_stale() {
         let db_path = temp_db_path();
         let state_root = db_path.parent().expect("db has parent").join("state-root");
         let mnt_dir = state_root.join("mnt");
-        let repo_path = state_root.join("repo");
         std::fs::create_dir_all(&mnt_dir).expect("create mnt dir");
-        std::fs::create_dir_all(&repo_path).expect("create repo dir");
 
         let cfg = Arc::new(Config {
-            repo_path: repo_path.clone(),
+            repo_path: state_root.join("repo"),
             state_dir: state_root.clone(),
             mnt_dir: mnt_dir.clone(),
             max_sessions: 16,
             max_delta_bytes: 2 * 1024 * 1024,
             lock_ttl_seconds: 3600,
-            session_recovery_ttl_seconds: 86400,
+            session_recovery_ttl_seconds: 1, // 1-second TTL forces immediate expiry
             vfs_backend: VfsBackend::NfsLoopback,
             metrics_enabled: false,
             metrics_addr: "127.0.0.1:0".to_owned(),
@@ -557,7 +574,7 @@ mod tests {
         let borrows = Arc::new(BorrowRegistry::new(Arc::clone(&sessions)));
         let deltas = Arc::new(DeltaStore::new(state_root.join("deltas")));
         let events = Arc::new(EventBroker::new());
-        let vfs = Arc::new(VfsManager::new(
+        let unused_vfs = Arc::new(VfsManager::new(
             Arc::clone(&cfg),
             Arc::clone(&deltas),
             Arc::clone(&borrows),
@@ -569,40 +586,60 @@ mod tests {
             borrows,
             deltas,
             events,
-            vfs,
+            vfs: unused_vfs,
             metrics: Arc::new(crate::metrics::Metrics::new().expect("metrics")),
             commit_scheduler: Arc::new(crate::commit_scheduler::CommitScheduler::new(
                 std::time::Duration::from_secs(30),
             )),
-            socket_path: std::path::PathBuf::new(),
+            port_file: std::path::PathBuf::new(),
         };
 
-        let info = sessions
-            .create(
-                "recover-task".to_owned(),
-                Some("recover-agent".to_owned()),
-                "HEAD".to_owned(),
-                mnt_dir.join("recover-session"),
-                false,
-                16,
-                std::path::PathBuf::new(),
-            )
-            .expect("create active session");
+        // Create a normal session (timestamp = now), then update its
+        // created_at to the distant past so the recovery TTL check fires.
+        let session_id = {
+            let info = sessions
+                .create(
+                    "recover-task".into(),
+                    None,
+                    "HEAD".into(),
+                    mnt_dir.join("stale-session"),
+                    false,
+                    16,
+                )
+                .expect("create session");
+            info.session_id
+        };
+        assert_eq!(sessions.list_active().len(), 1, "should have 1 active session");
 
-        assert!(
-            !info.mount_path.exists(),
-            "mount path should not exist before recovery mount"
-        );
+        // Back-date the row to force TTL expiry, then reload the cache so
+        // `list_active()` sees the updated timestamp.
+        let old = chrono::Utc::now() - chrono::Duration::hours(48);
+        sessions.db_conn().conn.execute(
+            "UPDATE sessions SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![old.timestamp(), session_id.to_string()],
+        ).expect("backdate session");
+        sessions.warm_cache().expect("warm cache after backdating");
+
+        // Recovery must see the stale session and mark it as such.
         sessions
             .recover_active_sessions(&state)
             .await
             .expect("recover active sessions");
-        assert!(
-            info.mount_path.exists(),
-            "recover should mount active session path"
+
+        let recovered = sessions
+            .get(session_id)
+            .expect("session should still exist");
+        assert_eq!(
+            recovered.status,
+            SessionStatus::Stale,
+            "48h-old session with 1s TTL should be marked stale"
+        );
+        assert_eq!(
+            sessions.list_active().len(),
+            0,
+            "no sessions should remain active"
         );
 
-        state.vfs.unmount_all().await;
         let _ = std::fs::remove_file(&db_path);
         if let Some(parent) = db_path.parent() {
             let _ = std::fs::remove_dir_all(parent);
@@ -628,7 +665,6 @@ mod tests {
                     std::env::temp_dir().join("simgit-lock-mount"),
                     false,
                     8,
-                    std::path::PathBuf::new(),
                 )
                 .expect("create session");
 
