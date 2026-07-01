@@ -145,6 +145,20 @@ pub enum VfsBackend {
     ///
     /// See [crate::vfs::nfs_backend].
     NfsLoopback,
+
+    /// WinFSP (Windows default).
+    ///
+    /// Uses the WinFSP user-mode filesystem driver (https://winfsp.dev)
+    /// via the `winfsp_wrs` crate to provide a kernel-level VFS mount.
+    /// Requires the WinFSP runtime installed on the machine (MSI installer,
+    /// Chocolatey, or bundled).  No reboot required.
+    ///
+    /// Write-time borrow-checking is enforced through WinFSP write callbacks →
+    /// SessionVfsOps → BorrowRegistry (identical guarantee to FUSE/NFS).
+    ///
+    /// See [crate::vfs::winfsp_backend].
+    #[cfg(windows)]
+    WinFsp,
 }
 
 impl Config {
@@ -195,6 +209,8 @@ impl Config {
             match val.to_lowercase().as_str() {
                 "fuse" => VfsBackend::Fuse,
                 "nfs" | "nfs-loopback" => VfsBackend::NfsLoopback,
+                #[cfg(windows)]
+                "winfsp" => VfsBackend::WinFsp,
                 other => {
                     eprintln!(
                         "simgitd: unknown SIMGIT_BACKEND={other}, falling back to platform default"
@@ -246,11 +262,12 @@ fn default_state_dir() -> PathBuf {
 }
 
 fn platform_default_backend() -> VfsBackend {
-    if cfg!(target_os = "macos") {
-        VfsBackend::NfsLoopback
-    } else {
-        VfsBackend::Fuse
-    }
+    #[cfg(target_os = "macos")]
+    { VfsBackend::NfsLoopback }
+    #[cfg(target_os = "windows")]
+    { VfsBackend::WinFsp }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    { VfsBackend::Fuse }
 }
 
 fn dirs_home() -> PathBuf {

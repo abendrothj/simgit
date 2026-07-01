@@ -35,5 +35,8 @@ opentelemetry-otlp    = { version = "0.27", features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.28"
 nfsserve              = "0.11"
 
+[target.'cfg(windows)'.dependencies]
+winfsp_wrs = "0.4"
+
 [dev-dependencies]
 walkdir = "2"

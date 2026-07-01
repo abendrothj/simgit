@@ -109,6 +109,8 @@ use crate::delta::DeltaStore;
 mod fuse_backend;
 mod git_resolver;
 mod nfs_backend;
+#[cfg(windows)]
+mod winfsp_backend;
 pub mod session_ops;
 
 /// Trait implemented by both the FUSE and NFS-loopback backends.
@@ -207,6 +209,10 @@ impl VfsManager {
         let backend: Box<dyn VfsBackendTrait> = match cfg.vfs_backend {
             VfsBackend::Fuse => Box::new(fuse_backend::FuseBackend::new(cfg, deltas, borrows)),
             VfsBackend::NfsLoopback => Box::new(nfs_backend::NfsLoopbackBackend::new(
+                cfg, deltas, borrows, metrics,
+            )),
+            #[cfg(windows)]
+            VfsBackend::WinFsp => Box::new(winfsp_backend::WinFspBackend::new(
                 cfg, deltas, borrows, metrics,
             )),
         };
