@@ -92,6 +92,19 @@ Agent runner / CLI / SDK
 - Idempotent commit resolution under ambiguous transport outcomes
 - Explicit terminal states for all commit requests (pending → success | failed)
 
+### Platform support and guarantee scope
+
+simgit ships two VFS backends, and **they do not provide the same guarantees today**:
+
+| Platform | Backend | Write-time enforcement | How conflicts are found |
+|---|---|---|---|
+| Linux | FUSE (`fuser`) | Yes — every read/write is intercepted by `SessionFs`, and `BorrowRegistry` is consulted on the write path itself | Detected the instant a write would violate exclusivity, in addition to the commit-time scan |
+| macOS | NFS-loopback (Phase 0 stub) | **No** — sessions are mounted as plain directories; agents write straight to disk with no interception | Inferred *after the fact*, by walking the mount directory, fingerprinting `(path, size, mtime)`, and diffing against the git baseline at commit time |
+
+In other words: on macOS, two agents can write to the same file concurrently with **no real-time prevention**. The daemon reconstructs what changed at commit time well enough to report a conflict, but it cannot stop the write from happening the way the FUSE backend can. If you need the write-time borrow-checking guarantee the project is named for, run simgitd on Linux. The macOS backend is a pragmatic stopgap (avoids the macFUSE kernel-extension/notarization dance) tracked for a real NFSv3 server in a future phase — see `simgitd/src/vfs/nfs_backend.rs` for the current implementation and roadmap.
+
+The nightly SLO/chaos suite (`docs/track2_chaos_validation.md`) currently runs on macOS runners, so its passing results validate the *commit-time reconciliation* path, not write-time exclusivity. Linux/FUSE correctness is covered by a separate, narrower integration suite (see Testing below).
+
 ## Repository layout
 
 ```text
