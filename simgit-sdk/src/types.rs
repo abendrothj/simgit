@@ -54,6 +54,7 @@ pub enum SessionStatus {
 ///     peers_enabled: false,
 ///     git_proxy_enabled: true,
 ///     initial_branch: None,
+///     socket_path: PathBuf::from("/tmp/simgit-dev/control.sock"),
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +90,10 @@ pub struct SessionInfo {
     /// When `None`, HEAD is in detached mode pointing to `base_commit`.
     #[serde(default)]
     pub initial_branch: Option<String>,
+    /// Path to the daemon's control socket (used by the git-proxy pre-commit
+    /// hook to route `git commit` → `sg commit`).
+    #[serde(default)]
+    pub socket_path: PathBuf,
 }
 
 fn default_git_proxy_enabled() -> bool {

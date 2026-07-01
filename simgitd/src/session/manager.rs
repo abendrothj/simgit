@@ -88,6 +88,7 @@ impl SessionManager {
         mount_path: PathBuf,
         peers: bool,
         max_sessions: usize,
+        socket_path: PathBuf,
     ) -> Result<SessionInfo> {
         // Enforce max-sessions limit.
         let active_count = {
@@ -116,6 +117,7 @@ impl SessionManager {
             peers_enabled: peers,
             git_proxy_enabled: true,
             initial_branch: None,
+            socket_path,
         };
 
         self.db.lock().unwrap().upsert_session(

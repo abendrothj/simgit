@@ -128,6 +128,8 @@ impl super::VfsBackendTrait for FuseBackend {
                     &session.base_commit,
                     &self.cfg.repo_path,
                     session.initial_branch.as_deref(),
+                    session.session_id,
+                    &session.socket_path,
                 )
                 .ok()
             } else {

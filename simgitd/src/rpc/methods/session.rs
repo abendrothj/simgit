@@ -41,6 +41,7 @@ pub(super) async fn session_create(
             mount_path.clone(),
             peers,
             state.config.max_sessions,
+            state.socket_path.clone(),
         )
         .map_err(|e| {
             let msg = e.to_string();

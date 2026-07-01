@@ -70,6 +70,7 @@
 //! 4. Delta blobs are finalized and persisted
 //! 5. Daemon process exits cleanly
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -120,14 +121,16 @@ use crate::vfs::VfsManager;
 /// ```
 #[derive(Clone)]
 pub struct AppState {
-    pub config:           Arc<Config>,
-    pub sessions:         Arc<SessionManager>,
-    pub borrows:          Arc<BorrowRegistry>,
-    pub deltas:           Arc<DeltaStore>,
-    pub events:           Arc<EventBroker>,
-    pub vfs:              Arc<VfsManager>,
-    pub metrics:          Arc<Metrics>,
+    pub config: Arc<Config>,
+    pub sessions: Arc<SessionManager>,
+    pub borrows: Arc<BorrowRegistry>,
+    pub deltas: Arc<DeltaStore>,
+    pub events: Arc<EventBroker>,
+    pub vfs: Arc<VfsManager>,
+    pub metrics: Arc<Metrics>,
     pub commit_scheduler: Arc<CommitScheduler>,
+    /// Path to the daemon's control socket.
+    pub socket_path: PathBuf,
 }
 
 /// Run the simgitd daemon until shutdown signal.
@@ -178,22 +181,27 @@ pub async fn run(cfg: Config) -> Result<()> {
 
     // Initialise subsystems.
     let sessions = Arc::new(SessionManager::open(&db_path).await?);
-    let borrows  = Arc::new(BorrowRegistry::new(Arc::clone(&sessions)));
+    let borrows = Arc::new(BorrowRegistry::new(Arc::clone(&sessions)));
     // Restore borrow locks that were held when the daemon previously shut down or crashed.
-    borrows.restore_locks().context("restore borrow locks from SQLite")?;
-    let deltas   = Arc::new(DeltaStore::new_with_quota(cfg.state_dir.join("deltas"), cfg.max_delta_bytes));
-    let events   = Arc::new(EventBroker::new());
-    let metrics  = Arc::new(Metrics::new()?);
-    let vfs      = Arc::new(VfsManager::new(
+    borrows
+        .restore_locks()
+        .context("restore borrow locks from SQLite")?;
+    let deltas = Arc::new(DeltaStore::new_with_quota(
+        cfg.state_dir.join("deltas"),
+        cfg.max_delta_bytes,
+    ));
+    let events = Arc::new(EventBroker::new());
+    let metrics = Arc::new(Metrics::new()?);
+    let vfs = Arc::new(VfsManager::new(
         Arc::clone(&cfg),
         Arc::clone(&deltas),
         Arc::clone(&borrows),
         Arc::clone(&metrics),
     ));
 
-    let commit_scheduler = Arc::new(CommitScheduler::new(
-        std::time::Duration::from_secs(cfg.commit_wait_secs),
-    ));
+    let commit_scheduler = Arc::new(CommitScheduler::new(std::time::Duration::from_secs(
+        cfg.commit_wait_secs,
+    )));
 
     let state = AppState {
         config: Arc::clone(&cfg),
@@ -204,6 +212,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         vfs,
         metrics,
         commit_scheduler,
+        socket_path: cfg.state_dir.join("control.sock"),
     };
 
     // Recover any sessions that were ACTIVE before a previous crash.
@@ -223,15 +232,14 @@ pub async fn run(cfg: Config) -> Result<()> {
         })
         .await
         {
-            Ok(Ok(out)) if out.status.success() =>
-                info!("git worktree prune: ok"),
-            Ok(Ok(out)) =>
-                warn!("git worktree prune exited {}: {}", out.status,
-                      String::from_utf8_lossy(&out.stderr).trim()),
-            Ok(Err(e)) =>
-                warn!("git worktree prune failed to spawn: {e}"),
-            Err(e) =>
-                warn!("git worktree prune task panicked: {e}"),
+            Ok(Ok(out)) if out.status.success() => info!("git worktree prune: ok"),
+            Ok(Ok(out)) => warn!(
+                "git worktree prune exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Ok(Err(e)) => warn!("git worktree prune failed to spawn: {e}"),
+            Err(e) => warn!("git worktree prune task panicked: {e}"),
         }
     }
 
@@ -239,15 +247,21 @@ pub async fn run(cfg: Config) -> Result<()> {
     // Sessions that were ACTIVE at crash time left behind delta dirs.  Any
     // delta dir whose UUID is not in the post-recovery ACTIVE set is orphaned.
     {
-        let active_ids: std::collections::HashSet<uuid::Uuid> =
-            state.sessions.list_active().iter().map(|s| s.session_id).collect();
+        let active_ids: std::collections::HashSet<uuid::Uuid> = state
+            .sessions
+            .list_active()
+            .iter()
+            .map(|s| s.session_id)
+            .collect();
         match state.deltas.list_sessions() {
             Ok(all_delta_ids) => {
                 for orphan_id in all_delta_ids {
                     if !active_ids.contains(&orphan_id) {
                         match state.deltas.purge_session(orphan_id) {
                             Ok(()) => info!(id = %orphan_id, "purged orphaned delta dir"),
-                            Err(e) => warn!(id = %orphan_id, err = %e, "failed to purge orphaned delta dir"),
+                            Err(e) => {
+                                warn!(id = %orphan_id, err = %e, "failed to purge orphaned delta dir")
+                            }
                         }
                     }
                 }
@@ -276,7 +290,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         None
     };
 
-    info!("simgitd ready — socket at {}", cfg.state_dir.join("control.sock").display());
+    info!(
+        "simgitd ready — socket at {}",
+        cfg.state_dir.join("control.sock").display()
+    );
 
     // Wait for SIGINT or SIGTERM.
     tokio::select! {

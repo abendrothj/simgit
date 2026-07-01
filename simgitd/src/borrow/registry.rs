@@ -135,6 +135,7 @@ impl BorrowRegistry {
                             peers_enabled: false,
                             git_proxy_enabled: false,
                             initial_branch: None,
+                            socket_path: PathBuf::new(),
                         });
                     Outcome::Conflict(BorrowError {
                         path: path.to_owned(),

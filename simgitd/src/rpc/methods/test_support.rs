@@ -1,8 +1,11 @@
 //! Shared `#[cfg(test)]` fixtures used by both `commit::tests` and `locks::tests`.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use std::path::PathBuf;
 
 use crate::borrow::BorrowRegistry;
 use crate::config::{Config, VfsBackend};
@@ -96,6 +99,7 @@ pub(super) async fn build_state_for_commit_tests() -> (Arc<AppState>, std::path:
         commit_scheduler: Arc::new(crate::commit_scheduler::CommitScheduler::new(
             std::time::Duration::from_secs(30),
         )),
+        socket_path: PathBuf::new(),
     });
     (state, root)
 }
