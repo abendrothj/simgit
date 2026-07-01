@@ -85,6 +85,7 @@ async fn fuse_mount_roundtrip_create_unlink_rename() {
         metrics_enabled: false,
         metrics_addr: "127.0.0.1:0".to_owned(),
         commit_peer_capture_concurrency: 4,
+        commit_wait_secs: 30,
     });
 
     let db_path = state_dir.join("state.db");
@@ -150,6 +151,7 @@ async fn fuse_mount_can_remount_same_session_path() {
         metrics_enabled: false,
         metrics_addr: "127.0.0.1:0".to_owned(),
         commit_peer_capture_concurrency: 4,
+        commit_wait_secs: 30,
     });
 
     let db_path = state_dir.join("state.db");
