@@ -64,9 +64,10 @@ simgit targets a third design point:
 - **Python bindings** — PyO3-backed, works with asyncio orchestrators
 - **Rust SDK** — async JSON-RPC client with typed request/response models
 - **`sg` CLI** — interactive session management and inspection
-- **Transparent git proxy** — synthetic `.git` index makes `git status`,
-  `git diff`, `git log`, and `git commit` work inside session mounts,
-  enabling drop-in replacement of `git worktree add` for LLM agents
+- **Drop-in worktree replacement** — minimal `.git` bootstrap (symlinked
+  `refs/`, `HEAD`, `objects/info/alternates`, `config`, one-time `index`
+  init) makes every git command work inside session mounts, so existing
+  LLM agents that shell out to `git` work without modification
 - **Chaos-validated** — SLO gate suite covering disjoint commits, hotspot contention, transport faults, and abandon storms
 
 ## Architecture
@@ -95,18 +96,22 @@ Agent runner / CLI / SDK
 - Idempotent commit resolution under ambiguous transport outcomes
 - Explicit terminal states for all commit requests (pending → success | failed)
 
-### Platform support and guarantee scope
+### Platform support and backend tiers
 
-simgit ships two VFS backends, and **they do not provide the same guarantees today**:
+simgit ships three VFS backends, all providing the same write-time
+borrow-checking guarantee through the shared `SessionVfsOps` trait:
 
-| Platform | Backend | Write-time enforcement | How conflicts are found |
+| Platform | Backend | Write-time enforcement | User friction |
 |---|---|---|---|
-| Linux | FUSE (`fuser`) | Yes — every read/write is intercepted by `SessionFs`, and `BorrowRegistry` is consulted on the write path itself | Detected the instant a write would violate exclusivity, in addition to the commit-time scan |
-| macOS | NFS-loopback (Phase 0 stub) | **No** — sessions are mounted as plain directories; agents write straight to disk with no interception | Inferred *after the fact*, by walking the mount directory, fingerprinting `(path, size, mtime)`, and diffing against the git baseline at commit time |
+| Linux | FUSE (`fuser`) | Yes — every read/write is intercepted by `SessionFs`, `BorrowRegistry` consulted on the write path | None (FUSE kernel module is standard) |
+| macOS (default) | Embedded NFSv3 server (`nfsserve`) | Yes — every NFSv3 `WRITE` RPC goes through `SessionVfsOps::write()` → `BorrowRegistry` | None (no install, no kernel extension, no macFUSE) |
+| macOS (opt-in) | FUSE via `SIMGIT_BACKEND=fuse` | Yes — identical to Linux FUSE path | One-time install: `brew install --cask macfuse` or `brew install fuse-t` |
+| macOS 15.4+ (future) | FSKit native provider | Yes — Apple's user-space FS framework, no kernel extension | One-time System Settings toggle; requires paid Apple Developer account to sign |
 
-In other words: on macOS, two agents can write to the same file concurrently with **no real-time prevention**. The daemon reconstructs what changed at commit time well enough to report a conflict, but it cannot stop the write from happening the way the FUSE backend can. If you need the write-time borrow-checking guarantee the project is named for, run simgitd on Linux. The macOS backend is a pragmatic stopgap (avoids the macFUSE kernel-extension/notarization dance) tracked for a real NFSv3 server in a future phase — see `simgitd/src/vfs/nfs_backend.rs` for the current implementation and roadmap.
-
-The nightly SLO/chaos suite (`docs/track2_chaos_validation.md`) currently runs on macOS runners, so its passing results validate the *commit-time reconciliation* path, not write-time exclusivity. Linux/FUSE correctness is covered by a separate, narrower integration suite (see Testing below).
+The nightly SLO/chaos suite currently runs on macOS with the NFSv3 backend. Linux
+FUSE correctness is covered by a separate integration suite that gates PRs
+(see `.github/workflows/fuse-linux-integration.yml`). Both backends share the
+same borrow-checking and CoW delta logic through `SessionVfsOps`.
 
 ## Repository layout
 

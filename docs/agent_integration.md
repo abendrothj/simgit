@@ -4,7 +4,7 @@ This guide is for building production-grade agent runners on top of simgit using
 
 ## Drop-in worktree replacement — using simgit sessions like `git worktree add`
 
-simgit sessions ship a synthetic `.git` directory at the mount root so that
+simgit sessions bootstrap a minimal `.git` directory at the mount root so that
 existing LLM coding agents that shell out to `git` work **without
 modification** inside a session mount.  This means you can replace:
 
@@ -22,45 +22,52 @@ cd /vdev/<session-uuid>
 
 and every subsequent `git` command the agent runs behaves correctly.
 
-### Git commands that work transparently
-
-| Command | What the agent sees |
-|---|---|
-| `git status` | Modified files = session delta vs baseline. Already-staged writes and deletes appear. |
-| `git diff` | Working tree vs index. Shows the session's uncommitted delta. |
-| `git diff --cached` | Index vs HEAD. Empty unless the agent explicitly runs `git add` on a file already in the index. |
-| `git log` | Full history up to `base_commit` (objects reachable via `objects/info/alternates`). |
-| `git blame <file>` | Line-level history from the real repository. |
-| `git show <commit>` | Any commit reachable from `base_commit`. |
-| `git add <file>` | **Idempotent.**  The file is already in the index after a write.  `git add` is a no-op. |
-
-### Git commands that are intercepted and rerouted
-
-| Command | What happens |
-|---|---|
-| `git commit -m "..."` | The `.git/hooks/pre-commit` hook fires, forwards the commit to the daemon via `sg commit --session <uuid> --branch <branch> --message "..."`, and prevents git from creating a local commit.  The agent's changes are committed through the simgit commit scheduler (conflict-aware, idempotent). |
-
-### Git commands that are NOT supported (by design)
-
-| Command | Why | What to do instead |
-|---|---|---|
-| `git checkout <branch>` | Sessions are pinned to `base_commit`. Switching branches would invalidate the delta overlay. | Create a new session (`sg new`) with the desired branch. |
-| `git push` / `git fetch` | The synthetic `.git` has no remotes configured. | The orchestrator handles push/fetch outside the session. |
-| `git merge` / `git rebase` | Conflict resolution is the orchestrator's concern, not the agent's. | Use simgit's structured merge at commit time; if auto-merge fails, the orchestrator receives a conflict payload and can plan a resolution. |
-| `git stash` | No git stash state. The session's delta IS the working state. | N/A — there's nothing to stash; all changes are tracked in the delta store. |
-
 ### How it works
 
-At session creation (`sg new` or `session.create` RPC), the daemon bootstraps a
-synthetic `.git` directory at the mount root:
+At session creation, the daemon bootstraps five files in `.git/` at the mount
+root — that's it:
 
-- `HEAD` → points to `base_commit` (detached or branch-ref).
-- `objects/info/alternates` → path to the real repo's object store, so all
-  blobs, trees, and commits are reachable without copying data.
-- `index` → a sparse index listing every file in `base_commit`'s tree as
-  tracked (stage 0).  Updated in real time on every write, delete, or rename
-  via the FUSE/NFS handler.
-- `hooks/pre-commit` → intercepts `git commit` and forwards to `sg commit`.
+| File | What it does |
+|---|---|
+| `.git/refs` → symlink to real repo's `refs/` | Every branch, tag, and remote ref resolves natively. Zero bytes, always in sync. |
+| `.git/HEAD` → `base_commit` | Git knows what commit the session is on. |
+| `.git/objects/info/alternates` → real repo's object store | All blobs, trees, and commits are reachable without copying data. |
+| `.git/config` → `[remote "origin"]` url | `git push` and `git fetch` work against the real remote. |
+| `.git/index` → one-time init via `git read-tree HEAD` | `git status` and `git diff` compare the working tree (served by the VFS overlay) against this baseline snapshot. No per-write updates needed — the VFS automatically serves delta versions for modified files, so git naturally sees them as "modified." |
+
+Two hooks handle the remaining integration:
+
+| Hook | What it does |
+|---|---|
+| `.git/hooks/pre-commit` | Intercepts `git commit` and forwards to `sg commit` via the daemon's commit scheduler (conflict-aware, idempotent). Prevents git from creating a local commit. |
+| `.git/hooks/post-checkout` | Called after `git checkout`. Notifies the daemon that the session's base commit changed, clears stale deltas, and reinitializes the delta store for the new base. |
+
+### Every git command works
+
+| Command | Status | Notes |
+|---|---|---|
+| `git status` | ✓ | Working tree (VFS) vs index (baseline snapshot). Delta files appear as modified. |
+| `git diff` | ✓ | Same comparison. |
+| `git diff --cached` | ✓ | Staging area vs HEAD. |
+| `git log` / `git blame` | ✓ | Objects via alternates, refs via symlink. |
+| `git show` | ✓ | Any commit reachable from the real repo. |
+| `git add` | ✓ | Idempotent — the VFS serves the written version, git sees the change. |
+| `git commit` | ✓ | Intercepted by pre-commit hook → `sg commit`. |
+| `git checkout <branch>` | ✓ | Resolves the branch via symlinked refs. Writes the new working tree through the VFS handler. Post-checkout hook updates the session's base commit. |
+| `git push` / `git fetch` | ✓ | Remote URL in `.git/config`. Refs update through the symlink. |
+| `git merge` / `git rebase` | ✓ | Git resolves refs via symlink, performs the operation, writes through VFS. |
+| `git stash` | ✓ | Stash refs are stored under the symlinked `refs/stash`. |
+| `git bisect` | ✓ | Git checks out commits, each firing the post-checkout hook. |
+| `git clean` | ✓ | Works against the VFS-served working tree. |
+
+### Session isolation
+
+The `.git/refs` symlink points at the shared real repo, but **all writes go
+through the per-session VFS handler**.  Two agents doing `git checkout` in
+parallel don't touch each other's files — the VFS intercepts every write and
+routes it to the per-session `DeltaStore` after consulting `BorrowRegistry`.
+The symlink is read-only metadata; it can't modify another session's working
+tree.
 
 ### Disabling the git proxy
 
@@ -73,13 +80,6 @@ session = simgit.Session.new(
     agent_label="planner-1",
     git_proxy_enabled=False,   # skips .git/ bootstrap
 )
-```
-
-Or via the Rust SDK:
-
-```rust
-client.session_create_with_opts("task", Some("label".into()), None, false, false)
-                                                                           // ^ git_proxy_enabled
 ```
 
 This reduces mount-time overhead when the agent only reads/writes files and
