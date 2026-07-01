@@ -40,8 +40,8 @@
 //! - `state_dir` must be writable and mode 0700 (prevent other users from accessing blobs/sockets)
 //! - `mnt_dir` is mode 0755 (per session mounts are 0700)
 
-use std::path::PathBuf;
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 /// Daemon configuration.
 ///
@@ -116,19 +116,32 @@ pub struct Config {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VfsBackend {
-    /// FUSE (Linux primary).
+    /// FUSE (Linux primary, also available on macOS when macFUSE or fuse-t is installed).
     ///
     /// Uses the `fuser` crate to handle filesystem requests.
     /// Requires FUSE kernel module loaded (present on all Linux distros).
-    /// No kernel extension or user approval needed.
+    /// On macOS, requires either:
+    ///   - macFUSE 5.2+ (FSKit backend, no kernel extension on macOS 26+),
+    ///     installed via `brew install --cask macfuse` and enabled in System Settings.
+    ///   - fuse-t (kext-less, uses local NFSv4/SMB/FSKit), installed via
+    ///     `brew install macos-fuse-t/homebrew-cask/fuse-t`.
+    ///
+    /// The `fuser` crate docs mark macOS support as "untested" — this is a
+    /// community-supported path.  If FUSE fails to mount, fall back to
+    /// `NfsLoopback`.
     ///
     /// See [crate::vfs::fuse_backend].
     Fuse,
 
-    /// NFS-loopback (macOS Phase 0, stub; Phase 1+, full NFSv3 server).
+    /// Embedded NFSv3 server (macOS default, also available on Linux).
     ///
-    /// Phase 0: Creates plain directories (no kernel involvement).
-    /// Phase 1+: Embeds an NFSv3 RPC server to avoid macFUSE kernel extension.
+    /// Binds an NFSv3 server on 127.0.0.1 and mounts via the system's
+    /// built-in NFS client.  No kernel extension, no third-party install —
+    /// zero friction on macOS and most Linux distros.
+    ///
+    /// Write-time borrow-checking is enforced synchronously through the
+    /// NFSv3 RPC handler → SessionVfsOps → BorrowRegistry (identical guarantee
+    /// to FUSE).
     ///
     /// See [crate::vfs::nfs_backend].
     NfsLoopback,
@@ -177,17 +190,27 @@ impl Config {
 
         let mnt_dir = state_dir.join("mnt");
 
-        let vfs_backend = if cfg!(target_os = "macos") {
-            VfsBackend::NfsLoopback
+        // Default by platform; override via SIMGIT_BACKEND env if set.
+        let vfs_backend = if let Ok(val) = std::env::var("SIMGIT_BACKEND") {
+            match val.to_lowercase().as_str() {
+                "fuse" => VfsBackend::Fuse,
+                "nfs" | "nfs-loopback" => VfsBackend::NfsLoopback,
+                other => {
+                    eprintln!(
+                        "simgitd: unknown SIMGIT_BACKEND={other}, falling back to platform default"
+                    );
+                    platform_default_backend()
+                }
+            }
         } else {
-            VfsBackend::Fuse
+            platform_default_backend()
         };
 
         Ok(Self {
             repo_path,
             state_dir,
             mnt_dir,
-            max_sessions:    256,
+            max_sessions: 256,
             max_delta_bytes: 2 * 1024 * 1024 * 1024,
             lock_ttl_seconds: 3600,
             session_recovery_ttl_seconds: std::env::var("SIMGIT_SESSION_RECOVERY_TTL")
@@ -200,11 +223,13 @@ impl Config {
                 .unwrap_or(true),
             metrics_addr: std::env::var("SIMGIT_METRICS_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:9100".to_owned()),
-            commit_peer_capture_concurrency: std::env::var("SIMGIT_COMMIT_PEER_CAPTURE_CONCURRENCY")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(8),
+            commit_peer_capture_concurrency: std::env::var(
+                "SIMGIT_COMMIT_PEER_CAPTURE_CONCURRENCY",
+            )
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(8),
             commit_wait_secs: std::env::var("SIMGIT_COMMIT_WAIT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -218,6 +243,14 @@ fn default_state_dir() -> PathBuf {
         return PathBuf::from(xdg).join("simgit");
     }
     dirs_home().join(".local").join("state").join("simgit")
+}
+
+fn platform_default_backend() -> VfsBackend {
+    if cfg!(target_os = "macos") {
+        VfsBackend::NfsLoopback
+    } else {
+        VfsBackend::Fuse
+    }
 }
 
 fn dirs_home() -> PathBuf {
