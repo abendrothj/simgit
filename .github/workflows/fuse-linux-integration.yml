@@ -4,6 +4,18 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 4 * * *"
+  pull_request:
+    paths:
+      - "simgitd/src/vfs/**"
+      - "simgitd/src/borrow/**"
+      - "simgitd/src/delta/**"
+      - ".github/workflows/fuse-linux-integration.yml"
+  push:
+    branches: [main]
+    paths:
+      - "simgitd/src/vfs/**"
+      - "simgitd/src/borrow/**"
+      - "simgitd/src/delta/**"
 
 jobs:
   linux-fuse-integration:
@@ -25,11 +37,20 @@ jobs:
             sudo modprobe fuse || true
           fi
           if [ ! -e /dev/fuse ]; then
+            sudo mknod -m 666 /dev/fuse c 10 229 || true
+          fi
+          if [ ! -e /dev/fuse ]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "FUSE device not available on this runner; skipping Linux mount integration tests."
+            echo "::warning::FUSE device not available on this runner; skipping Linux mount integration tests. This is the suite that validates write-time borrow-checking, so a skip here means that guarantee is unverified for this run."
           else
             echo "available=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Fail if FUSE unavailable on PR/push (must gate merges)
+        if: steps.fuse-check.outputs.available == 'false' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+        run: |
+          echo "FUSE integration tests are required for pull_request/push runs and could not be executed."
+          exit 1
 
       - name: Install Rust toolchain
         if: steps.fuse-check.outputs.available == 'true'

@@ -200,9 +200,10 @@ High-value metrics:
 Minimum CI gate set:
 
 1. cargo test --workspace
-2. smoke run of tests/real_agent_harness.py with reduced agents
-3. nightly Track 2 swarm_runner execution with artifact upload
-4. threshold regression check against prior p95 baselines
+2. Linux FUSE integration suite (`.github/workflows/fuse-linux-integration.yml`) on every PR/push touching `simgitd/src/vfs`, `simgitd/src/borrow`, or `simgitd/src/delta` — this is the only suite that exercises write-time borrow-checking (see README “Platform support and guarantee scope”). It fails the run instead of skipping if `/dev/fuse` is unavailable on PR/push events.
+3. smoke run of tests/real_agent_harness.py with reduced agents
+4. nightly Track 2 swarm_runner execution with artifact upload (macOS backend; validates commit-time reconciliation, not write-time exclusivity)
+5. threshold regression check against prior p95 baselines
 
 ## Failure triage checklist
 
