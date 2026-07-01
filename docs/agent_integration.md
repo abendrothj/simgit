@@ -29,7 +29,7 @@ root — that's it:
 
 | File | What it does |
 |---|---|
-| `.git/refs` → symlink to real repo's `refs/` | Every branch, tag, and remote ref resolves natively. Zero bytes, always in sync. |
+| `.git/refs` → copy of real repo's `refs/` | Every branch, tag, and remote ref is available locally. ~10-600 KB per session. Copied at bootstrap so git treats the session as having a real local commit history — required for `git stash`, `git blame`, and `git merge`. |
 | `.git/HEAD` → `base_commit` | Git knows what commit the session is on. |
 | `.git/objects/info/alternates` → real repo's object store | All blobs, trees, and commits are reachable without copying data. |
 | `.git/config` → `[remote "origin"]` url | `git push` and `git fetch` work against the real remote. |

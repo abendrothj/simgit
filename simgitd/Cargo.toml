@@ -34,3 +34,6 @@ opentelemetry_sdk     = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp    = { version = "0.27", features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.28"
 nfsserve              = "0.11"
+
+[dev-dependencies]
+walkdir = "2"

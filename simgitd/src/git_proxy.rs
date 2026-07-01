@@ -65,7 +65,12 @@ impl GitProxy {
         };
         fs::write(git_dir.join("HEAD"), &head)?;
 
-        // ── refs/ → symlink to real repo's refs ──────────────────────────
+        // ── refs/ → copy from real repo ─────────────────────────────────
+        // We COPY rather than symlink so that the session's .git/refs is a
+        // proper standalone ref store.  This lets git stash, git blame, git
+        // merge, etc. treat the session as having a real local commit
+        // history (the objects are still shared via alternates).
+        // A typical repo's refs are ~10-600 KB — negligible per session.
         let real_git_dir = repo_path
             .canonicalize()
             .with_context(|| format!("canonicalize repo path {}", repo_path.display()))?
@@ -75,16 +80,17 @@ impl GitProxy {
 
         if real_refs.exists() {
             if session_refs.exists() || session_refs.read_link().is_ok() {
-                let _ = fs::remove_file(&session_refs);
+                let _ = fs::remove_dir_all(&session_refs);
             }
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&real_refs, &session_refs)
-                .with_context(|| format!("symlink refs/ from {}", real_refs.display()))?;
-            #[cfg(not(unix))]
-            {
-                // Windows fallback: copy refs tree.
-                copy_dir_all(&real_refs, &session_refs)?;
-            }
+            copy_dir_all(&real_refs, &session_refs)
+                .with_context(|| format!("copy refs from {}", real_refs.display()))?;
+        }
+
+        // Write the current branch ref so the session has a local HEAD ref.
+        if let Some(branch) = initial_branch {
+            let branch_ref_dir = session_refs.join("heads");
+            fs::create_dir_all(&branch_ref_dir)?;
+            fs::write(branch_ref_dir.join(branch), format!("{base_commit}\n"))?;
         }
 
         // ── alternates ────────────────────────────────────────────────────
@@ -183,7 +189,6 @@ fn git_remote_url(repo_path: &Path, remote: &str) -> Result<String> {
     }
 }
 
-#[cfg(not(unix))]
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -278,12 +283,9 @@ mod tests {
             .join("post-checkout")
             .exists());
 
-        // refs should be a symlink on unix, or a directory on windows
+        // refs should exist as a directory (copied from real repo)
         let refs = mount.join(".git").join("refs");
-        assert!(
-            refs.exists() || refs.read_link().is_ok(),
-            "refs should exist (directory or symlink)"
-        );
+        assert!(refs.exists() && refs.is_dir(), "refs should be a directory");
     }
 
     #[test]
@@ -321,18 +323,44 @@ mod tests {
         );
     }
 
+    /// Helper: copy working tree files from repo to mount so git sees them.
+    /// The mount is empty after bootstrap (only .git/ exists).
+    fn populate_working_tree(repo: &Path, mount: &Path) {
+        for entry in walkdir::WalkDir::new(repo)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().file_name().map(|n| n != ".git").unwrap_or(true))
+        {
+            let rel = entry.path().strip_prefix(repo).unwrap();
+            let dest = mount.join(rel);
+            if entry.file_type().is_dir() {
+                let _ = fs::create_dir_all(&dest);
+            } else if entry.file_type().is_file() {
+                if let Some(parent) = dest.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::copy(entry.path(), &dest);
+            }
+        }
+    }
+
+    /// Run a git command inside the mount, using the synthetic .git.
+    fn git_in_mount(mount: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .current_dir(mount)
+            .env("GIT_DIR", mount.join(".git"))
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    // ── git status ────────────────────────────────────────────────────────
+
     #[test]
-    fn checkout_resolves_branch() {
+    fn git_status_shows_modified_file() {
         let repo = temp_dir();
         init_git_repo(&repo);
-        let base = create_and_commit(&repo, "a.txt", "a\n");
-
-        // Create a branch
-        std::process::Command::new("git")
-            .current_dir(&repo)
-            .args(["branch", "feature-x"])
-            .output()
-            .unwrap();
+        let base = create_and_commit(&repo, "src/main.rs", "fn main() {}\n");
 
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
@@ -341,25 +369,329 @@ mod tests {
             &repo,
             Some("main"),
             Uuid::now_v7(),
-            Path::new("/tmp/sock"),
+            Path::new("/tmp/s"),
         )
         .expect("bootstrap");
 
-        // git checkout should work because refs/ is symlinked
-        let checkout = std::process::Command::new("git")
-            .current_dir(&mount)
-            .env("GIT_DIR", mount.join(".git"))
-            .args(["checkout", "feature-x"])
+        // Populate the working tree from repo, then modify a file.
+        populate_working_tree(&repo, &mount);
+        fs::write(
+            mount.join("src/main.rs"),
+            "fn main() { println!(\"hi\"); }\n",
+        )
+        .unwrap();
+
+        let out = git_in_mount(&mount, &["status", "--porcelain"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("src/main.rs"),
+            "git status should show modified file: {stdout}"
+        );
+    }
+
+    #[test]
+    fn git_status_shows_untracked_file() {
+        let repo = temp_dir();
+        init_git_repo(&repo);
+        let base = create_and_commit(&repo, "a.txt", "a\n");
+
+        let mount = temp_dir();
+        let _proxy = GitProxy::bootstrap(
+            &mount,
+            &base,
+            &repo,
+            Some("main"),
+            Uuid::now_v7(),
+            Path::new("/tmp/s"),
+        )
+        .expect("bootstrap");
+
+        populate_working_tree(&repo, &mount);
+        fs::write(mount.join("untracked.txt"), "new\n").unwrap();
+
+        let out = git_in_mount(&mount, &["status", "--porcelain"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("untracked.txt"),
+            "git status should show untracked file: {stdout}"
+        );
+    }
+
+    // ── git diff ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_diff_shows_changes() {
+        let repo = temp_dir();
+        init_git_repo(&repo);
+        let base = create_and_commit(&repo, "f.txt", "original\n");
+
+        let mount = temp_dir();
+        let _proxy = GitProxy::bootstrap(
+            &mount,
+            &base,
+            &repo,
+            Some("main"),
+            Uuid::now_v7(),
+            Path::new("/tmp/s"),
+        )
+        .expect("bootstrap");
+
+        populate_working_tree(&repo, &mount);
+        fs::write(mount.join("f.txt"), "modified\n").unwrap();
+
+        let out = git_in_mount(&mount, &["diff", "--", "f.txt"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("--- a/f.txt"),
+            "diff should show file header: {stdout}"
+        );
+        assert!(
+            stdout.contains("+++ b/f.txt"),
+            "diff should show file header: {stdout}"
+        );
+        assert!(
+            stdout.contains("-original"),
+            "diff should show removed line: {stdout}"
+        );
+        assert!(
+            stdout.contains("+modified"),
+            "diff should show added line: {stdout}"
+        );
+    }
+
+    // ── git log ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_log_shows_commits() {
+        let repo = temp_dir();
+        init_git_repo(&repo);
+        let base = create_and_commit(&repo, "a.txt", "first\n");
+
+        let mount = temp_dir();
+        let _proxy = GitProxy::bootstrap(
+            &mount,
+            &base,
+            &repo,
+            Some("main"),
+            Uuid::now_v7(),
+            Path::new("/tmp/s"),
+        )
+        .expect("bootstrap");
+
+        let out = git_in_mount(&mount, &["log", "--oneline"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.trim().is_empty(),
+            "git log should show at least one commit: {stdout}"
+        );
+    }
+
+    // ── git add ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_add_stages_new_file() {
+        let repo = temp_dir();
+        init_git_repo(&repo);
+        let base = create_and_commit(&repo, "a.txt", "a\n");
+
+        let mount = temp_dir();
+        let _proxy = GitProxy::bootstrap(
+            &mount,
+            &base,
+            &repo,
+            Some("main"),
+            Uuid::now_v7(),
+            Path::new("/tmp/s"),
+        )
+        .expect("bootstrap");
+
+        populate_working_tree(&repo, &mount);
+        fs::write(mount.join("new.rs"), "// code\n").unwrap();
+        git_in_mount(&mount, &["add", "new.rs"]);
+
+        let out = git_in_mount(&mount, &["status", "--porcelain"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Staged new file shows as "A " (added in index).
+        assert!(
+            stdout.contains("new.rs"),
+            "git status should show staged new.rs: {stdout}"
+        );
+    }
+
+    // ── git stash ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_stash_and_pop_roundtrip() {
+        let repo = temp_dir();
+        init_git_repo(&repo);
+        let base = create_and_commit(&repo, "f.txt", "original\n");
+
+        let mount = temp_dir();
+        let _proxy = GitProxy::bootstrap(
+            &mount,
+            &base,
+            &repo,
+            Some("main"),
+            Uuid::now_v7(),
+            Path::new("/tmp/s"),
+        )
+        .expect("bootstrap");
+
+        populate_working_tree(&repo, &mount);
+        fs::write(mount.join("f.txt"), "modified for stash\n").unwrap();
+
+        let stash_out = git_in_mount(&mount, &["stash", "push", "-m", "test stash"]);
+        assert!(
+            stash_out.status.success(),
+            "git stash should succeed: {:?} {}",
+            stash_out.status,
+            String::from_utf8_lossy(&stash_out.stderr),
+        );
+
+        // File should be back to original after stash.
+        let after = fs::read_to_string(mount.join("f.txt")).unwrap();
+        assert_eq!(after, "original\n", "file should be reverted after stash");
+
+        // Pop the stash.
+        git_in_mount(&mount, &["stash", "pop"]);
+        let restored = fs::read_to_string(mount.join("f.txt")).unwrap();
+        assert_eq!(
+            restored, "modified for stash\n",
+            "file should be restored after stash pop"
+        );
+    }
+
+    // ── git clean ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_clean_removes_untracked_file() {
+        let repo = temp_dir();
+        init_git_repo(&repo);
+        let base = create_and_commit(&repo, "a.txt", "a\n");
+
+        let mount = temp_dir();
+        let _proxy = GitProxy::bootstrap(
+            &mount,
+            &base,
+            &repo,
+            Some("main"),
+            Uuid::now_v7(),
+            Path::new("/tmp/s"),
+        )
+        .expect("bootstrap");
+
+        populate_working_tree(&repo, &mount);
+        let junk = mount.join("junk.tmp");
+        fs::write(&junk, "delete me\n").unwrap();
+        assert!(junk.exists(), "junk file should exist before clean");
+
+        git_in_mount(&mount, &["clean", "-f"]);
+        assert!(
+            !junk.exists(),
+            "junk file should be removed after git clean -f"
+        );
+    }
+
+    // ── git blame ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_blame_shows_annotation() {
+        let repo = temp_dir();
+        init_git_repo(&repo);
+        let base = create_and_commit(&repo, "code.rs", "line one\nline two\n");
+
+        let mount = temp_dir();
+        let _proxy = GitProxy::bootstrap(
+            &mount,
+            &base,
+            &repo,
+            Some("main"),
+            Uuid::now_v7(),
+            Path::new("/tmp/s"),
+        )
+        .expect("bootstrap");
+
+        populate_working_tree(&repo, &mount);
+
+        let out = git_in_mount(&mount, &["blame", "code.rs"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("line one") || stdout.contains("line two"),
+            "git blame should annotate lines: {stdout}"
+        );
+    }
+
+    // ── git show ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_show_shows_commit_details() {
+        let repo = temp_dir();
+        init_git_repo(&repo);
+        let base = create_and_commit(&repo, "hello.txt", "hello\n");
+
+        let mount = temp_dir();
+        let _proxy = GitProxy::bootstrap(
+            &mount,
+            &base,
+            &repo,
+            Some("main"),
+            Uuid::now_v7(),
+            Path::new("/tmp/s"),
+        )
+        .expect("bootstrap");
+
+        let out = git_in_mount(&mount, &["show", "--stat", "HEAD"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("hello.txt"),
+            "git show --stat should list files: {stdout}"
+        );
+    }
+
+    // ── git merge ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn git_merge_resolves_fast_forward() {
+        let repo = temp_dir();
+        init_git_repo(&repo);
+        let _base = create_and_commit(&repo, "a.txt", "a\n");
+
+        // Create a feature branch with an extra commit.
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["checkout", "-b", "feature"])
+            .output()
+            .unwrap();
+        let feature_head = create_and_commit(&repo, "b.txt", "b\n");
+
+        // Back to main.
+        std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["checkout", "main"])
             .output()
             .unwrap();
 
-        // checkout may fail if there's no sg session-set-base, but the
-        // important thing is that git resolved the branch
-        let stderr = String::from_utf8_lossy(&checkout.stderr);
-        let stdout = String::from_utf8_lossy(&checkout.stdout);
+        // Bootstrap on main in the mount.
+        let mount = temp_dir();
+        let _proxy = GitProxy::bootstrap(
+            &mount,
+            &feature_head,
+            &repo,
+            Some("main"),
+            Uuid::now_v7(),
+            Path::new("/tmp/s"),
+        )
+        .expect("bootstrap");
+
+        populate_working_tree(&repo, &mount);
+
+        // Merge feature into main.
+        let merge = git_in_mount(&mount, &["merge", "feature"]);
         assert!(
-            stdout.contains("feature-x") || stderr.contains("feature-x"),
-            "should resolve feature-x branch: stdout={stdout} stderr={stderr}"
+            merge.status.success(),
+            "merge should succeed: stdout={} stderr={}",
+            String::from_utf8_lossy(&merge.stdout),
+            String::from_utf8_lossy(&merge.stderr),
         );
     }
 }
