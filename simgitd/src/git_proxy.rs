@@ -32,6 +32,13 @@
 //! and stores deltas in the per-session DeltaStore.  Two agents doing
 //! `git checkout` in parallel don't touch each other's files.  The refs copy
 //! is read-only metadata — it can't modify another session's working tree.
+//!
+//! # Not a git worktree
+//!
+//! simgit sessions are **not** registered as `git worktree` entries.  The
+//! synthetic `.git/` directory is standalone — `git worktree list` in the
+//! real repo won't show sessions.  This avoids the disk and I/O overhead of
+//! real worktrees (N full checkouts).  Use `sg session list` for discovery.
 
 use std::fs;
 use std::path::{Path, PathBuf};

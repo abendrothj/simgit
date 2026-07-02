@@ -72,6 +72,24 @@ routes it to the per-session `DeltaStore` after consulting `BorrowRegistry`.
 The refs copy is read-only metadata; it can't modify another session's working
 tree.
 
+### Why sessions aren't git worktrees
+
+simgit sessions are **not** registered as `git worktree` entries in the real
+repo's `.git/worktrees/`.  This is intentional:
+
+- **`git worktree list` won't show simgit sessions**.  Each session is a
+  standalone VFS mount with its own synthetic `.git/` directory.  The real
+  repo is unaware of sessions.
+- **No disk overhead**.  Real worktrees duplicate the full working tree on
+  disk (N worktrees × repo size).  simgit sessions consume zero baseline disk
+  and store only the files the agent actually writes (copy-on-write deltas).
+- **No checkout penalty**.  Sessions are created in microseconds.  There is
+  no `git checkout` — the VFS serves files on-demand from the git object
+  store.
+
+The tradeoff is that tooling expecting `git worktree list` or `.git/worktrees/`
+entries won't discover simgit sessions.  Use `sg session list` instead.
+
 ### Disabling the git proxy
 
 If agents don't need `git` subprocess support, set:
