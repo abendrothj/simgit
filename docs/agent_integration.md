@@ -24,18 +24,20 @@ and every subsequent `git` command the agent runs behaves correctly.
 
 ### How it works
 
-At session creation, the daemon bootstraps five files in `.git/` at the mount
-root — that's it:
+At session creation, the daemon bootstraps a minimal `.git/` at the mount
+root:
 
 | File | What it does |
 |---|---|
 | `.git/refs` → copy of real repo's `refs/` | Every branch, tag, and remote ref is available locally. ~10-600 KB per session. Copied at bootstrap so git treats the session as having a real local commit history — required for `git stash`, `git blame`, and `git merge`. |
+| `.git/packed-refs` → copy of real repo's `packed-refs` | Ref entries stored in packed format (common for tags and stale branches) are visible. |
+| `.git/logs/` | Empty reflog directory so `git reflog` and `git stash` log history work. |
 | `.git/HEAD` → `base_commit` | Git knows what commit the session is on. |
 | `.git/objects/info/alternates` → real repo's object store | All blobs, trees, and commits are reachable without copying data. |
-| `.git/config` → `[remote "origin"]` url | `git push` and `git fetch` work against the real remote. |
+| `.git/config` | Inherits `user.name`, `user.email`, `remote.origin.url`, and key `core.*`/`pull.*`/`push.*` values from the real repo. |
 | `.git/index` → one-time init via `git read-tree HEAD` | `git status` and `git diff` compare the working tree (served by the VFS overlay) against this baseline snapshot. No per-write updates needed — the VFS automatically serves delta versions for modified files, so git naturally sees them as "modified." |
 
-Four hooks handle the remaining integration:
+Six hooks handle the remaining integration:
 
 | Hook | What it does |
 |---|---|
@@ -43,6 +45,8 @@ Four hooks handle the remaining integration:
 | `.git/hooks/post-checkout` | Called after `git checkout`. Notifies the daemon that the session's base commit changed, clears stale deltas, and reinitializes the delta store for the new base. |
 | `.git/hooks/post-merge` | Called after `git merge` / `git pull`. Updates the session's base commit to the merge result. |
 | `.git/hooks/post-rewrite` | Called after `git rebase` / `git commit --amend`. Updates the session's base commit to the rewritten HEAD. |
+| `.git/hooks/commit-msg` | Pass-through for agent commit-message validation hooks. |
+| `.git/hooks/pre-push` | Refreshes session state before `git push` so the daemon sees the latest base commit. |
 
 ### Every git command works
 

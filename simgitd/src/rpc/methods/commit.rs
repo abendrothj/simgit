@@ -372,17 +372,64 @@ pub(super) async fn session_commit(
         // and git can finalize its local commit (pre-commit hook path).
         // Unmount happens on session abort or daemon shutdown.
 
-        // Refresh the session's .git/refs from the real repo so the agent
-        // sees the latest branch state including the new commit.
+        // Refresh the session's git state from the real repo so the agent
+        // sees the latest branches/tags including the new commit.
         {
-            let real_refs = state.config.repo_path.join(".git").join("refs");
-            let session_refs = info.mount_path.join(".git").join("refs");
+            let real_git = state.config.repo_path.join(".git");
+            let session_git = info.mount_path.join(".git");
+
+            // Preserve the session's local stash refs before overwriting.
+            let session_stash = session_git.join("refs").join("stash");
+            let stash_backup = if session_stash.exists() {
+                let mut data = Vec::new();
+                if std::fs::File::open(&session_stash)
+                    .and_then(|mut f| std::io::Read::read_to_end(&mut f, &mut data))
+                    .is_ok()
+                {
+                    Some(data)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Refresh refs/ from real repo.
+            let real_refs = real_git.join("refs");
+            let session_refs = session_git.join("refs");
             if real_refs.exists() {
                 if session_refs.exists() || session_refs.is_symlink() {
                     let _ = std::fs::remove_dir_all(&session_refs);
                 }
                 if let Err(e) = copy_dir_all(&real_refs, &session_refs) {
                     tracing::warn!(session = %session_id, err = %e, "failed to refresh session refs");
+                }
+            }
+
+            // Restore preserved stash refs.
+            if let Some(data) = stash_backup {
+                if let Some(parent) = session_stash.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&session_stash, &data);
+            }
+
+            // Refresh packed-refs.
+            let real_packed = real_git.join("packed-refs");
+            let session_packed = session_git.join("packed-refs");
+            if real_packed.exists() {
+                let _ = std::fs::copy(&real_packed, &session_packed);
+            }
+
+            // Re-initialize the index from the new HEAD so git status/diff
+            // show correct results after the daemon's commit.
+            if session_git.join("HEAD").exists() {
+                let index_init = std::process::Command::new("git")
+                    .env("GIT_DIR", &session_git)
+                    .args(["read-tree", "HEAD"])
+                    .output();
+                if let Err(ref e) = index_init {
+                    tracing::warn!(session = %session_id, err = %e, "git read-tree HEAD failed during post-commit refresh");
                 }
             }
         }

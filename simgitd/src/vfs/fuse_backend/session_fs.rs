@@ -308,7 +308,7 @@ impl SessionVfsOps for SessionFs {
         }
 
         if let Some(meta) = self.inode_map.delta_file_of(id) {
-            if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(true) {
+            if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(false) {
                 return Err(VfsOpError::NotFound);
             }
             return Ok(VfsAttr {
@@ -337,7 +337,7 @@ impl SessionVfsOps for SessionFs {
         let Some(path) = self.inode_map.path_of(id) else {
             return Err(VfsOpError::NotFound);
         };
-        if delta_path_deleted(&self.deltas, self.session_id, &path).unwrap_or(true) {
+        if delta_path_deleted(&self.deltas, self.session_id, &path).unwrap_or(false) {
             return Err(VfsOpError::NotFound);
         }
 
@@ -374,7 +374,7 @@ impl SessionVfsOps for SessionFs {
         }
 
         if let Some(meta) = self.inode_map.delta_file_of(id) {
-            if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(true) {
+            if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(false) {
                 return Err(VfsOpError::NotFound);
             }
             let data = match self.deltas.read_blob(self.session_id, &meta.path) {
@@ -394,7 +394,7 @@ impl SessionVfsOps for SessionFs {
         let Some(path) = self.inode_map.path_of(id) else {
             return Err(VfsOpError::NotFound);
         };
-        if delta_path_deleted(&self.deltas, self.session_id, &path).unwrap_or(true) {
+        if delta_path_deleted(&self.deltas, self.session_id, &path).unwrap_or(false) {
             return Err(VfsOpError::NotFound);
         }
 
@@ -772,7 +772,7 @@ impl SessionVfsOps for SessionFs {
             return Err(VfsOpError::IsADirectory);
         }
         if let Some(meta) = self.inode_map.delta_file_of(id) {
-            if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(true) {
+            if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(false) {
                 return Err(VfsOpError::NotFound);
             }
             return Ok(());
@@ -788,7 +788,7 @@ impl SessionVfsOps for SessionFs {
         let Some(path) = self.inode_map.path_of(id) else {
             return Err(VfsOpError::NotFound);
         };
-        if delta_path_deleted(&self.deltas, self.session_id, &path).unwrap_or(true) {
+        if delta_path_deleted(&self.deltas, self.session_id, &path).unwrap_or(false) {
             return Err(VfsOpError::NotFound);
         }
         Ok(())

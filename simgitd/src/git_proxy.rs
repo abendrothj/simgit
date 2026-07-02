@@ -13,6 +13,8 @@
 //! 7. **Write `hooks/post-checkout`** — notifies the daemon when the session's base commit changes.
 //! 8. **Write `hooks/post-merge`** — notifies the daemon after `git merge`/`git pull`.
 //! 9. **Write `hooks/post-rewrite`** — notifies the daemon after `git rebase`/`git commit --amend`.
+//! 10. **Write `hooks/commit-msg`** — pass-through for agent message validation.
+//! 11. **Write `hooks/pre-push`** — refreshes session state before push.
 //!
 //! The VFS overlay handles reads (fall through to the real file when no delta)
 //! and writes (intercept for borrow-checking + delta storage). Git sees a real
@@ -66,6 +68,8 @@ impl GitProxy {
         // ── Directory structure ───────────────────────────────────────────
         fs::create_dir_all(git_dir.join("hooks"))
             .with_context(|| format!("create .git/hooks in {}", mount_path.display()))?;
+        fs::create_dir_all(git_dir.join("logs"))
+            .with_context(|| format!("create .git/logs in {}", mount_path.display()))?;
 
         // ── HEAD ──────────────────────────────────────────────────────────
         let head = if let Some(branch) = initial_branch {
@@ -96,6 +100,15 @@ impl GitProxy {
                 .with_context(|| format!("copy refs from {}", real_refs.display()))?;
         }
 
+        // Also copy packed-refs so tags and branches stored in the packed
+        // format are visible in the session.
+        let real_packed = real_git_dir.join("packed-refs");
+        let session_packed = git_dir.join("packed-refs");
+        if real_packed.exists() {
+            fs::copy(&real_packed, &session_packed)
+                .with_context(|| format!("copy packed-refs from {}", real_packed.display()))?;
+        }
+
         // Write the current branch ref so the session has a local HEAD ref.
         if let Some(branch) = initial_branch {
             let branch_ref_dir = session_refs.join("heads");
@@ -118,12 +131,18 @@ impl GitProxy {
             .unwrap_or_else(|| "simgit".to_owned());
         let user_email = git_config_get(repo_path, "user.email")
             .unwrap_or_else(|| "simgit@localhost".to_owned());
+
+        // Inherit key config values from the real repo so the session
+        // behaves identically to a real worktree.
+        let inherited_config = build_inherited_config(repo_path);
+
         fs::write(
             git_dir.join("config"),
             format!(
                 "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\
                  [user]\n\tname = {user_name}\n\temail = {user_email}\n\
-                 {remote_section}",
+                 {remote_section}\
+                 {inherited_config}",
                 remote_section = if origin_url.is_empty() {
                     String::new()
                 } else {
@@ -195,6 +214,31 @@ impl GitProxy {
         );
         write_executable_hook(&git_dir, "post-rewrite", &post_rewrite)?;
 
+        // ── commit-msg hook ────────────────────────────────────────────────
+        // Allow the agent's commit-msg hook (e.g. ticket ID validation) to
+        // run by providing a pass-through that preserves the message file.
+        // The real repo's commit-msg hook is not replicated — agents should
+        // apply their own message policies through the hook mechanism.
+        let commit_msg = format!(
+            "#!/bin/sh\n\
+             # simgit: commit-msg pass-through\n\
+             # The message file ($1) is preserved; sg commit already ran.\n\
+             exit 0\n"
+        );
+        write_executable_hook(&git_dir, "commit-msg", &commit_msg)?;
+
+        // ── pre-push hook ──────────────────────────────────────────────────
+        // Notify daemon before git push so it can refresh refs.
+        let pre_push = format!(
+            "#!/bin/sh\n\
+             # simgit: update session refs before push\n\
+             # $1 = remote name, $2 = remote URL\n\
+             HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null) && \\\n\
+             sg session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+            sid = session_id,
+        );
+        write_executable_hook(&git_dir, "pre-push", &pre_push)?;
+
         Ok(Self { git_dir })
     }
 }
@@ -239,6 +283,53 @@ fn git_config_get(repo_path: &Path, key: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Inherit key config values from the real repo so the session behaves
+/// identically to a real worktree. Skips keys simgit manages itself.
+fn build_inherited_config(repo_path: &Path) -> String {
+    let keys = &[
+        "core.autocrlf",
+        "core.filemode",
+        "core.safecrlf",
+        "core.symlinks",
+        "core.ignorecase",
+        "core.precomposeunicode",
+        "core.sshCommand",
+        "core.editor",
+        "core.pager",
+        "core.quotePath",
+        "credential.helper",
+        "http.proxy",
+        "https.proxy",
+        "http.sslVerify",
+        "pull.rebase",
+        "pull.ff",
+        "push.default",
+        "push.autoSetupRemote",
+        "commit.gpgsign",
+        "tag.gpgsign",
+        "tag.sort",
+        "rerere.enabled",
+        "diff.algorithm",
+        "diff.renameLimit",
+        "init.defaultBranch",
+        "merge.conflictStyle",
+        "merge.ff",
+    ];
+
+    let mut out = String::new();
+    for key in keys {
+        if let Some(val) = git_config_get(repo_path, key) {
+            // Split dotted key into section.key: core.autocrlf → [core] \t autocrlf = val
+            if let Some(dot) = key.find('.') {
+                let section = &key[..dot];
+                let subkey = &key[dot + 1..];
+                out.push_str(&format!("[{section}]\n\t{subkey} = {val}\n"));
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
@@ -339,6 +430,13 @@ mod tests {
             .join("hooks")
             .join("post-rewrite")
             .exists());
+        assert!(mount.join(".git").join("hooks").join("commit-msg").exists());
+        assert!(mount.join(".git").join("hooks").join("pre-push").exists());
+        assert!(
+            mount.join(".git").join("logs").exists()
+                && mount.join(".git").join("logs").is_dir(),
+            ".git/logs should exist"
+        );
 
         // refs should exist as a directory (copied from real repo)
         let refs = mount.join(".git").join("refs");

@@ -228,7 +228,7 @@ impl SessionVfsOps for NfsSession {
                 self.session_id,
                 &meta.path,
             )
-            .unwrap_or(true)
+            .unwrap_or(false)
             {
                 return Err(VfsOpError::NotFound);
             }
@@ -259,7 +259,7 @@ impl SessionVfsOps for NfsSession {
             return Err(VfsOpError::NotFound);
         };
         if crate::vfs::session_ops::delta_path_deleted(&self.deltas, self.session_id, &path)
-            .unwrap_or(true)
+            .unwrap_or(false)
         {
             return Err(VfsOpError::NotFound);
         }
@@ -302,7 +302,7 @@ impl SessionVfsOps for NfsSession {
                 self.session_id,
                 &meta.path,
             )
-            .unwrap_or(true)
+            .unwrap_or(false)
             {
                 return Err(VfsOpError::NotFound);
             }
@@ -329,7 +329,7 @@ impl SessionVfsOps for NfsSession {
             return Err(VfsOpError::NotFound);
         };
         if crate::vfs::session_ops::delta_path_deleted(&self.deltas, self.session_id, &path)
-            .unwrap_or(true)
+            .unwrap_or(false)
         {
             return Err(VfsOpError::NotFound);
         }
@@ -717,7 +717,7 @@ impl SessionVfsOps for NfsSession {
                 self.session_id,
                 &meta.path,
             )
-            .unwrap_or(true)
+            .unwrap_or(false)
             {
                 return Err(VfsOpError::NotFound);
             }
@@ -738,7 +738,7 @@ impl SessionVfsOps for NfsSession {
             return Err(VfsOpError::NotFound);
         };
         if crate::vfs::session_ops::delta_path_deleted(&self.deltas, self.session_id, &path)
-            .unwrap_or(true)
+            .unwrap_or(false)
         {
             return Err(VfsOpError::NotFound);
         }
