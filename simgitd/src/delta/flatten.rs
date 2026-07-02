@@ -425,6 +425,7 @@ mod tests {
             deletes,
             renames: vec![(Path::new("move.txt").to_path_buf(), Path::new("moved.txt").to_path_buf())],
             ranges: HashMap::new(),
+            dirs: HashSet::new(),
         };
 
         let result = flatten(
@@ -485,6 +486,7 @@ mod tests {
             deletes: HashSet::new(),
             renames: Vec::new(),
             ranges: HashMap::new(),
+            dirs: HashSet::new(),
         };
 
         let _ = flatten(

@@ -444,6 +444,10 @@ impl InodeMap {
         self.delta_files.lock().unwrap().get(&ino).cloned()
     }
 
+    pub fn remove_delta_file(&self, ino: u64) {
+        self.delta_files.lock().unwrap().remove(&ino);
+    }
+
     pub fn update_delta_size(&self, ino: u64, size: u64) {
         if let Some(meta) = self.delta_files.lock().unwrap().get_mut(&ino) {
             meta.size = size;

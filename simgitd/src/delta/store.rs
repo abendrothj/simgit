@@ -42,6 +42,9 @@ pub struct DeltaManifest {
     /// scan treats absent entries as whole-file overlap.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub ranges: HashMap<PathBuf, Vec<ByteRange>>,
+    /// directories explicitly created via mkdir (synthetic, no git tree entry).
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub dirs: HashSet<PathBuf>,
 }
 
 pub struct DeltaStore {
@@ -297,6 +300,35 @@ impl DeltaStore {
                 manifest.writes.insert(to.to_owned(), hash);
             }
             manifest.renames.push((from.to_owned(), to.to_owned()));
+            self.write_manifest(session_id, &manifest)
+        })
+    }
+
+    // ── mkdir / rmdir ──────────────────────────────────────────────────────
+
+    /// Record an explicitly created directory (virtual, no git tree entry).
+    pub fn record_mkdir(&self, session_id: Uuid, path: &Path) -> Result<()> {
+        self.with_session_lock(session_id, || {
+            let mut manifest = self.load_manifest_unlocked(session_id)?;
+            manifest.dirs.insert(path.to_owned());
+            self.write_manifest(session_id, &manifest)
+        })
+    }
+
+    /// Remove an explicitly created directory (must have no children).
+    pub fn record_rmdir(&self, session_id: Uuid, path: &Path) -> Result<()> {
+        self.with_session_lock(session_id, || {
+            let mut manifest = self.load_manifest_unlocked(session_id)?;
+            // Verify no child files exist under this directory in writes or dirs.
+            let has_children = manifest
+                .writes
+                .keys()
+                .chain(manifest.dirs.iter())
+                .any(|p| p.starts_with(path) && p != path);
+            if has_children {
+                return Err(anyhow::anyhow!("directory not empty: {}", path.display()));
+            }
+            manifest.dirs.remove(path);
             self.write_manifest(session_id, &manifest)
         })
     }
