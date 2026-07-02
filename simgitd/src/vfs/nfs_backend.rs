@@ -1114,13 +1114,8 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
             .context("bind NFSv3 TCP listener")?;
         let port = listener.get_listen_port();
 
-        let handle = tokio::spawn(async move {
-            if let Err(e) = listener.handle_forever().await {
-                warn!(port, err = %e, "NFSv3 server task exited with error");
-            }
-        });
-
-        // Mount via macOS built-in NFS client.
+        // Mount via macOS built-in NFS client BEFORE spawning the server
+        // task so a mount_nfs failure doesn't leave an orphaned task.
         let mount_output = tokio::task::spawn_blocking({
             let mp = mount_path.clone();
             move || {
@@ -1140,11 +1135,20 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
 
         if !mount_output.status.success() {
             let stderr = String::from_utf8_lossy(&mount_output.stderr);
+            // listener is dropped here — the bound port is released.
             anyhow::bail!(
                 "mount_nfs failed (exit {:?}): {stderr}",
                 mount_output.status.code()
             );
         }
+
+        // Spawn the server task after mount_nfs succeeds — no orphaned task
+        // on mount failure.
+        let handle = tokio::spawn(async move {
+            if let Err(e) = listener.handle_forever().await {
+                warn!(port, err = %e, "NFSv3 server task exited with error");
+            }
+        });
 
         let mut mounts = self.mounts.lock().unwrap();
         mounts.insert(
