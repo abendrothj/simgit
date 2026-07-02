@@ -66,10 +66,14 @@ impl GitProxy {
     ///
     /// `socket_path` is the path to the daemon's `control.port` file, injected
     /// into hook scripts so that `sg commit` can find the daemon.
+    ///
+    /// `sg_binary_path` is the absolute path to the `sg` CLI binary, injected
+    /// into hook scripts so hooks work regardless of `$PATH`.
     pub fn bootstrap(
         _mount_path: &Path,
         git_data_dir: &Path,
         socket_path: &Path,
+        sg_binary_path: &Path,
         base_commit: &str,
         repo_path: &Path,
         initial_branch: Option<&str>,
@@ -186,10 +190,12 @@ impl GitProxy {
         // message; the real commit message is in the git commit object.
         let branch = initial_branch.unwrap_or("simgit-session");
         let socket = socket_path.to_string_lossy();
+        let sg = sg_binary_path.to_string_lossy();
         let pre_commit = format!(
             "#!/bin/sh\n\
              # simgit: forward git commit to the daemon\n\
-             sg --socket {socket} commit \\\n  --session {sid} \\\n  --branch {branch} \\\n  --message \"simgit commit\"\n",
+             {sg} --socket {socket} commit \\\n  --session {sid} \\\n  --branch {branch} \\\n  --message \"simgit commit\"\n",
+            sg = sg,
             socket = socket,
             sid = session_id,
             branch = branch,
@@ -202,7 +208,8 @@ impl GitProxy {
             "#!/bin/sh\n\
              # simgit: update session base commit after checkout\n\
              # $1 = prev HEAD, $2 = new HEAD, $3 = branch flag\n\
-             sg --socket {socket} session-set-base --session {sid} --commit \"$2\"\n",
+             {sg} --socket {socket} session-set-base --session {sid} --commit \"$2\"\n",
+            sg = sg,
             socket = socket,
             sid = session_id,
         );
@@ -215,7 +222,8 @@ impl GitProxy {
              # simgit: update session base commit after merge\n\
              # $1 = 1 if squash, 0 otherwise\n\
              HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null) && \\\n\
-             sg --socket {socket} session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+             {sg} --socket {socket} session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+            sg = sg,
             socket = socket,
             sid = session_id,
         );
@@ -227,7 +235,8 @@ impl GitProxy {
             "#!/bin/sh\n\
              # simgit: update session base commit after rebase/amend\n\
              HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null) && \\\n\
-             sg --socket {socket} session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+             {sg} --socket {socket} session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+            sg = sg,
             socket = socket,
             sid = session_id,
         );
@@ -253,7 +262,8 @@ impl GitProxy {
              # simgit: update session refs before push\n\
              # $1 = remote name, $2 = remote URL\n\
              HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null) && \\\n\
-             sg --socket {socket} session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+             {sg} --socket {socket} session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+            sg = sg,
             socket = socket,
             sid = session_id,
         );
@@ -481,6 +491,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -538,6 +549,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -596,6 +608,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -630,6 +643,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -661,6 +675,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -704,6 +719,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -732,6 +748,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -765,6 +782,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -809,6 +827,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -841,6 +860,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -871,6 +891,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),
@@ -915,6 +936,7 @@ mod tests {
             &mount,
             &mount,
             &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
             &base,
             &repo,
             Some("main"),

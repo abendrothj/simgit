@@ -1208,11 +1208,13 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
 
         let git_proxy = if session.git_proxy_enabled {
             let socket_path = self.cfg.state_dir.join("control.port");
+            let sg_path = sg_binary_path();
             Some(
                 crate::git_proxy::GitProxy::bootstrap(
                     &mount_path,
                     &git_data_dir,
                     &socket_path,
+                    &sg_path,
                     &session.base_commit,
                     &self.cfg.repo_path,
                     session.initial_branch.as_deref(),
@@ -1322,4 +1324,13 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
         // FuseBackend uses.
         Ok(())
     }
+}
+
+/// Resolve the absolute path to the `sg` CLI binary, which lives next to
+/// the `simgitd` daemon binary.
+fn sg_binary_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("sg")))
+        .unwrap_or_else(|| PathBuf::from("sg"))
 }
