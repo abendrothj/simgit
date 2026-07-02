@@ -317,6 +317,13 @@ pub trait SessionVfsOps {
     /// Returns the newly allocated file ID.
     fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64, VfsOpError>;
 
+    /// Create a symbolic link in `parent` with `name` pointing to `target`.
+    /// Returns the newly allocated file ID.
+    fn create_symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64, VfsOpError> {
+        let _target = target;
+        Err(VfsOpError::InvalidArgument)
+    }
+
     /// Create a new directory in `parent` with the given `name` and access `mode`.
     /// Returns the newly allocated file ID.
     fn mkdir(&self, parent: u64, name: &str, _mode: u32) -> Result<u64, VfsOpError> {

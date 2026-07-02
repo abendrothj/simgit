@@ -394,6 +394,16 @@ pub(super) async fn session_commit(
                 None
             };
 
+            // Preserve session-created tags that don't yet exist in the real
+            // repo, so they survive the refs refresh and can be propagated.
+            let session_tags = session_git.join("refs").join("tags");
+            let real_tags = real_git.join("refs").join("tags");
+            let new_tags: Vec<(PathBuf, Vec<u8>)> = if session_tags.exists() {
+                collect_new_tags(&session_tags, &real_tags)
+            } else {
+                Vec::new()
+            };
+
             // Refresh refs/ from real repo.
             let real_refs = real_git.join("refs");
             let session_refs = session_git.join("refs");
@@ -412,6 +422,25 @@ pub(super) async fn session_commit(
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let _ = std::fs::write(&session_stash, &data);
+            }
+
+            // Propagate session-created tags to the real repo and restore
+            // them in the session after the refs refresh.
+            for (rel_path, data) in &new_tags {
+                // Restore in session.
+                let session_dest = session_git.join("refs").join("tags").join(rel_path);
+                if let Some(parent) = session_dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&session_dest, data);
+                // Push to real repo.
+                let real_dest = real_git.join("refs").join("tags").join(rel_path);
+                if !real_dest.exists() {
+                    if let Some(parent) = real_dest.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&real_dest, data);
+                }
             }
 
             // Refresh packed-refs.
@@ -730,6 +759,31 @@ fn check_commit_deadline(
             "now_epoch_ms": now,
         })),
     })
+}
+
+/// Collect tag refs from `session_tags_dir` that do not exist in `real_tags_dir`.
+/// Returns relative paths and their content.
+fn collect_new_tags(session_tags_dir: &Path, real_tags_dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut result = Vec::new();
+    let Ok(entries) = std::fs::read_dir(session_tags_dir) else {
+        return result;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let rel = path.strip_prefix(session_tags_dir).unwrap_or(&path).to_path_buf();
+        if path.is_dir() {
+            result.extend(collect_new_tags(&path, &real_tags_dir.join(&rel)));
+        } else {
+            let real_path = real_tags_dir.join(&rel);
+            if real_path.exists() {
+                continue; // Already in real repo.
+            }
+            if let Ok(data) = std::fs::read(&path) {
+                result.push((rel, data));
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]

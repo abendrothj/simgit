@@ -23,8 +23,9 @@
 //!   - `choco install winfsp`
 //!   - Bundled with the application
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -39,6 +40,8 @@ use crate::vfs::fuse_backend::SessionFs;
 
 mod adapter;
 
+use adapter::WinFspSession;
+
 /// WinFSP backend driver for Windows.
 pub struct WinFspBackend {
     cfg: Arc<Config>,
@@ -46,6 +49,9 @@ pub struct WinFspBackend {
     borrows: Arc<BorrowRegistry>,
     #[allow(dead_code)]
     metrics: Arc<Metrics>,
+    /// Active FileSystemHost handles keyed by session ID.  Stored so they
+    /// can be cleanly stopped/unmounted rather than leaked.
+    hosts: Mutex<HashMap<Uuid, winfsp_wrs::host::FileSystemHost>>,
 }
 
 impl WinFspBackend {
@@ -60,6 +66,7 @@ impl WinFspBackend {
             deltas,
             borrows,
             metrics,
+            hosts: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -100,25 +107,23 @@ impl crate::vfs::VfsBackendTrait for WinFspBackend {
 
         // Spawn the WinFSP filesystem in a background thread.
         // `FileSystemHost` runs the dispatch loop synchronously.
-        let _host = session_fs.spawn_mount(&mount_point)?;
-
-        // Intentionally leak the host handle to keep the mount alive.
-        // The mount is torn down when the daemon calls unmount().
-        // NOTE: Production code should store the host handle in a registry
-        // so it can be cleanly stopped on unmount().
+        let host = session_fs.spawn_mount(&mount_point)?;
+        self.hosts
+            .lock()
+            .unwrap()
+            .insert(session.session_id, host);
 
         Ok(())
     }
 
     async fn unmount(&self, session_id: Uuid) -> Result<()> {
-        let mount_path = self.cfg.mnt_dir.join(session_id.to_string());
+        // Cleanly stop the WinFSP host: dropping the handle stops the
+        // dispatch loop and unmounts the filesystem.
+        if let Some(_host) = self.hosts.lock().unwrap().remove(&session_id) {
+            // FileSystemHost stops the filesystem on drop.
+        }
 
-        // WinFSP volumes are unmounted by deleting the mount point directory
-        // when no open handles exist.  For a drive-letter mount, we'd call
-        // FspFileSystemStopDispatcher.  For directory mounts, removing the
-        // directory (after all handles are closed) is sufficient.
-        //
-        // TODO: implement proper WinFSP stop via a stored host handle.
+        let mount_path = self.cfg.mnt_dir.join(session_id.to_string());
         let _ = std::fs::remove_dir_all(&mount_path);
         Ok(())
     }

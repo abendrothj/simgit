@@ -288,7 +288,8 @@ fn git_config_get(repo_path: &Path, key: &str) -> Option<String> {
 /// Inherit key config values from the real repo so the session behaves
 /// identically to a real worktree. Skips keys simgit manages itself.
 fn build_inherited_config(repo_path: &Path) -> String {
-    let keys = &[
+    // Simple dotted keys: section.key → [section] \t key = val
+    let simple_keys = &[
         "core.autocrlf",
         "core.filemode",
         "core.safecrlf",
@@ -318,16 +319,66 @@ fn build_inherited_config(repo_path: &Path) -> String {
         "merge.ff",
     ];
 
+    // Subsection keys: section.subsection.key → [section "subsection"] \t key = val
+    let subsection_keys: &[(&str, &str)] = &[
+        ("filter", "lfs"),
+    ];
+
     let mut out = String::new();
-    for key in keys {
+    for key in simple_keys {
         if let Some(val) = git_config_get(repo_path, key) {
-            // Split dotted key into section.key: core.autocrlf → [core] \t autocrlf = val
             if let Some(dot) = key.find('.') {
                 let section = &key[..dot];
                 let subkey = &key[dot + 1..];
                 out.push_str(&format!("[{section}]\n\t{subkey} = {val}\n"));
             }
         }
+    }
+
+    for (section, subsection) in subsection_keys {
+        // Build subsection entries from real repo config by shelling out
+        // to `git config --list --local` and filtering.
+        let subsection_config = git_config_section(repo_path, section, subsection);
+        if !subsection_config.is_empty() {
+            out.push_str(&subsection_config);
+        }
+    }
+
+    out
+}
+
+/// Read a full config section (including subsections) from the real repo.
+/// Returns the .git/config text for that section.
+fn git_config_section(repo_path: &Path, section: &str, subsection: &str) -> String {
+    let output = match std::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["config", "--list", "--local"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return String::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let prefix = format!("{section}.{subsection}.");
+    let mut keys: Vec<(&str, &str)> = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            if let Some(eq) = rest.find('=') {
+                let key = rest[..eq].trim();
+                let val = rest[eq + 1..].trim();
+                keys.push((key, val));
+            }
+        }
+    }
+
+    if keys.is_empty() {
+        return String::new();
+    }
+
+    let mut out = format!("[{section} \"{subsection}\"]\n");
+    for (key, val) in keys {
+        out.push_str(&format!("\t{key} = {val}\n"));
     }
     out
 }

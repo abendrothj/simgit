@@ -863,6 +863,23 @@ impl SessionVfsOps for NfsSession {
         self.inode_map.remove_delta_file(dir_id);
         Ok(())
     }
+
+    fn create_symlink(&self, parent: u64, name: &str, target: &str) -> Result<u64, VfsOpError> {
+        let _ = <Self as SessionVfsOps>::lookup(self, parent, ".")?;
+        let parent_path = if parent == 1 {
+            PathBuf::new()
+        } else {
+            self.inode_map.path_of(parent).unwrap_or_default()
+        };
+        let full_path = parent_path.join(name);
+        self.deltas
+            .write_blob(self.session_id, &full_path, target.as_bytes(), None)
+            .map_err(|_| VfsOpError::Io)?;
+        let ino = self.inode_map.allocate();
+        self.inode_map
+            .insert_delta_file(ino, full_path, target.len() as u64, 0o120000);
+        Ok(ino)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -897,11 +914,41 @@ impl NFSFileSystem for NfsSession {
     async fn setattr(
         &self,
         id: fileid3,
-        _setattr: sattr3,
+        setattr: sattr3,
     ) -> std::result::Result<fattr3, nfsstat3> {
-        // Accept all attribute changes (mode, owner, size, times) silently.
-        // Truncation via O_TRUNC is handled by the write path (overwriting
-        // files with empty content). Full setattr semantics deferred.
+        // Handle truncation: set size to 0 (O_TRUNC) or to a specific value.
+        match setattr.size {
+            nfsserve::nfs::set_size3::Void => {}
+            nfsserve::nfs::set_size3::size(new_size) => {
+                let path = self.inode_map.path_of(id).ok_or(nfsstat3::NFS3ERR_NOENT)?;
+                if new_size == 0 {
+                    // Truncate to zero: write an empty delta blob.
+                    self.deltas
+                        .write_blob(self.session_id, &path, &[], None)
+                        .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    self.inode_map.update_delta_size(id, 0);
+                } else {
+                    // Extend or truncate to a specific size: read current,
+                    // resize, and write back.
+                    let current = self
+                        .deltas
+                        .read_blob(self.session_id, &path)
+                        .map_err(|_| nfsstat3::NFS3ERR_IO)?
+                        .unwrap_or_default();
+                    let mut buf = current;
+                    if (new_size as usize) < buf.len() {
+                        buf.truncate(new_size as usize);
+                    } else {
+                        buf.resize(new_size as usize, 0);
+                    }
+                    self.deltas
+                        .write_blob(self.session_id, &path, &buf, None)
+                        .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    self.inode_map.update_delta_size(id, new_size as u64);
+                }
+            }
+        }
+        // Other attribute changes (mode, owner, times) accepted silently.
         let attr = SessionVfsOps::getattr(self, id).map_err(|e| Self::to_nfsstat(&e))?;
         Ok(Self::attr_to_fattr(id, &attr))
     }
@@ -1025,12 +1072,17 @@ impl NFSFileSystem for NfsSession {
 
     async fn symlink(
         &self,
-        _dirid: fileid3,
-        _linkname: &filename3,
-        _symlink: &nfsserve::nfs::nfspath3,
+        dirid: fileid3,
+        linkname: &filename3,
+        symlink: &nfsserve::nfs::nfspath3,
         _attr: &sattr3,
     ) -> std::result::Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        let name = String::from_utf8_lossy(linkname.as_ref());
+        let target = String::from_utf8_lossy(symlink.as_ref());
+        let child = SessionVfsOps::create_symlink(self, dirid, &name, &target)
+            .map_err(|e| Self::to_nfsstat(&e))?;
+        let attr = SessionVfsOps::getattr(self, child).map_err(|e| Self::to_nfsstat(&e))?;
+        Ok((child, Self::attr_to_fattr(child, &attr)))
     }
 
     async fn readlink(

@@ -378,8 +378,8 @@ impl BlobCache {
     /// Read a byte range from a blob without materializing the full content.
     ///
     /// For large binary files this avoids the O(file-size) memory allocation
-    /// of [`get`]. Uses `git cat-file` with piped stdout and skips `offset`
-    /// bytes before reading up to `len` bytes (may return fewer at EOF).
+    /// of [`get`]. Uses gitoxide (`gix`) for direct object reads — no
+    /// subprocess overhead.
     pub fn get_range(
         &self,
         blob_oid: &str,
@@ -387,42 +387,18 @@ impl BlobCache {
         len: usize,
         repo_path: &Path,
     ) -> Result<Vec<u8>> {
-        use std::io::Read;
-        let mut child = std::process::Command::new("git")
-            .current_dir(repo_path)
-            .args(["cat-file", "blob", blob_oid])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .with_context(|| format!("spawn git cat-file blob {blob_oid}"))?;
+        let repo = gix::open(repo_path)?;
+        let oid: gix::ObjectId = blob_oid
+            .parse()
+            .with_context(|| format!("invalid OID: {blob_oid}"))?;
+        let obj = repo
+            .find_object(oid)
+            .with_context(|| format!("find object {blob_oid}"))?;
+        let data = obj.data.as_slice();
 
-        let mut stdout = child.stdout.take().context("capture git stdout")?;
-
-        // Skip offset bytes.
-        if offset > 0 {
-            std::io::copy(&mut (&mut stdout).take(offset as u64), &mut std::io::sink())
-                .with_context(|| format!("skip {offset} bytes in {blob_oid}"))?;
-        }
-
-        let mut buf = vec![0u8; len];
-        let mut total = 0;
-        while total < len {
-            match stdout.read(&mut buf[total..]) {
-                Ok(0) => break, // EOF
-                Ok(n) => total += n,
-                Err(e) => {
-                    let _ = child.wait();
-                    return Err(e.into());
-                }
-            }
-        }
-        buf.truncate(total);
-
-        let status = child.wait().context("wait git cat-file")?;
-        if !status.success() {
-            bail!("git cat-file blob {blob_oid} exited {status}");
-        }
-        Ok(buf)
+        let start = offset.min(data.len());
+        let end = (offset + len).min(data.len());
+        Ok(data[start..end].to_vec())
     }
 }
 
@@ -519,7 +495,7 @@ impl InodeMap {
 mod tests {
     use super::{BlobCache, EntryKind, InodeMap, TreeCache};
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -726,6 +702,87 @@ mod tests {
         map.update_delta_size(ino, 42);
         let meta2 = map.delta_file_of(ino).expect("delta meta should still exist");
         assert_eq!(meta2.size, 42);
+    }
+
+    #[test]
+    fn submodule_entry_parsed_as_commit_kind() {
+        let repo = init_repo_with_file();
+        let target_oid = {
+            let out = Command::new("git")
+                .current_dir(&repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+
+        // Build a tree with a 160000 (gitlink) entry.
+        let tree_input = format!("160000 commit {}\tsub\n", target_oid);
+        let tree_oid = run_git_piped_output(&repo, "mktree", tree_input.as_bytes());
+        let tree_oid = tree_oid.trim().to_owned();
+
+        // Parse the tree and verify the submodule entry.
+        let cache = TreeCache::new(10);
+        let entries = cache.get(&tree_oid, &repo).expect("parse tree with submodule");
+        let sub_entry = entries
+            .iter()
+            .find(|e| e.name == "sub")
+            .expect("sub entry should exist");
+
+        assert_eq!(sub_entry.kind, EntryKind::Commit);
+        assert_eq!(sub_entry.oid, target_oid);
+        assert_eq!(sub_entry.mode, "160000");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn get_range_reads_partial_blob() {
+        let repo = init_repo_with_file();
+        let content: Vec<u8> = (0..200u8).collect();
+        let file = repo.join("data.bin");
+        std::fs::write(&file, &content).unwrap();
+        run_git(&repo, &["add", "data.bin"]);
+        run_git(&repo, &["commit", "-m", "range-test"]);
+
+        let oid = {
+            let out = Command::new("git")
+                .current_dir(&repo)
+                .args(["rev-parse", "HEAD:data.bin"])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+
+        let cache = BlobCache::new(1, 10 * 1024 * 1024);
+        let slice = cache
+            .get_range(&oid, 5, 10, &repo)
+            .expect("get_range should succeed");
+        assert_eq!(slice.len(), 10);
+        assert_eq!(&slice, &(5u8..15u8).collect::<Vec<u8>>());
+
+        let slice = cache
+            .get_range(&oid, 195, 20, &repo)
+            .expect("get_range beyond EOF should return partial");
+        assert_eq!(slice.len(), 5);
+        assert_eq!(&slice, &(195u8..200u8).collect::<Vec<u8>>());
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    fn run_git_piped_output(repo: &Path, cmd: &str, stdin: &[u8]) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("git")
+            .current_dir(repo)
+            .arg(cmd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn git");
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
     }
 }
 
