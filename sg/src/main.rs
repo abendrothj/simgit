@@ -26,7 +26,11 @@
 //!
 //! ## Port File Discovery
 //!
-//! By default, `sg` reads the TCP port from the daemon's discovery file at:
+//! `sg worktree` discovers the daemon's port file automatically from the
+//! git repository root (`.git/simgit/control.port`). No configuration needed.
+//!
+//! For other commands, `sg` reads the TCP port from the daemon's discovery
+//! file at these platform defaults:
 //! - Linux: `$XDG_RUNTIME_DIR/simgit/control.port`
 //! - macOS: `$HOME/.local/state/simgit/control.port`
 //! - Windows: `%LOCALAPPDATA%\simgit\control.port`
@@ -47,6 +51,8 @@
 //!
 //! ## Command Reference
 //!
+//! - **worktree add/remove/list** — Drop-in `git worktree` replacement
+//!   (auto-starts daemon, prints mount path, hooks auto-inject socket)
 //! - **init** — Initialize simgit + start daemon (one-time setup)
 //! - **new** — Create new session (`--branch <name>` for target branch)
 //! - **commit** — Flatten delta to git branch + close session
@@ -63,20 +69,29 @@
 //!
 //! ## Example Workflow
 //!
+//! ### Quick: `sg worktree` (recommended)
+//!
 //! ```bash
-//! # One-time: initialize daemon
+//! # One command: create session, auto-start daemon, cd into mount
+//! cd $(sg worktree add feature-1)
+//!
+//! # All standard git commands work (commit is forwarded via hook)
+//! git add <files>
+//! git commit -m "feature work"
+//!
+//! # Inspect or clean up
+//! sg diff                             # Preview changes
+//! sg worktree remove --commit         # Commit and unmount
+//! ```
+//!
+//! ### Manual: `sg new` / `sg commit`
+//!
+//! ```bash
 //! sg init
-//!
-//! # Agent 1: Create session on 'feature-1' branch
-//! SG_SESSION=$(sg new --branch feature-1 | jq .session_id)
-//! mount | grep /vdev/$SG_SESSION    # Agent now sees /vdev/$SG_SESSION mounted
-//! # Agent writes to /vdev/$SG_SESSION/...
-//! sg diff $SG_SESSION                 # Preview changes
-//! sg commit $SG_SESSION               # Flatten to git 'feature-1' branch
-//!
-//! # Agent 2: Check lock status
+//! sg new --task "demo" --label "agent-1"
+//! # write files under the printed mount path
+//! sg commit --branch feature-1 --message "demo"
 //! sg lock status
-//! # → (no locks shown if agent 1 has committed)
 //! ```
 //!
 //! ## Error Codes

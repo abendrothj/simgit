@@ -62,11 +62,13 @@ simgit targets a third design point:
 - **OTLP tracing** — optional distributed trace export for orchestrator-level visibility
 - **Python bindings** — PyO3-backed, works with asyncio orchestrators
 - **Rust SDK** — async JSON-RPC client with typed request/response models
-- **`sg` CLI** — interactive session management and inspection
-- **Drop-in worktree replacement** — minimal `.git` bootstrap (symlinked
-  `refs/`, `HEAD`, `objects/info/alternates`, `config`, one-time `index`
-  init) makes every git command work inside session mounts, so existing
-  LLM agents that shell out to `git` work without modification
+- **`sg` CLI** — drop-in `git worktree` replacement (`sg worktree`) plus
+  session management and inspection
+- **`sg worktree` — drop-in `git worktree` replacement** — minimal `.git`
+  bootstrap (copied `refs/`, `HEAD`, `objects/info/alternates`, `config`,
+  one-time `index` init) makes every git command work inside session mounts,
+  so existing LLM agents that shell out to `git` work without modification.
+  Auto-starts the daemon; no manual env var setup.
 - **Chaos-validated** — SLO gate suite covering disjoint commits, hotspot contention, transport faults, and abandon storms
 
 ## Architecture
@@ -134,34 +136,57 @@ simgit/
 cargo build --workspace
 ```
 
-### 2. Start the daemon
+### 2. Create a worktree session
 
 ```bash
-export SIMGIT_REPO=$(pwd)
-export SIMGIT_STATE_DIR=/tmp/simgit-dev
-mkdir -p "$SIMGIT_STATE_DIR"
-
-./target/debug/simgitd
+cd $(sg worktree add feat/my-feature)
 ```
 
-The daemon writes its TCP port number to `/tmp/simgit-dev/control.port`.
+The daemon auto-starts on first use. State is stored per-repo in
+`.git/simgit/`. The session mount is fully isolated — every git command
+works inside it as if it were a normal checkout.
 
-### 3. Create and use a session
+### 3. Use git commands directly inside the session
 
-`sg` is the simgit CLI. In a second shell:
+`sg worktree` bootstraps a full `.git` directory inside the mount.
+All standard git commands work without extra setup:
 
 ```bash
-export SIMGIT_PORT_FILE=/tmp/simgit-dev/control.port
+cd $(sg worktree add feat/demo)
 
-sg new --task "demo-task" --label "agent-1"
-# write files under the printed mount path, then:
+# Edit files with any tool...
+echo "hello" > README.md
 
+# Standard git commands — commit is forwarded via pre-commit hook
+git add README.md
+git commit -m "demo"
+
+# Inspect session state
 sg status
-sg diff --session <session-uuid>
-sg commit --session <session-uuid> --branch feat/demo --message "demo"
+sg diff
+
+# Commit uncommitted changes and remove the session
+sg worktree remove --commit --message "clean up"
+```
+
+For programmatic commit control:
+```bash
+sg commit --branch feat/demo --message "demo"
 ```
 
 ### 4. Run multiple agents in parallel
+
+```bash
+# Shell 1
+cd $(sg worktree add feat/auth)
+# ... agent writes files, runs git commit ...
+
+# Shell 2
+cd $(sg worktree add feat/api)
+# ... agent writes files, runs git commit ...
+```
+
+For stress testing at scale:
 
 ```bash
 source .venv/bin/activate

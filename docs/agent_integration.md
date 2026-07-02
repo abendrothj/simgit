@@ -16,8 +16,7 @@ cd ../agent-1-session
 with:
 
 ```bash
-sg new --task "agent-1" --label "agent-1"
-cd /vdev/<session-uuid>
+cd $(sg worktree add feat/my-feature)
 ```
 
 and every subsequent `git` command the agent runs behaves correctly.
@@ -37,7 +36,9 @@ root:
 | `.git/config` | Inherits `user.name`, `user.email`, `remote.origin.url`, and key `core.*`/`pull.*`/`push.*` values from the real repo. |
 | `.git/index` → one-time init via `git read-tree HEAD` | `git status` and `git diff` compare the working tree (served by the VFS overlay) against this baseline snapshot. No per-write updates needed — the VFS automatically serves delta versions for modified files, so git naturally sees them as "modified." |
 
-Six hooks handle the remaining integration:
+Six hooks handle the remaining integration. **Each hook embeds the daemon's
+socket path** so they work without any environment variables — `sg worktree
+add` handles this automatically at session creation.
 
 | Hook | What it does |
 |---|---|
@@ -205,22 +206,32 @@ async fn main() -> anyhow::Result<()> {
 
 ### Using with Claude Code agents
 
-Assign each Claude Code agent instance a distinct session mount path via `SIMGIT_PORT_FILE` and session creation. The agents never need to know about each other — isolation and conflict detection are handled entirely by the daemon.
+Assign each Claude Code agent instance a distinct session via `sg worktree`.
+The agents never need to know about each other — isolation and conflict
+detection are handled entirely by the daemon, which auto-starts on first use.
 
 ```bash
 # Agent 1 shell
-export SIMGIT_PORT_FILE=/tmp/simgit-dev/control.port
-sg new --task "auth-refactor" --label "claude-agent-1"
-# work under the printed mount path, then:
-sg commit --session <uuid> --branch feat/auth-refactor --message "auth refactor"
+cd $(sg worktree add feat/auth-refactor)
+# agent writes files, runs `git commit` — forwarded by pre-commit hook
+sg worktree remove --commit --message "auth refactor"
 
-# Agent 2 shell (runs simultaneously)
-sg new --task "api-v2" --label "claude-agent-2"
-sg commit --session <uuid> --branch feat/api-v2 --message "api v2"
+# Agent 2 shell (runs simultaneously; daemon already running)
+cd $(sg worktree add feat/api-v2)
+# agent writes files, runs `git commit`
+sg worktree remove --commit --message "api v2"
 
 # Agent 3 shell (runs simultaneously)
-sg new --task "ui-components" --label "claude-agent-3"
-sg commit --session <uuid> --branch feat/ui-components --message "ui components"
+cd $(sg worktree add feat/ui-components)
+# agent writes files, runs `git commit`
+sg worktree remove --commit --message "ui components"
+```
+
+For programmatic commit control without git subprocesses:
+```bash
+sg new --task "auth-refactor" --label "agent-1"
+# ... write files ...
+sg commit --branch feat/auth-refactor --message "auth refactor"
 ```
 
 ### Scalability reference
@@ -254,7 +265,15 @@ assigned port number to a discovery file.  Clients read this file to connect.
 No platform-specific IPC primitives — works identically on Linux, macOS, and
 Windows.
 
-Recommended approach:
+**With `sg worktree` (recommended for agent workflows):** No env vars needed.
+The daemon auto-starts in `.git/simgit/`, and the socket path is automatically
+discovered from the git repository root and injected into git hooks.
+
+```bash
+cd $(sg worktree add feat/my-branch)
+```
+
+**For manual daemon management:**
 
 ```bash
 export SIMGIT_STATE_DIR=/tmp/simgit-dev
