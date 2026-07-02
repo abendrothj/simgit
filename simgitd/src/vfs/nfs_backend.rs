@@ -349,15 +349,19 @@ impl SessionVfsOps for NfsSession {
         }
 
         let data = match self.deltas.read_blob(self.session_id, &path) {
-            Ok(Some(delta_bytes)) => delta_bytes,
+            Ok(Some(delta_bytes)) => crate::vfs::session_ops::file_slice(
+                &delta_bytes,
+                offset as usize,
+                size as usize,
+            )
+            .to_vec(),
             Ok(None) => self
                 .blob_cache
-                .get(&entry.oid, &self.cfg.repo_path)
+                .get_range(&entry.oid, offset as usize, size as usize, &self.cfg.repo_path)
                 .map_err(|_| VfsOpError::Io)?,
             Err(_) => return Err(VfsOpError::Io),
         };
-
-        Ok(crate::vfs::session_ops::file_slice(&data, offset as usize, size as usize).to_vec())
+        Ok(data)
     }
 
     fn write(&self, id: u64, offset: u64, data: &[u8]) -> Result<u64, VfsOpError> {

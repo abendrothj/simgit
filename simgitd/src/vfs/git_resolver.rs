@@ -374,6 +374,56 @@ impl BlobCache {
 
         Ok(content)
     }
+
+    /// Read a byte range from a blob without materializing the full content.
+    ///
+    /// For large binary files this avoids the O(file-size) memory allocation
+    /// of [`get`]. Uses `git cat-file` with piped stdout and skips `offset`
+    /// bytes before reading up to `len` bytes (may return fewer at EOF).
+    pub fn get_range(
+        &self,
+        blob_oid: &str,
+        offset: usize,
+        len: usize,
+        repo_path: &Path,
+    ) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let mut child = std::process::Command::new("git")
+            .current_dir(repo_path)
+            .args(["cat-file", "blob", blob_oid])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .with_context(|| format!("spawn git cat-file blob {blob_oid}"))?;
+
+        let mut stdout = child.stdout.take().context("capture git stdout")?;
+
+        // Skip offset bytes.
+        if offset > 0 {
+            std::io::copy(&mut (&mut stdout).take(offset as u64), &mut std::io::sink())
+                .with_context(|| format!("skip {offset} bytes in {blob_oid}"))?;
+        }
+
+        let mut buf = vec![0u8; len];
+        let mut total = 0;
+        while total < len {
+            match stdout.read(&mut buf[total..]) {
+                Ok(0) => break, // EOF
+                Ok(n) => total += n,
+                Err(e) => {
+                    let _ = child.wait();
+                    return Err(e.into());
+                }
+            }
+        }
+        buf.truncate(total);
+
+        let status = child.wait().context("wait git cat-file")?;
+        if !status.success() {
+            bail!("git cat-file blob {blob_oid} exited {status}");
+        }
+        Ok(buf)
+    }
 }
 
 /// Inode to {tree_oid, entry_index} mapping for path resolution.
