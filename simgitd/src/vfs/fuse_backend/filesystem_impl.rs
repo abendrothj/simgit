@@ -18,7 +18,7 @@ use std::ffi::OsStr;
 use fuser::{
     Errno, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, OpenFlags,
     RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, WriteFlags,
+    ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use tracing::debug;
 use uuid::Uuid;
@@ -414,6 +414,65 @@ impl Filesystem for SessionFs {
 
         match SessionVfsOps::rename(self, parent.0, old_name, newparent.0, new_name) {
             Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_errno(e)),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let Some(name_str) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match SessionVfsOps::mkdir(self, parent.0, name_str, 0o755) {
+            Ok(id) => match SessionVfsOps::getattr(self, id) {
+                Ok(attr) => reply.entry(&TTL, &entry_attr(INodeNo(id), &attr), Generation(0)),
+                Err(e) => reply.error(to_errno(e)),
+            },
+            Err(e) => reply.error(to_errno(e)),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name_str) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match SessionVfsOps::rmdir(self, parent.0, name_str) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(to_errno(e)),
+        }
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        // Accept attribute changes silently (no-op).  Full setattr semantics
+        // (truncate, mode, ownership) deferred to future work.
+        match SessionVfsOps::getattr(self, ino.0) {
+            Ok(attr) => reply.attr(&TTL, &entry_attr(ino, &attr)),
             Err(e) => reply.error(to_errno(e)),
         }
     }

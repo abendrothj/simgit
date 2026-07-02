@@ -292,6 +292,14 @@ impl SessionVfsOps for SessionFs {
             return Ok(ino);
         }
 
+        // Check created directories (mkdir in delta manifest).
+        if manifest.dirs.contains(&full_path) {
+            let ino = self.inode_map.allocate();
+            self.inode_map
+                .insert_delta_file(ino, full_path, 0, 0o40755);
+            return Ok(ino);
+        }
+
         Err(VfsOpError::NotFound)
     }
 
@@ -311,8 +319,9 @@ impl SessionVfsOps for SessionFs {
             if delta_path_deleted(&self.deltas, self.session_id, &meta.path).unwrap_or(false) {
                 return Err(VfsOpError::NotFound);
             }
+            let is_dir = meta.perm & 0o40000 != 0;
             return Ok(VfsAttr {
-                kind: VfsFileKind::File,
+                kind: if is_dir { VfsFileKind::Dir } else { VfsFileKind::File },
                 size: meta.size,
                 perm: meta.perm,
                 nlink: 1,
@@ -563,6 +572,28 @@ impl SessionVfsOps for SessionFs {
                 kind: VfsFileKind::File,
             });
             seen_names.insert(file_name.to_owned());
+        }
+
+        // Include mkdir-created directories.
+        for dir_path in &manifest.dirs {
+            if !path_starts_with_dir(dir_path, &parent_path) {
+                continue;
+            }
+            let Some(dir_name) = dir_path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if seen_names.contains(dir_name) || manifest.deletes.contains(dir_path) {
+                continue;
+            }
+            let ino = self.inode_map.allocate();
+            self.inode_map
+                .insert_delta_file(ino, dir_path.clone(), 0, 0o40755);
+            entries.push(VfsDirEntry {
+                name: dir_name.to_owned(),
+                id: ino,
+                kind: VfsFileKind::Dir,
+            });
+            seen_names.insert(dir_name.to_owned());
         }
 
         Ok(entries)
@@ -824,6 +855,52 @@ impl SessionVfsOps for SessionFs {
         self.blob_cache
             .get(&entry.oid, &self.cfg.repo_path)
             .map_err(|_| VfsOpError::Io)
+    }
+
+    fn allocate_dir_ino(&self, parent: u64, name: &str) -> Result<u64, VfsOpError> {
+        let parent_path = if parent == 1 {
+            PathBuf::new()
+        } else {
+            self.inode_map.path_of(parent).unwrap_or_default()
+        };
+        let dir_path = parent_path.join(name);
+        let ino = self.inode_map.allocate();
+        self.inode_map.insert_delta_file(ino, dir_path, 0, 0o40755);
+        Ok(ino)
+    }
+
+    fn mkdir(&self, parent: u64, name: &str, _mode: u32) -> Result<u64, VfsOpError> {
+        let _ = <Self as SessionVfsOps>::lookup(self, parent, ".")?;
+        let parent_path = if parent == 1 {
+            PathBuf::new()
+        } else {
+            self.inode_map.path_of(parent).unwrap_or_default()
+        };
+        let dir_path = parent_path.join(name);
+        self.deltas.record_mkdir(self.session_id, &dir_path).map_err(|_| VfsOpError::Io)?;
+        self.allocate_dir_ino(parent, name)
+    }
+
+    fn rmdir(&self, parent: u64, name: &str) -> Result<(), VfsOpError> {
+        let dir_id = <Self as SessionVfsOps>::lookup(self, parent, name)?;
+        let parent_path = if parent == 1 {
+            PathBuf::new()
+        } else {
+            self.inode_map.path_of(parent).unwrap_or_default()
+        };
+        let dir_path = parent_path.join(name);
+        let manifest = self.deltas.load_manifest(self.session_id).map_err(|_| VfsOpError::Io)?;
+        let has_children = manifest
+            .writes
+            .keys()
+            .chain(manifest.dirs.iter())
+            .any(|p| p.starts_with(&dir_path) && p != &dir_path);
+        if has_children {
+            return Err(VfsOpError::IsADirectory);
+        }
+        self.deltas.record_rmdir(self.session_id, &dir_path).map_err(|_| VfsOpError::Io)?;
+        self.inode_map.remove_delta_file(dir_id);
+        Ok(())
     }
 }
 
