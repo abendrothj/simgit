@@ -90,6 +90,47 @@ pub(super) async fn session_set_base(
         tracing::warn!(session = %session_id, err = %e, "failed to reset delta for new base");
     }
 
+    // Refresh the session's git refs from the real repo so new branches,
+    // tags, and remote refs are visible after checkout / merge / rebase.
+    if let Some(info) = state.sessions.get(session_id) {
+        // Compute the git data dir the same way the NFS backend does:
+        // the mount path has a sibling `.git` directory (mount_path.git/.git/).
+        let git_data_dir = {
+            let mut p = info.mount_path.clone();
+            let _ = p.set_extension("git");
+            p.join(".git")
+        };
+        let real_git = state.config.repo_path.join(".git");
+
+        let session_refs = git_data_dir.join("refs");
+        let real_refs = real_git.join("refs");
+        if real_refs.exists() {
+            if session_refs.exists() || session_refs.is_symlink() {
+                let _ = std::fs::remove_dir_all(&session_refs);
+            }
+            use crate::git_proxy::copy_dir_all;
+            if let Err(e) = copy_dir_all(&real_refs, &session_refs) {
+                tracing::warn!(session = %session_id, err = %e, "failed to refresh session refs in set-base");
+            }
+        }
+
+        // Also refresh packed-refs.
+        let real_packed = real_git.join("packed-refs");
+        let session_packed = git_data_dir.join("packed-refs");
+        if real_packed.exists() {
+            let _ = std::fs::copy(&real_packed, &session_packed);
+        }
+
+        // Re-init index for the new base so git status is accurate.
+        let index_init = std::process::Command::new("git")
+            .env("GIT_DIR", &git_data_dir)
+            .args(["read-tree", &new_base])
+            .output();
+        if let Err(ref e) = index_init {
+            tracing::warn!(session = %session_id, err = %e, "git read-tree failed during set-base");
+        }
+    }
+
     Ok(serde_json::json!({ "ok": true, "base_commit": new_base }))
 }
 

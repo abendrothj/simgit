@@ -590,6 +590,11 @@ impl SessionVfsOps for NfsSession {
             directory_tree_oid_for_ino, full_child_path, git_entry_exists_in_parent, DirTreeError,
         };
 
+        // Reject AppleDouble resource-fork files created by macOS NFS client.
+        if name.starts_with("._") {
+            return Err(VfsOpError::InvalidArgument);
+        }
+
         match directory_tree_oid_for_ino(
             parent,
             &self.base_commit,
@@ -1296,24 +1301,31 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
     async fn unmount(&self, session_id: Uuid) -> Result<()> {
         let mount_path = self.cfg.mnt_dir.join(session_id.to_string());
 
-        // Force-unmount first to guarantee cleanup.
-        let _ = std::process::Command::new("umount")
-            .args(["-f", &mount_path.to_string_lossy().to_string()])
-            .status();
-
-        let _ = std::process::Command::new("umount")
-            .args([&mount_path.to_string_lossy().to_string()])
-            .status();
-
-        let _ = std::fs::remove_dir(&mount_path);
-
+        // Abort the NFS server task first so the kernel NFS client detects
+        // a dead server and releases the mount.
         if let Ok(mut mounts) = self.mounts.lock() {
             if let Some(mount) = mounts.remove(&session_id) {
                 mount._handle.abort();
-                info!(session = %session_id, port = mount.port, "NFSv3 session unmounted");
+                info!(session = %session_id, port = mount.port, "NFSv3 server task aborted for unmount");
             }
         }
 
+        // Force-unmount. Try multiple approaches for reliability on macOS.
+        let mp = mount_path.to_string_lossy().to_string();
+        let _ = std::process::Command::new("umount")
+            .args(["-f", &mp])
+            .status();
+        // macOS diskutil fallback.
+        let _ = std::process::Command::new("diskutil")
+            .args(["unmount", "force", &mp])
+            .status();
+        // Retry once after a short delay.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = std::process::Command::new("umount")
+            .args(["-f", &mp])
+            .status();
+
+        let _ = std::fs::remove_dir(&mount_path);
         Ok(())
     }
 

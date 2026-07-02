@@ -605,6 +605,11 @@ impl SessionVfsOps for SessionFs {
     }
 
     fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64, VfsOpError> {
+        // Reject AppleDouble resource-fork files created by macOS NFS client.
+        if name.starts_with("._") {
+            return Err(VfsOpError::InvalidArgument);
+        }
+
         match directory_tree_oid_for_ino(
             parent,
             &self.base_commit,
@@ -627,7 +632,8 @@ impl SessionVfsOps for SessionFs {
             .load_manifest(self.session_id)
             .map_err(|_| VfsOpError::Io)?;
         if !manifest.deletes.contains(&path) && manifest.writes.contains_key(&path) {
-            return Err(VfsOpError::AlreadyExists);
+            // Allow overwrite: treat as create-with-truncate.
+            // Fall through to write an empty blob.
         }
 
         if !manifest.deletes.contains(&path)
@@ -641,7 +647,8 @@ impl SessionVfsOps for SessionFs {
             )
             .unwrap_or(false)
         {
-            return Err(VfsOpError::AlreadyExists);
+            // Allow overwrite: treat as create-with-truncate.
+            // Fall through to write an empty blob.
         }
 
         self.borrows
@@ -1047,13 +1054,15 @@ mod tests {
     }
 
     #[test]
-    fn create_existing_name_fails_with_already_exists() {
+    fn create_existing_name_succeeds_with_overwrite() {
         let repo = init_repo_with_file();
         let fs = new_session_fs(&repo);
 
-        let err = SessionVfsOps::create(&fs, 1, "hello.txt", 0o100644)
-            .expect_err("creating an existing git-tracked path should fail");
-        assert!(matches!(err, VfsOpError::AlreadyExists));
+        // create() now allows overwrite (O_CREAT | O_TRUNC semantics)
+        // for parity with the NFS backend and POSIX correctness.
+        let ino = SessionVfsOps::create(&fs, 1, "hello.txt", 0o100644)
+            .expect("creating an existing git-tracked path should succeed (overwrite)");
+        assert!(ino > 0);
 
         let _ = fs::remove_dir_all(&repo);
     }
