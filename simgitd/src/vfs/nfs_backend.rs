@@ -759,8 +759,26 @@ impl SessionVfsOps for NfsSession {
         }
     }
 
-    fn read_symlink_target(&self, _id: u64) -> Result<Vec<u8>, VfsOpError> {
-        Err(VfsOpError::NotFound)
+    fn read_symlink_target(&self, id: u64) -> Result<Vec<u8>, VfsOpError> {
+        if id == 1 {
+            return Err(VfsOpError::InvalidArgument);
+        }
+        let Some((tree_oid, entry_idx)) = self.inode_map.lookup(id) else {
+            return Err(VfsOpError::NotFound);
+        };
+        let tree_entries = self
+            .tree_cache
+            .get(&tree_oid, &self.cfg.repo_path)
+            .map_err(|_| VfsOpError::Io)?;
+        let Some(entry) = tree_entries.get(entry_idx) else {
+            return Err(VfsOpError::NotFound);
+        };
+        if entry.kind != EntryKind::Symlink {
+            return Err(VfsOpError::InvalidArgument);
+        }
+        self.blob_cache
+            .get(&entry.oid, &self.cfg.repo_path)
+            .map_err(|_| VfsOpError::Io)
     }
 }
 

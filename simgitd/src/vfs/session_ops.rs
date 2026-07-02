@@ -310,6 +310,35 @@ pub trait SessionVfsOps {
     /// Returns the newly allocated file ID.
     fn create(&self, parent: u64, name: &str, mode: u32) -> Result<u64, VfsOpError>;
 
+    /// Create a new directory in `parent` with the given `name` and access `mode`.
+    /// Returns the newly allocated file ID.
+    fn mkdir(&self, parent: u64, name: &str, _mode: u32) -> Result<u64, VfsOpError> {
+        // Default: just verify parent exists.  simgit directories are virtual
+        // (existence implies from child files); no delta entry is needed.
+        let _parent_id = self.lookup(parent, ".")?;
+        // Allocate a synthetic inode that lookup/getattr can resolve for
+        // newly-created-empty directories by reserving a range.
+        self.allocate_dir_ino(parent, name)
+    }
+
+    /// Remove the directory named `name` from `parent` (must be empty).
+    fn rmdir(&self, parent: u64, name: &str) -> Result<(), VfsOpError> {
+        // Directories in simgit are virtual; removing them just means
+        // verifying the directory has no children (in git tree or delta).
+        let dir_id = self.lookup(parent, name)?;
+        let children = self.readdir(dir_id)?;
+        if children.iter().any(|c| c.name != "." && c.name != "..") {
+            return Err(VfsOpError::IsADirectory);
+        }
+        Ok(())
+    }
+
+    /// Allocate a synthetic inode for a newly created directory.
+    /// Backends that track inodes in maps should override this.
+    fn allocate_dir_ino(&self, _parent: u64, _name: &str) -> Result<u64, VfsOpError> {
+        Err(VfsOpError::InvalidArgument)
+    }
+
     /// Remove the entry named `name` from `parent`.
     fn unlink(&self, parent: u64, name: &str) -> Result<(), VfsOpError>;
 
