@@ -1055,14 +1055,16 @@ impl NFSFileSystem for NfsSession {
 
     async fn create_exclusive(
         &self,
-        _dirid: fileid3,
-        _filename: &filename3,
+        dirid: fileid3,
+        filename: &filename3,
     ) -> std::result::Result<fileid3, nfsstat3> {
-        // macOS NFS client uses EXCLUSIVE create for open(O_CREAT|O_EXCL).
-        // Signal that the server doesn't support this mode so the client
-        // retries with regular CREATE (which our handler allows for all
-        // overwrite scenarios).
-        Err(nfsstat3::NFS3ERR_NOTSUPP)
+        // Handle exclusive create by falling through to regular create.
+        // The macOS NFS client sends EXCLUSIVE create for O_CREAT and
+        // returning NOTSUPP causes an EEXIST loop.  Our create() always
+        // allows overwrite, so exclusive semantics are maintained.
+        let name = String::from_utf8_lossy(filename.as_ref());
+        SessionVfsOps::create(self, dirid, &name, 0o644)
+            .map_err(|e| Self::to_nfsstat(&e))
     }
 
     async fn mkdir(
