@@ -189,7 +189,7 @@ fn git_remote_url(repo_path: &Path, remote: &str) -> Result<String> {
     }
 }
 
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;

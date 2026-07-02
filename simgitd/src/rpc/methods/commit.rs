@@ -18,6 +18,7 @@ use crate::commit_scheduler::CommitWaitTimeout;
 use crate::daemon::AppState;
 use crate::delta::flatten::FlattenError;
 use crate::delta::store::ByteRange;
+use crate::git_proxy::copy_dir_all;
 
 use super::session::{changed_path_ops, ops_for_path, read_base_blob, read_delta_blob};
 use super::support::{internal, not_found, now_epoch_ms, optional_uuid_field, uuid_field};
@@ -370,6 +371,21 @@ pub(super) async fn session_commit(
         // Keep VFS mounted so the agent can inspect the committed result
         // and git can finalize its local commit (pre-commit hook path).
         // Unmount happens on session abort or daemon shutdown.
+
+        // Refresh the session's .git/refs from the real repo so the agent
+        // sees the latest branch state including the new commit.
+        {
+            let real_refs = state.config.repo_path.join(".git").join("refs");
+            let session_refs = info.mount_path.join(".git").join("refs");
+            if real_refs.exists() {
+                if session_refs.exists() || session_refs.is_symlink() {
+                    let _ = std::fs::remove_dir_all(&session_refs);
+                }
+                if let Err(e) = copy_dir_all(&real_refs, &session_refs) {
+                    tracing::warn!(session = %session_id, err = %e, "failed to refresh session refs");
+                }
+            }
+        }
 
         // Emit peer_commit event.
         state.events.publish(
