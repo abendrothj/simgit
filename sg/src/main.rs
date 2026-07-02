@@ -178,6 +178,9 @@ enum Commands {
     /// Daemon management.
     #[command(subcommand)]
     Daemon(commands::daemon::Daemon),
+    /// Worktree sessions (like git worktree).
+    #[command(subcommand)]
+    Worktree(commands::worktree::Worktree),
 }
 
 /// Entry point for the sg CLI.
@@ -210,7 +213,7 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let socket = cli.socket.unwrap_or_else(|| {
+    let socket = cli.socket.clone().unwrap_or_else(|| {
         simgit_sdk::client::default_socket_path()
             .to_string_lossy()
             .into_owned()
@@ -218,15 +221,16 @@ async fn main() -> Result<()> {
     let client = simgit_sdk::Client::new(&socket);
 
     match cli.command {
-        Commands::Init(cmd)   => commands::init::run(cmd).await,
-        Commands::New(cmd)    => commands::new::run(cmd, &client, cli.json).await,
-        Commands::Commit(cmd) => commands::commit::run(cmd, &client, cli.json).await,
-        Commands::Abort(cmd)  => commands::abort::run(cmd, &client).await,
-        Commands::Diff(cmd)   => commands::diff::run(cmd, &client, cli.json).await,
-        Commands::Status(cmd) => commands::status::run(cmd, &client, cli.json).await,
-        Commands::Lock(cmd)   => commands::lock::run(cmd, &client, cli.json).await,
-        Commands::Peer(cmd)   => commands::peer::run(cmd, &client, cli.json).await,
-        Commands::Gc(cmd)     => commands::gc::run(cmd, &client).await,
-        Commands::Daemon(cmd) => commands::daemon::run(cmd).await,
+        Commands::Init(cmd)     => commands::init::run(cmd).await,
+        Commands::New(cmd)      => commands::new::run(cmd, &client, cli.json).await,
+        Commands::Commit(cmd)   => commands::commit::run(cmd, &client, cli.json).await,
+        Commands::Abort(cmd)    => commands::abort::run(cmd, &client).await,
+        Commands::Diff(cmd)     => commands::diff::run(cmd, &client, cli.json).await,
+        Commands::Status(cmd)   => commands::status::run(cmd, &client, cli.json).await,
+        Commands::Lock(cmd)     => commands::lock::run(cmd, &client, cli.json).await,
+        Commands::Peer(cmd)     => commands::peer::run(cmd, &client, cli.json).await,
+        Commands::Gc(cmd)       => commands::gc::run(cmd, &client).await,
+        Commands::Daemon(cmd)   => commands::daemon::run(cmd).await,
+        Commands::Worktree(cmd) => commands::worktree::run(cmd, &cli.socket, cli.json).await,
     }
 }

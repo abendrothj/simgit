@@ -24,6 +24,7 @@ pub(super) async fn session_create(
     let agent_label: Option<String> = p["agent_label"].as_str().map(str::to_owned);
     let base_commit: Option<String> = p["base_commit"].as_str().map(str::to_owned);
     let peers: bool = p["peers"].as_bool().unwrap_or(false);
+    let initial_branch: Option<String> = p["initial_branch"].as_str().map(str::to_owned);
 
     // Resolve base commit (default = HEAD).
     let base_commit = base_commit.unwrap_or_else(|| resolve_head(&state.config.repo_path));
@@ -41,6 +42,7 @@ pub(super) async fn session_create(
             mount_path.clone(),
             peers,
             state.config.max_sessions,
+            initial_branch.clone(),
         )
         .map_err(|e| {
             let msg = e.to_string();

@@ -118,8 +118,11 @@ impl super::VfsBackendTrait for FuseBackend {
         // Bootstrap synthetic .git if enabled (fire-and-forget, doesn't need
         // to be passed to SessionFs — git commands read .git/ directly).
         if session.git_proxy_enabled {
+            let socket_path = self.cfg.state_dir.join("control.port");
             crate::git_proxy::GitProxy::bootstrap(
                 &mount_path,
+                &mount_path,
+                &socket_path,
                 &session.base_commit,
                 &self.cfg.repo_path,
                 session.initial_branch.as_deref(),

@@ -79,8 +79,11 @@ impl crate::vfs::VfsBackendTrait for WinFspBackend {
 
         // Bootstrap synthetic .git if enabled.
         if session.git_proxy_enabled {
+            let socket_path = self.cfg.state_dir.join("control.port");
             crate::git_proxy::GitProxy::bootstrap(
                 &mount_path,
+                &mount_path,
+                &socket_path,
                 &session.base_commit,
                 &self.cfg.repo_path,
                 session.initial_branch.as_deref(),

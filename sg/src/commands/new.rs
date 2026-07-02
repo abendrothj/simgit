@@ -24,7 +24,7 @@ pub struct New {
 
 pub async fn run(cmd: New, client: &Client, json: bool) -> Result<()> {
     let info = client
-        .session_create(cmd.task, cmd.label, cmd.base, cmd.peers)
+        .session_create(cmd.task, cmd.label, cmd.base, cmd.peers, None)
         .await?;
 
     if json {

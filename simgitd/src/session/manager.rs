@@ -105,6 +105,7 @@ impl SessionManager {
         mount_path: PathBuf,
         peers: bool,
         max_sessions: usize,
+        initial_branch: Option<String>,
     ) -> Result<SessionInfo> {
         // Enforce max-sessions limit.
         let active_count = {
@@ -132,7 +133,7 @@ impl SessionManager {
             branch_name: None,
             peers_enabled: peers,
             git_proxy_enabled: true,
-            initial_branch: None,
+            initial_branch: initial_branch,
             socket_path: PathBuf::new(),
         };
 

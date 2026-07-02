@@ -295,19 +295,21 @@ impl Client {
 
     pub async fn session_create(
         &self,
-        task_id:      impl Into<String>,
-        agent_label:  Option<String>,
-        base_commit:  Option<String>,
-        peers:        bool,
+        task_id:         impl Into<String>,
+        agent_label:     Option<String>,
+        base_commit:     Option<String>,
+        peers:           bool,
+        initial_branch:  Option<String>,
     ) -> Result<SessionInfo, SdkError> {
         let result = self
             .call(
                 "session.create",
                 serde_json::json!({
-                    "task_id":     task_id.into(),
-                    "agent_label": agent_label,
-                    "base_commit": base_commit,
-                    "peers":       peers,
+                    "task_id":        task_id.into(),
+                    "agent_label":    agent_label,
+                    "base_commit":    base_commit,
+                    "peers":          peers,
+                    "initial_branch": initial_branch,
                 }),
             )
             .await?;

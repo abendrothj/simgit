@@ -8,3 +8,4 @@ pub mod lock;
 pub mod peer;
 pub mod gc;
 pub mod daemon;
+pub mod worktree;

@@ -130,7 +130,7 @@ impl PyClient {
         peers: bool,
     ) -> PyResult<PySession> {
         let client = Client::new(&self.socket_path);
-        let info = run_async(client.session_create(task_id, agent_label, base_commit, peers))?;
+        let info = run_async(client.session_create(task_id, agent_label, base_commit, peers, None))?;
         let cached_info = session_info_dict(py, &info)?;
         Ok(PySession {
             socket_path: self.socket_path.clone(),

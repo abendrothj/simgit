@@ -76,7 +76,10 @@ pub struct NfsSession {
     blob_cache: Arc<BlobCache>,
     inode_map: Arc<InodeMap>,
     root_fileid: fileid3,
-    git_proxy: Option<crate::git_proxy::GitProxy>,
+    /// Absolute path to the bootstrapped `.git/` data directory created by
+    /// `GitProxy` outside the NFS mount.  When set, a `.git` pointer file is
+    /// written to the delta store after mount so git discovers it.
+    git_data_dir: Option<PathBuf>,
 }
 
 impl NfsSession {
@@ -86,7 +89,7 @@ impl NfsSession {
         base_commit: String,
         deltas: Arc<DeltaStore>,
         borrows: Arc<BorrowRegistry>,
-        git_proxy: Option<crate::git_proxy::GitProxy>,
+        git_data_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             session_id,
@@ -98,7 +101,7 @@ impl NfsSession {
             blob_cache: Arc::new(BlobCache::new(50, 10 * 1024 * 1024)),
             inode_map: Arc::new(InodeMap::new()),
             root_fileid: 1,
-            git_proxy,
+            git_data_dir,
         }
     }
 
@@ -151,6 +154,14 @@ impl NfsSession {
 // the trait is correct" pattern.
 impl SessionVfsOps for NfsSession {
     fn lookup(&self, parent: u64, name: &str) -> Result<u64, VfsOpError> {
+        // Virtual .git file at the root — serves gitdir: pointer
+        if parent == 1 && name == ".git" {
+            if self.git_data_dir.is_none() {
+                return Err(VfsOpError::NotFound);
+            }
+            return Ok(2); // reserved inode for virtual .git
+        }
+
         let parent_tree_oid = match crate::vfs::session_ops::directory_tree_oid_for_ino(
             parent,
             &self.base_commit,
@@ -231,6 +242,22 @@ impl SessionVfsOps for NfsSession {
             });
         }
 
+        // Virtual .git file
+        if id == 2 {
+            if let Some(ref git_dir) = self.git_data_dir {
+                let content = format!("gitdir: {}\n", git_dir.display());
+                return Ok(VfsAttr {
+                    kind: VfsFileKind::File,
+                    size: content.len() as u64,
+                    perm: 0o644,
+                    nlink: 1,
+                    uid: crate::platform::current_uid(),
+                    gid: crate::platform::current_gid(),
+                });
+            }
+            return Err(VfsOpError::NotFound);
+        }
+
         if let Some(meta) = self.inode_map.delta_file_of(id) {
             if crate::vfs::session_ops::delta_path_deleted(
                 &self.deltas,
@@ -304,6 +331,17 @@ impl SessionVfsOps for NfsSession {
     fn read(&self, id: u64, offset: u64, size: u64) -> Result<Vec<u8>, VfsOpError> {
         if id == 1 {
             return Err(VfsOpError::IsADirectory);
+        }
+
+        // Virtual .git file
+        if id == 2 {
+            if let Some(ref git_dir) = self.git_data_dir {
+                let content = format!("gitdir: {}\n", git_dir.display());
+                return Ok(
+                    crate::vfs::session_ops::file_slice(content.as_bytes(), offset as usize, size as usize).to_vec(),
+                );
+            }
+            return Err(VfsOpError::NotFound);
         }
 
         if let Some(meta) = self.inode_map.delta_file_of(id) {
@@ -531,6 +569,18 @@ impl SessionVfsOps for NfsSession {
             seen_names.insert(dir_name.to_owned());
         }
 
+        // Virtual .git file at the root — git needs this to discover the
+        // git data directory outside the NFS overlay.
+        if id == 1 && self.git_data_dir.is_some() {
+            if !seen_names.contains(".git") {
+                entries.push(crate::vfs::session_ops::VfsDirEntry {
+                    name: ".git".to_owned(),
+                    id: 2,
+                    kind: VfsFileKind::File,
+                });
+            }
+        }
+
         Ok(entries)
     }
 
@@ -561,22 +611,24 @@ impl SessionVfsOps for NfsSession {
             .deltas
             .load_manifest(self.session_id)
             .map_err(|_| VfsOpError::Io)?;
-        if !manifest.deletes.contains(&path) && manifest.writes.contains_key(&path) {
-            return Err(VfsOpError::AlreadyExists);
-        }
 
+        // NFS create is O_CREAT | O_TRUNC — overwrite is expected.
+        // Only reject creation when the entry already exists AND has
+        // NOT been previously deleted by this session.
         if !manifest.deletes.contains(&path)
-            && git_entry_exists_in_parent(
-                &self.cfg.repo_path,
-                &self.tree_cache,
-                &self.base_commit,
-                &self.inode_map,
-                parent,
-                name,
-            )
-            .unwrap_or(false)
+            && (manifest.writes.contains_key(&path)
+                || git_entry_exists_in_parent(
+                    &self.cfg.repo_path,
+                    &self.tree_cache,
+                    &self.base_commit,
+                    &self.inode_map,
+                    parent,
+                    name,
+                )
+                .unwrap_or(false))
         {
-            return Err(VfsOpError::AlreadyExists);
+            // Allow overwrite: treat as create-with-truncate.
+            // Fall through to write an empty blob.
         }
 
         self.borrows
@@ -1145,24 +1197,39 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
         std::fs::create_dir_all(&mount_path)
             .with_context(|| format!("create mount dir {}", mount_path.display()))?;
 
+        // Place git data outside the NFS mount so it isn't hidden by the
+        // overlay.  A `.git` pointer file is written through the delta store
+        // after mount so git commands inside the session find it.
+        let git_data_dir = {
+            let mut p = mount_path.clone();
+            let _ = p.set_extension("git");
+            p
+        };
+
+        let git_proxy = if session.git_proxy_enabled {
+            let socket_path = self.cfg.state_dir.join("control.port");
+            Some(
+                crate::git_proxy::GitProxy::bootstrap(
+                    &mount_path,
+                    &git_data_dir,
+                    &socket_path,
+                    &session.base_commit,
+                    &self.cfg.repo_path,
+                    session.initial_branch.as_deref(),
+                    session.session_id,
+                )?
+            )
+        } else {
+            None
+        };
+
         let fs = NfsSession::new(
             session.session_id,
             Arc::clone(&self.cfg),
             session.base_commit.clone(),
             Arc::clone(&self.deltas),
             Arc::clone(&self.borrows),
-            if session.git_proxy_enabled {
-                crate::git_proxy::GitProxy::bootstrap(
-                    &mount_path,
-                    &session.base_commit,
-                    &self.cfg.repo_path,
-                    session.initial_branch.as_deref(),
-                    session.session_id,
-                )
-                .ok()
-            } else {
-                None
-            },
+            git_proxy.as_ref().map(|p| p.git_dir.clone()),
         );
 
         // Bind on random loopback port.
@@ -1171,8 +1238,15 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
             .context("bind NFSv3 TCP listener")?;
         let port = listener.get_listen_port();
 
-        // Mount via macOS built-in NFS client BEFORE spawning the server
-        // task so a mount_nfs failure doesn't leave an orphaned task.
+        // Spawn the server task BEFORE mount_nfs so the macOS NFS client
+        // can reach a live NFSv3 server during the mount handshake.
+        // If mount_nfs subsequently fails, we abort the task and unmount.
+        let handle = tokio::spawn(async move {
+            if let Err(e) = listener.handle_forever().await {
+                warn!(port, err = %e, "NFSv3 server task exited with error");
+            }
+        });
+
         let mount_output = tokio::task::spawn_blocking({
             let mp = mount_path.clone();
             move || {
@@ -1192,20 +1266,12 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
 
         if !mount_output.status.success() {
             let stderr = String::from_utf8_lossy(&mount_output.stderr);
-            // listener is dropped here — the bound port is released.
+            handle.abort();
             anyhow::bail!(
                 "mount_nfs failed (exit {:?}): {stderr}",
                 mount_output.status.code()
             );
         }
-
-        // Spawn the server task after mount_nfs succeeds — no orphaned task
-        // on mount failure.
-        let handle = tokio::spawn(async move {
-            if let Err(e) = listener.handle_forever().await {
-                warn!(port, err = %e, "NFSv3 server task exited with error");
-            }
-        });
 
         let mut mounts = self.mounts.lock().unwrap();
         mounts.insert(
@@ -1228,14 +1294,13 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
     async fn unmount(&self, session_id: Uuid) -> Result<()> {
         let mount_path = self.cfg.mnt_dir.join(session_id.to_string());
 
-        // Force-unmount if possible.
-        let _ = std::process::Command::new("umount")
-            .args([&mount_path.to_string_lossy().to_string()])
-            .status();
-
-        // Give macOS NFS client a moment, then force.
+        // Force-unmount first to guarantee cleanup.
         let _ = std::process::Command::new("umount")
             .args(["-f", &mount_path.to_string_lossy().to_string()])
+            .status();
+
+        let _ = std::process::Command::new("umount")
+            .args([&mount_path.to_string_lossy().to_string()])
             .status();
 
         let _ = std::fs::remove_dir(&mount_path);

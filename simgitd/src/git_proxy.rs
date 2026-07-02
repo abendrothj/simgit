@@ -54,22 +54,34 @@ pub struct GitProxy {
 }
 
 impl GitProxy {
-    /// Bootstrap a minimal `.git` directory at `mount_path` that makes every
-    /// git command work inside the session.
+    /// Bootstrap a minimal `.git` directory at `git_data_dir` that makes
+    /// every git command work inside the session at `mount_path`.
+    ///
+    /// `git_data_dir` is where the actual `.git/` content lives (hooks, refs,
+    /// config, objects).  `mount_path` is the working-tree root where agents
+    /// run git commands — it is used only for hook script paths and is not
+    /// the location of the `.git/` directory itself.  For backends that
+    /// overlay the mount (e.g. NFS), `git_data_dir` is placed outside the
+    /// overlay so that the data is always accessible.
+    ///
+    /// `socket_path` is the path to the daemon's `control.port` file, injected
+    /// into hook scripts so that `sg commit` can find the daemon.
     pub fn bootstrap(
-        mount_path: &Path,
+        _mount_path: &Path,
+        git_data_dir: &Path,
+        socket_path: &Path,
         base_commit: &str,
         repo_path: &Path,
         initial_branch: Option<&str>,
         session_id: Uuid,
     ) -> Result<Self> {
-        let git_dir = mount_path.join(".git");
+        let git_dir = git_data_dir.join(".git");
 
         // ── Directory structure ───────────────────────────────────────────
         fs::create_dir_all(git_dir.join("hooks"))
-            .with_context(|| format!("create .git/hooks in {}", mount_path.display()))?;
+            .with_context(|| format!("create .git/hooks in {}", git_dir.display()))?;
         fs::create_dir_all(git_dir.join("logs"))
-            .with_context(|| format!("create .git/logs in {}", mount_path.display()))?;
+            .with_context(|| format!("create .git/logs in {}", git_dir.display()))?;
 
         // ── HEAD ──────────────────────────────────────────────────────────
         let head = if let Some(branch) = initial_branch {
@@ -170,11 +182,15 @@ impl GitProxy {
         // ── pre-commit hook ───────────────────────────────────────────────
         // Forward `git commit` to `sg commit` via the daemon. Let git
         // proceed with its local commit afterwards (harmless duplicate).
+        // Pre-commit doesn't receive the commit message — we use a fixed
+        // message; the real commit message is in the git commit object.
         let branch = initial_branch.unwrap_or("simgit-session");
+        let socket = socket_path.to_string_lossy();
         let pre_commit = format!(
             "#!/bin/sh\n\
              # simgit: forward git commit to the daemon\n\
-             sg commit \\\n  --session {sid} \\\n  --branch {branch} \\\n  --message \"$(cat \"$1\")\"\n",
+             sg --socket {socket} commit \\\n  --session {sid} \\\n  --branch {branch} \\\n  --message \"simgit commit\"\n",
+            socket = socket,
             sid = session_id,
             branch = branch,
         );
@@ -186,7 +202,8 @@ impl GitProxy {
             "#!/bin/sh\n\
              # simgit: update session base commit after checkout\n\
              # $1 = prev HEAD, $2 = new HEAD, $3 = branch flag\n\
-             sg session-set-base --session {sid} --commit \"$2\"\n",
+             sg --socket {socket} session-set-base --session {sid} --commit \"$2\"\n",
+            socket = socket,
             sid = session_id,
         );
         write_executable_hook(&git_dir, "post-checkout", &post_checkout)?;
@@ -198,7 +215,8 @@ impl GitProxy {
              # simgit: update session base commit after merge\n\
              # $1 = 1 if squash, 0 otherwise\n\
              HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null) && \\\n\
-             sg session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+             sg --socket {socket} session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+            socket = socket,
             sid = session_id,
         );
         write_executable_hook(&git_dir, "post-merge", &post_merge)?;
@@ -209,7 +227,8 @@ impl GitProxy {
             "#!/bin/sh\n\
              # simgit: update session base commit after rebase/amend\n\
              HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null) && \\\n\
-             sg session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+             sg --socket {socket} session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+            socket = socket,
             sid = session_id,
         );
         write_executable_hook(&git_dir, "post-rewrite", &post_rewrite)?;
@@ -234,7 +253,8 @@ impl GitProxy {
              # simgit: update session refs before push\n\
              # $1 = remote name, $2 = remote URL\n\
              HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null) && \\\n\
-             sg session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+             sg --socket {socket} session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+            socket = socket,
             sid = session_id,
         );
         write_executable_hook(&git_dir, "pre-push", &pre_push)?;
@@ -459,6 +479,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -514,6 +536,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -570,6 +594,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -602,6 +628,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -631,6 +659,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -672,6 +702,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -698,6 +730,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -729,6 +763,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -771,6 +807,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -801,6 +839,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -829,6 +869,8 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
             &base,
             &repo,
             Some("main"),
@@ -871,7 +913,9 @@ mod tests {
         let mount = temp_dir();
         let _proxy = GitProxy::bootstrap(
             &mount,
-            &feature_head,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &base,
             &repo,
             Some("main"),
             Uuid::now_v7()
