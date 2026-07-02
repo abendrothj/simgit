@@ -196,6 +196,8 @@ enum Commands {
     /// Worktree sessions (like git worktree).
     #[command(subcommand)]
     Worktree(commands::worktree::Worktree),
+    /// Update a session's base commit (called by git hooks).
+    SessionSetBase(commands::session_set_base::SessionSetBase),
 }
 
 /// Entry point for the sg CLI.
@@ -246,6 +248,7 @@ async fn main() -> Result<()> {
         Commands::Peer(cmd)     => commands::peer::run(cmd, &client, cli.json).await,
         Commands::Gc(cmd)       => commands::gc::run(cmd, &client).await,
         Commands::Daemon(cmd)   => commands::daemon::run(cmd).await,
-        Commands::Worktree(cmd) => commands::worktree::run(cmd, &cli.socket, cli.json).await,
+        Commands::Worktree(cmd)       => commands::worktree::run(cmd, &cli.socket, cli.json).await,
+        Commands::SessionSetBase(cmd) => commands::session_set_base::run(cmd, &client).await,
     }
 }

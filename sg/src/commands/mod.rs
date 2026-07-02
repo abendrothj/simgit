@@ -9,3 +9,4 @@ pub mod peer;
 pub mod gc;
 pub mod daemon;
 pub mod worktree;
+pub mod session_set_base;
