@@ -9,7 +9,7 @@
 //! 3. **Write `objects/info/alternates`** pointing at the real repo's object store — all blobs/trees/commits are reachable without copying data.
 //! 4. **Write `.git/config`** with the real repo's remote URL — `git push`/`git fetch` work.
 //! 5. **Populate the index once** with `git read-tree HEAD` — `git status` and `git diff` compare the working tree (served by the VFS overlay) against this baseline index. No per-write updates needed.
-//! 6. **Write `hooks/pre-commit`** — intercepts `git commit` and forwards to `sg commit`.
+//! 6. **Write `hooks/pre-commit`** — forwards `git commit` to `sg commit` via the daemon.
 //! 7. **Write `hooks/post-checkout`** — notifies the daemon when the session's base commit changes.
 //!
 //! The VFS overlay handles reads (fall through to the real file when no delta)
@@ -134,12 +134,13 @@ impl GitProxy {
         }
 
         // ── pre-commit hook ───────────────────────────────────────────────
-        // Intercept `git commit` and forward to `sg commit`.
+        // Forward `git commit` to `sg commit` via the daemon. Let git
+        // proceed with its local commit afterwards (harmless duplicate).
         let branch = initial_branch.unwrap_or("simgit-session");
         let pre_commit = format!(
             "#!/bin/sh\n\
              # simgit: forward git commit to the daemon\n\
-             sg commit \\\n  --session {sid} \\\n  --branch {branch} \\\n  --message \"$(cat \"$1\")\" \\\n  && exit 1\n",
+             sg commit \\\n  --session {sid} \\\n  --branch {branch} \\\n  --message \"$(cat \"$1\")\"\n",
             sid = session_id,
             branch = branch,
         );

@@ -367,7 +367,9 @@ pub(super) async fn session_commit(
             .sessions
             .mark_committed(session_id, &result.branch_name)
             .map_err(internal)?;
-        state.vfs.unmount_session(session_id).await;
+        // Keep VFS mounted so the agent can inspect the committed result
+        // and git can finalize its local commit (pre-commit hook path).
+        // Unmount happens on session abort or daemon shutdown.
 
         // Emit peer_commit event.
         state.events.publish(

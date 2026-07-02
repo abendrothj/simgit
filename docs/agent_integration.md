@@ -39,7 +39,7 @@ Two hooks handle the remaining integration:
 
 | Hook | What it does |
 |---|---|
-| `.git/hooks/pre-commit` | Intercepts `git commit` and forwards to `sg commit` via the daemon's commit scheduler (conflict-aware, idempotent). Prevents git from creating a local commit. |
+| `.git/hooks/pre-commit` | Forwards `git commit` to `sg commit` via the daemon's commit scheduler (conflict-aware, idempotent). Returns 0 so git proceeds with a local commit afterwards (harmless duplicate; the real commit already exists in the shared repo). |
 | `.git/hooks/post-checkout` | Called after `git checkout`. Notifies the daemon that the session's base commit changed, clears stale deltas, and reinitializes the delta store for the new base. |
 
 ### Every git command works
