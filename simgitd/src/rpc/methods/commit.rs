@@ -852,9 +852,10 @@ mod tests {
                 "task-1".to_owned(),
                 Some("agent-1".to_owned()),
                 "HEAD".to_owned(),
-                state.config.mnt_dir.join("s1"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create s1");
         state
@@ -872,9 +873,10 @@ mod tests {
                 "task-2".to_owned(),
                 Some("agent-2".to_owned()),
                 "HEAD".to_owned(),
-                state.config.mnt_dir.join("s2"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create s2");
         state
@@ -922,9 +924,10 @@ mod tests {
                 "task-a".to_owned(),
                 Some("agent-a".to_owned()),
                 "HEAD".to_owned(),
-                state.config.mnt_dir.join("sa"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create s1");
         state
@@ -942,9 +945,10 @@ mod tests {
                 "task-b".to_owned(),
                 Some("agent-b".to_owned()),
                 "HEAD".to_owned(),
-                state.config.mnt_dir.join("sb"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create s2");
         state
@@ -996,9 +1000,10 @@ mod tests {
                 "task-r1".into(),
                 Some("agent-r1".into()),
                 "HEAD".into(),
-                state.config.mnt_dir.join("sr1"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create s1");
         state
@@ -1021,9 +1026,10 @@ mod tests {
                 "task-r2".into(),
                 Some("agent-r2".into()),
                 "HEAD".into(),
-                state.config.mnt_dir.join("sr2"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create s2");
         state
@@ -1071,9 +1077,10 @@ mod tests {
                 "task-o1".into(),
                 Some("agent-o1".into()),
                 "HEAD".into(),
-                state.config.mnt_dir.join("so1"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create s1");
         state
@@ -1096,9 +1103,10 @@ mod tests {
                 "task-o2".into(),
                 Some("agent-o2".into()),
                 "HEAD".into(),
-                state.config.mnt_dir.join("so2"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create s2");
         state
@@ -1143,9 +1151,10 @@ mod tests {
                 "task-m1".into(),
                 Some("agent-m1".into()),
                 "HEAD".into(),
-                state.config.mnt_dir.join("sm1"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create s1");
         state
@@ -1168,9 +1177,10 @@ mod tests {
                 "task-m2".into(),
                 Some("agent-m2".into()),
                 "HEAD".into(),
-                state.config.mnt_dir.join("sm2"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create s2");
         state
@@ -1222,9 +1232,10 @@ mod tests {
                 "task-timeout-lock".to_owned(),
                 Some("agent-timeout-lock".to_owned()),
                 "HEAD".to_owned(),
-                state.config.mnt_dir.join("timeout-lock"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create session");
         state
@@ -1271,9 +1282,10 @@ mod tests {
                 "task-timeout-flatten".to_owned(),
                 Some("agent-timeout-flatten".to_owned()),
                 "HEAD".to_owned(),
-                state.config.mnt_dir.join("timeout-flatten"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create session");
         state
@@ -1337,9 +1349,10 @@ mod tests {
                 "task-status-miss".to_owned(),
                 Some("agent-status-miss".to_owned()),
                 "HEAD".to_owned(),
-                state.config.mnt_dir.join("status-miss"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create session");
         state
@@ -1373,9 +1386,10 @@ mod tests {
                 "task-status-hit".to_owned(),
                 Some("agent-status-hit".to_owned()),
                 "HEAD".to_owned(),
-                state.config.mnt_dir.join("status-hit"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create session");
         state
@@ -1426,9 +1440,10 @@ mod tests {
                 "task-flat-e2e".to_owned(),
                 Some("agent-flat-e2e".to_owned()),
                 "HEAD".to_owned(),
-                state.config.mnt_dir.join("flat-e2e"),
+                &state.config.mnt_dir,
                 false,
-                8
+                8,
+                None,
             )
             .expect("create session");
         state

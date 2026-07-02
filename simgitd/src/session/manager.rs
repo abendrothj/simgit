@@ -102,7 +102,7 @@ impl SessionManager {
         task_id: String,
         agent_label: Option<String>,
         base_commit: String,
-        mount_path: PathBuf,
+        mount_root: &Path,
         peers: bool,
         max_sessions: usize,
         initial_branch: Option<String>,
@@ -121,6 +121,7 @@ impl SessionManager {
 
         let session_id = Uuid::now_v7();
         let created_at = Utc::now();
+        let mount_path = mount_root.join(session_id.to_string());
 
         let info = SessionInfo {
             session_id,
@@ -489,9 +490,10 @@ mod tests {
                     "task-a".to_owned(),
                     Some("agent-a".to_owned()),
                     "HEAD".to_owned(),
-                    std::env::temp_dir().join("simgit-mount-a"),
+                    &std::env::temp_dir(),
                     false,
                     8,
+                    None,
                 )
                 .expect("create session");
             info.session_id
@@ -522,9 +524,10 @@ mod tests {
                     "task-b".to_owned(),
                     None,
                     "HEAD".to_owned(),
-                    std::env::temp_dir().join("simgit-mount-b"),
+                    &std::env::temp_dir(),
                     false,
                     8,
+                    None,
                 )
                 .expect("create session");
             manager
@@ -603,9 +606,10 @@ mod tests {
                     "recover-task".into(),
                     None,
                     "HEAD".into(),
-                    mnt_dir.join("stale-session"),
+                    &mnt_dir,
                     false,
                     16,
+                    None,
                 )
                 .expect("create session");
             info.session_id
@@ -663,9 +667,10 @@ mod tests {
                     "lock-task".to_owned(),
                     None,
                     "HEAD".to_owned(),
-                    std::env::temp_dir().join("simgit-lock-mount"),
+                    &std::env::temp_dir(),
                     false,
                     8,
+                    None,
                 )
                 .expect("create session");
 

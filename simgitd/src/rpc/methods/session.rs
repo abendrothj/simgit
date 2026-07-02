@@ -29,17 +29,13 @@ pub(super) async fn session_create(
     // Resolve base commit (default = HEAD).
     let base_commit = base_commit.unwrap_or_else(|| resolve_head(&state.config.repo_path));
 
-    // Build mount path.
-    let session_id = uuid::Uuid::now_v7();
-    let mount_path = state.config.mnt_dir.join(session_id.to_string());
-
     let info = state
         .sessions
         .create(
             task_id,
             agent_label,
             base_commit.clone(),
-            mount_path.clone(),
+            &state.config.mnt_dir,
             peers,
             state.config.max_sessions,
             initial_branch.clone(),

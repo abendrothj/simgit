@@ -892,7 +892,7 @@ mod tests {
     fn git_merge_resolves_fast_forward() {
         let repo = temp_dir();
         init_git_repo(&repo);
-        let _base = create_and_commit(&repo, "a.txt", "a\n");
+        let base = create_and_commit(&repo, "a.txt", "a\n");
 
         // Create a feature branch with an extra commit.
         std::process::Command::new("git")
