@@ -712,8 +712,11 @@ impl SessionVfsOps for SessionFs {
             .acquire_write(self.session_id, &path, Some(self.cfg.lock_ttl_seconds))
             .map_err(VfsOpError::from)?;
 
+        // Write a zero-length blob instead of mark_deleted to avoid
+        // negative-cache interference with subsequent CREATE operations
+        // (same fix as NFS backend).
         self.deltas
-            .mark_deleted(self.session_id, &path)
+            .write_blob(self.session_id, &path, &[], None)
             .map_err(|_| VfsOpError::Io)?;
         Ok(())
     }
@@ -802,7 +805,7 @@ impl SessionVfsOps for SessionFs {
             .write_blob(self.session_id, &new_path, &source_data, None)
             .map_err(|_| VfsOpError::Io)?;
         self.deltas
-            .mark_deleted(self.session_id, &old_path)
+            .write_blob(self.session_id, &old_path, &[], None)
             .map_err(|_| VfsOpError::Io)?;
         let _ = self
             .deltas
@@ -1068,21 +1071,25 @@ mod tests {
     }
 
     #[test]
-    fn unlink_marks_file_deleted() {
+    fn unlink_truncates_file_to_empty() {
         let repo = init_repo_with_file();
         let fs = new_session_fs(&repo);
 
         SessionVfsOps::unlink(&fs, 1, "hello.txt").expect("unlink should succeed");
 
-        let err = SessionVfsOps::lookup(&fs, 1, "hello.txt")
-            .expect_err("deleted file should no longer resolve");
-        assert!(matches!(err, VfsOpError::NotFound));
+        // After unlink, the file still resolves (zero-length blob to avoid
+        // NFS negative-cache interference with subsequent CREATE).
+        let ino = SessionVfsOps::lookup(&fs, 1, "hello.txt")
+            .expect("unlinked file should still resolve (zero-length blob)");
+        let data = SessionVfsOps::read(&fs, ino, 0, 1024)
+            .expect("unlinked file should be readable");
+        assert!(data.is_empty(), "unlinked file should be empty");
 
         let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
-    fn rename_moves_delta_content_and_clears_old_name() {
+    fn rename_moves_delta_content_and_truncates_old_name() {
         let repo = init_repo_with_file();
         let fs = new_session_fs(&repo);
 
@@ -1091,9 +1098,12 @@ mod tests {
 
         SessionVfsOps::rename(&fs, 1, "new.txt", 1, "renamed.txt").expect("rename should succeed");
 
-        let err = SessionVfsOps::lookup(&fs, 1, "new.txt")
-            .expect_err("old name should no longer resolve");
-        assert!(matches!(err, VfsOpError::NotFound));
+        // Old name still resolves (zero-length blob to avoid NFS negative
+        // cache), but its content is empty.
+        let old_id = SessionVfsOps::lookup(&fs, 1, "new.txt")
+            .expect("old name should still resolve (zero-length blob)");
+        let old_data = SessionVfsOps::read(&fs, old_id, 0, 100).expect("read should succeed");
+        assert!(old_data.is_empty(), "old file should be empty after rename");
 
         let renamed_id =
             SessionVfsOps::lookup(&fs, 1, "renamed.txt").expect("new name should resolve");

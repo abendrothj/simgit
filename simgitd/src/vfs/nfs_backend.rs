@@ -700,8 +700,15 @@ impl SessionVfsOps for NfsSession {
             .acquire_write(self.session_id, &path, Some(self.cfg.lock_ttl_seconds))
             .map_err(VfsOpError::from)?;
 
+        // Write a zero-length blob instead of marking deleted.  If we add
+        // the path to manifest.deletes, the next LOOKUP returns NFS3ERR_NOENT
+        // and macOS's NFS client caches that negative result — causing
+        // subsequent CREATE (O_CREAT after O_TRUNC) to fail because the
+        // client never sends the CREATE RPC.  By keeping the path in
+        // manifest.writes with empty content, LOOKUP succeeds and CREATE
+        // can overwrite without negative-cache interference.
         self.deltas
-            .mark_deleted(self.session_id, &path)
+            .write_blob(self.session_id, &path, &[], None)
             .map_err(|_| VfsOpError::Io)?;
         Ok(())
     }
@@ -792,7 +799,7 @@ impl SessionVfsOps for NfsSession {
             .write_blob(self.session_id, &new_path, &source_data, None)
             .map_err(|_| VfsOpError::Io)?;
         self.deltas
-            .mark_deleted(self.session_id, &old_path)
+            .write_blob(self.session_id, &old_path, &[], None)
             .map_err(|_| VfsOpError::Io)?;
         let _ = self
             .deltas
@@ -1051,6 +1058,10 @@ impl NFSFileSystem for NfsSession {
         _dirid: fileid3,
         _filename: &filename3,
     ) -> std::result::Result<fileid3, nfsstat3> {
+        // macOS NFS client uses EXCLUSIVE create for open(O_CREAT|O_EXCL).
+        // Signal that the server doesn't support this mode so the client
+        // retries with regular CREATE (which our handler allows for all
+        // overwrite scenarios).
         Err(nfsstat3::NFS3ERR_NOTSUPP)
     }
 

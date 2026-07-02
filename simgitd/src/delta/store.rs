@@ -296,9 +296,10 @@ impl DeltaStore {
     pub fn record_rename(&self, session_id: Uuid, from: &Path, to: &Path) -> Result<()> {
         self.with_session_lock(session_id, || {
             let mut manifest = self.load_manifest_unlocked(session_id)?;
-            if let Some(hash) = manifest.writes.remove(from) {
-                manifest.writes.insert(to.to_owned(), hash);
-            }
+            // Just record the rename pair.  The caller has already written
+            // the new content to `to` and truncated `from` to empty via
+            // write_blob().  Don't touch hashes — the old entry stays in
+            // writes (empty) to avoid NFS negative-cache interference.
             manifest.renames.push((from.to_owned(), to.to_owned()));
             self.write_manifest(session_id, &manifest)
         })
@@ -445,16 +446,22 @@ mod tests {
         store
             .write_blob(session_id, old_path, b"hello", None)
             .expect("write old path");
+        // Write new content to new_path (rename handler does this before record_rename)
+        store
+            .write_blob(session_id, new_path, b"hello", None)
+            .expect("write new path");
         store
             .record_rename(session_id, old_path, new_path)
             .expect("rename path");
+        // Truncate old path (no longer uses mark_deleted which adds to deletes)
         store
-            .mark_deleted(session_id, old_path)
-            .expect("delete old path");
+            .write_blob(session_id, old_path, &[], None)
+            .expect("truncate old path");
 
         let manifest = store.load_manifest(session_id).expect("load manifest");
         assert!(manifest.writes.contains_key(new_path));
-        assert!(manifest.deletes.contains(old_path));
+        // Old path stays in writes with empty blob to avoid NFS negative cache.
+        assert!(manifest.writes.contains_key(old_path));
         assert!(manifest
             .renames
             .iter()
@@ -468,8 +475,9 @@ mod tests {
 
         let old = store
             .read_blob(session_id, old_path)
-            .expect("read old path");
-        assert!(old.is_none());
+            .expect("read old path")
+            .expect("old path should have empty blob");
+        assert!(old.is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
     }

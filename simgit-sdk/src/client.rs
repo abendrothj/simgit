@@ -432,14 +432,13 @@ impl Client {
         &self,
         session_id: Uuid,
         commit: &str,
-    ) -> Result<SessionInfo, SdkError> {
-        let result = self
-            .call(
-                "session.set-base",
-                serde_json::json!({ "session_id": session_id.to_string(), "commit": commit }),
-            )
-            .await?;
-        Ok(serde_json::from_value(result)?)
+    ) -> Result<(), SdkError> {
+        self.call(
+            "session.set-base",
+            serde_json::json!({ "session_id": session_id.to_string(), "commit": commit }),
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn session_list(
