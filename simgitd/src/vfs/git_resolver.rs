@@ -436,7 +436,7 @@ impl InodeMap {
         Self {
             map: Mutex::new(m),
             delta_files: Mutex::new(HashMap::new()),
-            next_ino: Mutex::new(2),
+            next_ino: Mutex::new(3), // 1 = root, 2 = virtual .git
         }
     }
 
