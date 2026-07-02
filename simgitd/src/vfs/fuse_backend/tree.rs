@@ -20,6 +20,7 @@ pub(super) fn vfs_kind_to_file_type(kind: VfsFileKind) -> FileType {
         VfsFileKind::File => FileType::RegularFile,
         VfsFileKind::Dir => FileType::Directory,
         VfsFileKind::Symlink => FileType::Symlink,
+        VfsFileKind::Submodule => FileType::Directory,
     }
 }
 

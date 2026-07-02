@@ -371,7 +371,7 @@ impl SessionVfsOps for SessionFs {
             kind: entry.kind.into(),
             size: entry.size,
             perm: entry.perm,
-            nlink: 1,
+            nlink: if entry.kind == EntryKind::Commit { 2 } else { 1 },
             uid: crate::platform::current_uid(),
             gid: crate::platform::current_gid(),
         })
@@ -407,7 +407,7 @@ impl SessionVfsOps for SessionFs {
             return Err(VfsOpError::NotFound);
         }
 
-        if entry.kind == EntryKind::Dir {
+        if entry.kind == EntryKind::Dir || entry.kind == EntryKind::Commit {
             return Err(VfsOpError::IsADirectory);
         }
 
@@ -462,7 +462,7 @@ impl SessionVfsOps for SessionFs {
         else {
             return Err(VfsOpError::NotFound);
         };
-        if entry.kind == EntryKind::Dir {
+        if entry.kind == EntryKind::Dir || entry.kind == EntryKind::Commit {
             return Err(VfsOpError::IsADirectory);
         }
 
@@ -684,7 +684,7 @@ impl SessionVfsOps for SessionFs {
             .get(&parent_tree_oid, &self.cfg.repo_path)
             .map_err(|_| VfsOpError::Io)?;
         if let Some(entry) = tree_entries.iter().find(|e| e.name == name) {
-            if entry.kind == EntryKind::Dir {
+            if entry.kind == EntryKind::Dir || entry.kind == EntryKind::Commit {
                 return Err(VfsOpError::IsADirectory);
             }
             if !manifest.deletes.contains(&path) {
@@ -743,7 +743,7 @@ impl SessionVfsOps for SessionFs {
 
         let git_entry = old_parent_entries.iter().find(|e| e.name == from_name);
         if let Some(entry) = git_entry {
-            if entry.kind == EntryKind::Dir {
+            if entry.kind == EntryKind::Dir || entry.kind == EntryKind::Commit {
                 return Err(VfsOpError::IsADirectory);
             }
         }
@@ -813,7 +813,7 @@ impl SessionVfsOps for SessionFs {
         else {
             return Err(VfsOpError::NotFound);
         };
-        if entry.kind == EntryKind::Dir {
+        if entry.kind == EntryKind::Dir || entry.kind == EntryKind::Commit {
             return Err(VfsOpError::IsADirectory);
         }
         let Some(path) = self.inode_map.path_of(id) else {

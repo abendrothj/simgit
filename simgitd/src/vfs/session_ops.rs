@@ -83,6 +83,9 @@ pub enum VfsFileKind {
     File,
     Dir,
     Symlink,
+    /// Git submodule (gitlink, mode 160000).  The VFS presents these as
+    /// directories; git resolves the linked commit for actual content.
+    Submodule,
 }
 
 impl From<EntryKind> for VfsFileKind {
@@ -91,6 +94,7 @@ impl From<EntryKind> for VfsFileKind {
             EntryKind::File => VfsFileKind::File,
             EntryKind::Dir => VfsFileKind::Dir,
             EntryKind::Symlink => VfsFileKind::Symlink,
+            EntryKind::Commit => VfsFileKind::Submodule,
         }
     }
 }
@@ -187,6 +191,9 @@ pub fn directory_tree_oid_for_ino(
     };
 
     if entry.kind != EntryKind::Dir {
+        if entry.kind == EntryKind::Commit {
+            return Err(DirTreeError::NotDir);
+        }
         return Err(DirTreeError::NotDir);
     }
 

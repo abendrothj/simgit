@@ -94,6 +94,8 @@ pub enum EntryKind {
     File,
     Dir,
     Symlink,
+    /// Git submodule (mode 160000 gitlink).
+    Commit,
 }
 
 /// Maps git tree OID → file entries.
@@ -225,6 +227,7 @@ impl TreeCache {
             let kind = match (mode, obj_type) {
                 ("040000", _) | (_, "tree") => EntryKind::Dir,
                 ("120000", _) => EntryKind::Symlink,
+                ("160000", _) => EntryKind::Commit,
                 _ => EntryKind::File,
             };
             let perm = u16::from_str_radix(mode, 8).unwrap_or(0o644);
