@@ -107,11 +107,15 @@ impl GitProxy {
 
         // ── config ────────────────────────────────────────────────────────
         let origin_url = git_remote_url(repo_path, "origin").unwrap_or_default();
+        let user_name = git_config_get(repo_path, "user.name")
+            .unwrap_or_else(|| "simgit".to_owned());
+        let user_email = git_config_get(repo_path, "user.email")
+            .unwrap_or_else(|| "simgit@localhost".to_owned());
         fs::write(
             git_dir.join("config"),
             format!(
                 "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\
-                 [user]\n\tname = simgit\n\temail = simgit@localhost\n\
+                 [user]\n\tname = {user_name}\n\temail = {user_email}\n\
                  {remote_section}",
                 remote_section = if origin_url.is_empty() {
                     String::new()
@@ -213,6 +217,20 @@ fn git_remote_url(repo_path: &Path, remote: &str) -> Result<String> {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
     } else {
         Ok(String::new())
+    }
+}
+
+fn git_config_get(repo_path: &Path, key: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let val = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if val.is_empty() { None } else { Some(val) }
+    } else {
+        None
     }
 }
 
