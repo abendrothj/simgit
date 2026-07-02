@@ -4,13 +4,15 @@
 //!
 //! Instead of building an elaborate real-time index, we let git be git:
 //!
-//! 1. **Symlink `refs/`** from the real repo — gives every git command branch/tag resolution for free.
+//! 1. **Copy `refs/`** from the real repo — gives every git command branch/tag resolution for free.
 //! 2. **Write `HEAD`** pointing to `base_commit` — git knows what commit the session is on.
 //! 3. **Write `objects/info/alternates`** pointing at the real repo's object store — all blobs/trees/commits are reachable without copying data.
 //! 4. **Write `.git/config`** with the real repo's remote URL — `git push`/`git fetch` work.
 //! 5. **Populate the index once** with `git read-tree HEAD` — `git status` and `git diff` compare the working tree (served by the VFS overlay) against this baseline index. No per-write updates needed.
 //! 6. **Write `hooks/pre-commit`** — forwards `git commit` to `sg commit` via the daemon.
 //! 7. **Write `hooks/post-checkout`** — notifies the daemon when the session's base commit changes.
+//! 8. **Write `hooks/post-merge`** — notifies the daemon after `git merge`/`git pull`.
+//! 9. **Write `hooks/post-rewrite`** — notifies the daemon after `git rebase`/`git commit --amend`.
 //!
 //! The VFS overlay handles reads (fall through to the real file when no delta)
 //! and writes (intercept for borrow-checking + delta storage). Git sees a real
@@ -19,14 +21,16 @@
 //! # What works
 //!
 //! Every `git` command works: status, diff, log, blame, show, add, commit
-//! (intercepted), checkout, push, fetch, merge, rebase, stash, bisect, clean.
+//! (forwarded), checkout, push, fetch, merge, rebase, stash, bisect, clean.
+//! All lifecycle hooks (pre-commit, post-checkout, post-merge, post-rewrite)
+//! are wired to keep the daemon in sync.
 //!
 //! # Session isolation
 //!
-//! The `.git/refs` symlink points at the shared real repo, but **all writes
+//! The `.git/refs` is a copy of the shared real repo's refs, but **all writes
 //! go through the per-session VFS handler**, which consults BorrowRegistry
 //! and stores deltas in the per-session DeltaStore.  Two agents doing
-//! `git checkout` in parallel don't touch each other's files.  The symlink
+//! `git checkout` in parallel don't touch each other's files.  The refs copy
 //! is read-only metadata — it can't modify another session's working tree.
 
 use std::fs;
@@ -157,6 +161,29 @@ impl GitProxy {
         );
         write_executable_hook(&git_dir, "post-checkout", &post_checkout)?;
 
+        // ── post-merge hook ────────────────────────────────────────────────
+        // Notify daemon after git merge / git pull.
+        let post_merge = format!(
+            "#!/bin/sh\n\
+             # simgit: update session base commit after merge\n\
+             # $1 = 1 if squash, 0 otherwise\n\
+             HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null) && \\\n\
+             sg session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+            sid = session_id,
+        );
+        write_executable_hook(&git_dir, "post-merge", &post_merge)?;
+
+        // ── post-rewrite hook ──────────────────────────────────────────────
+        // Notify daemon after git rebase / git commit --amend.
+        let post_rewrite = format!(
+            "#!/bin/sh\n\
+             # simgit: update session base commit after rebase/amend\n\
+             HEAD_COMMIT=$(git rev-parse HEAD 2>/dev/null) && \\\n\
+             sg session-set-base --session {sid} --commit \"$HEAD_COMMIT\"\n",
+            sid = session_id,
+        );
+        write_executable_hook(&git_dir, "post-rewrite", &post_rewrite)?;
+
         Ok(Self { git_dir })
     }
 }
@@ -280,6 +307,12 @@ mod tests {
             .join(".git")
             .join("hooks")
             .join("post-checkout")
+            .exists());
+        assert!(mount.join(".git").join("hooks").join("post-merge").exists());
+        assert!(mount
+            .join(".git")
+            .join("hooks")
+            .join("post-rewrite")
             .exists());
 
         // refs should exist as a directory (copied from real repo)

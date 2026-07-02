@@ -35,12 +35,14 @@ root — that's it:
 | `.git/config` → `[remote "origin"]` url | `git push` and `git fetch` work against the real remote. |
 | `.git/index` → one-time init via `git read-tree HEAD` | `git status` and `git diff` compare the working tree (served by the VFS overlay) against this baseline snapshot. No per-write updates needed — the VFS automatically serves delta versions for modified files, so git naturally sees them as "modified." |
 
-Two hooks handle the remaining integration:
+Four hooks handle the remaining integration:
 
 | Hook | What it does |
 |---|---|
 | `.git/hooks/pre-commit` | Forwards `git commit` to `sg commit` via the daemon's commit scheduler (conflict-aware, idempotent). Returns 0 so git proceeds with a local commit afterwards (harmless duplicate; the real commit already exists in the shared repo). |
 | `.git/hooks/post-checkout` | Called after `git checkout`. Notifies the daemon that the session's base commit changed, clears stale deltas, and reinitializes the delta store for the new base. |
+| `.git/hooks/post-merge` | Called after `git merge` / `git pull`. Updates the session's base commit to the merge result. |
+| `.git/hooks/post-rewrite` | Called after `git rebase` / `git commit --amend`. Updates the session's base commit to the rewritten HEAD. |
 
 ### Every git command works
 
@@ -52,21 +54,22 @@ Two hooks handle the remaining integration:
 | `git log` / `git blame` | ✓ | Objects via alternates, refs via symlink. |
 | `git show` | ✓ | Any commit reachable from the real repo. |
 | `git add` | ✓ | Idempotent — the VFS serves the written version, git sees the change. |
-| `git commit` | ✓ | Intercepted by pre-commit hook → `sg commit`. |
-| `git checkout <branch>` | ✓ | Resolves the branch via symlinked refs. Writes the new working tree through the VFS handler. Post-checkout hook updates the session's base commit. |
-| `git push` / `git fetch` | ✓ | Remote URL in `.git/config`. Refs update through the symlink. |
-| `git merge` / `git rebase` | ✓ | Git resolves refs via symlink, performs the operation, writes through VFS. |
+| `git commit` | ✓ | Forwarded by pre-commit hook → `sg commit`. Hook returns 0 so the agent sees success. |
+| `git checkout <branch>` | ✓ | Resolves the branch via refs. Writes new working tree through VFS. Post-checkout hook updates the session's base commit. |
+| `git push` / `git fetch` | ✓ | Remote URL in `.git/config`. Refs update through the local refs copy. |
+| `git merge` / `git rebase` | ✓ | Git resolves refs, performs operation, writes through VFS. Post-merge / post-rewrite hooks notify the daemon. |
+| `git commit --amend` | ✓ | Post-rewrite hook notifies the daemon of the new HEAD. |
 | `git stash` | ✓ | Stash refs are stored under the symlinked `refs/stash`. |
 | `git bisect` | ✓ | Git checks out commits, each firing the post-checkout hook. |
 | `git clean` | ✓ | Works against the VFS-served working tree. |
 
 ### Session isolation
 
-The `.git/refs` symlink points at the shared real repo, but **all writes go
+The `.git/refs` is a copy of the shared real repo's refs, but **all writes go
 through the per-session VFS handler**.  Two agents doing `git checkout` in
 parallel don't touch each other's files — the VFS intercepts every write and
 routes it to the per-session `DeltaStore` after consulting `BorrowRegistry`.
-The symlink is read-only metadata; it can't modify another session's working
+The refs copy is read-only metadata; it can't modify another session's working
 tree.
 
 ### Disabling the git proxy
