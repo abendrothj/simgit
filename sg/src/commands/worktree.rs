@@ -495,7 +495,8 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     let branch = list_worktrees(&repo)?
         .into_iter()
         .find(|entry| entry.path == target)
-        .and_then(|entry| entry.branch);
+        .and_then(|entry| entry.branch)
+        .or_else(|| overlay::branch(&repo, &target));
     // Detect overlay backing while the worktree is still mounted/registered.
     let overlay = overlay::state(&repo, &target);
 
@@ -569,6 +570,9 @@ fn resolve_worktree_target(repo: &RepoContext, target: Option<&str>) -> Result<P
         return Ok(as_path);
     }
     if let Some(path) = worktree_path_for_branch(repo, spec)? {
+        return Ok(path);
+    }
+    if let Some(path) = overlay::worktree_for_branch(repo, spec) {
         return Ok(path);
     }
     bail!("no worktree found for '{spec}' (not an existing path or a checked-out branch)");
@@ -676,14 +680,11 @@ fn repair(json_output: bool) -> Result<()> {
     let mut repaired = Vec::new();
     let mut healthy = Vec::new();
     let mut failed = Vec::new();
-    for entry in list_worktrees(&repo)? {
-        if entry.is_main || overlay::state(&repo, &entry.path).is_none() {
-            continue;
-        }
-        match overlay::repair(&repo, &entry.path) {
-            Ok(true) => repaired.push(entry.path),
-            Ok(false) => healthy.push(entry.path),
-            Err(error) => failed.push((entry.path, error.to_string())),
+    for (worktree, _) in overlay::registrations(&repo) {
+        match overlay::repair(&repo, &worktree) {
+            Ok(true) => repaired.push(worktree),
+            Ok(false) => healthy.push(worktree),
+            Err(error) => failed.push((worktree, error.to_string())),
         }
     }
     if json_output {

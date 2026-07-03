@@ -62,6 +62,10 @@ pub(super) fn write_marker(admin: &Path, state: &State) -> Result<()> {
 
 pub(super) fn state(repo: &RepoContext, worktree: &Path) -> Option<State> {
     let admin = admin_dir(repo, worktree)?;
+    read_state(&admin)
+}
+
+fn read_state(admin: &Path) -> Option<State> {
     let content = fs::read_to_string(admin.join(OVERLAY_MARKER)).ok()?;
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
         let overlay_dir = PathBuf::from(value.get("overlay_dir")?.as_str()?);
@@ -79,6 +83,60 @@ pub(super) fn state(repo: &RepoContext, worktree: &Path) -> Option<State> {
         overlay_dir: PathBuf::from(trimmed),
         lower: None,
     })
+}
+
+/// Enumerate overlay registrations directly from Git's common admin directory.
+/// Unlike `git worktree list`, this retains entries whose mountpoint currently
+/// lacks its `.git` file after a reboot or manual unmount.
+pub(super) fn registrations(repo: &RepoContext) -> Vec<(PathBuf, State)> {
+    let mut registrations = Vec::new();
+    let Ok(entries) = fs::read_dir(repo.common_git_dir.join("worktrees")) else {
+        return registrations;
+    };
+    for entry in entries.flatten() {
+        let admin = entry.path();
+        let Some(state) = read_state(&admin) else {
+            continue;
+        };
+        let Ok(gitdir) = fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let gitdir = PathBuf::from(gitdir.trim());
+        if let Some(worktree) = gitdir.parent() {
+            registrations.push((worktree.to_path_buf(), state));
+        }
+    }
+    registrations
+}
+
+pub(super) fn worktree_for_branch(repo: &RepoContext, branch: &str) -> Option<PathBuf> {
+    let wanted = format!("ref: refs/heads/{branch}");
+    let entries = fs::read_dir(repo.common_git_dir.join("worktrees")).ok()?;
+    for entry in entries.flatten() {
+        let admin = entry.path();
+        if read_state(&admin).is_none() {
+            continue;
+        }
+        let Ok(head) = fs::read_to_string(admin.join("HEAD")) else {
+            continue;
+        };
+        if head.trim() != wanted {
+            continue;
+        }
+        let Ok(gitdir) = fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        if let Some(worktree) = PathBuf::from(gitdir.trim()).parent() {
+            return Some(worktree.to_path_buf());
+        }
+    }
+    None
+}
+
+pub(super) fn branch(repo: &RepoContext, worktree: &Path) -> Option<String> {
+    let admin = admin_dir(repo, worktree)?;
+    let head = fs::read_to_string(admin.join("HEAD")).ok()?;
+    head.trim().strip_prefix("ref: ").map(str::to_owned)
 }
 
 pub(super) fn admin_dir(repo: &RepoContext, worktree: &Path) -> Option<PathBuf> {

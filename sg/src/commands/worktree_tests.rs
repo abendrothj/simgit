@@ -167,6 +167,20 @@ fn overlay_marker_round_trips_through_common_admin_dir() -> Result<()> {
     };
     overlay::write_marker(&worktree_admin_dir(&worktree)?, &state)?;
     assert_eq!(overlay::state(&repo, &worktree), Some(state));
+
+    let saved_gitlink = fixture.root.join("saved-gitlink");
+    fs::rename(worktree.join(".git"), &saved_gitlink)?;
+    let registrations = overlay::registrations(&repo);
+    assert!(registrations.iter().any(|(path, _)| path == &worktree));
+    assert_eq!(
+        overlay::branch(&repo, &worktree).as_deref(),
+        Some("refs/heads/wt")
+    );
+    assert_eq!(
+        overlay::worktree_for_branch(&repo, "wt"),
+        Some(worktree.clone())
+    );
+    fs::rename(saved_gitlink, worktree.join(".git"))?;
     Ok(())
 }
 
