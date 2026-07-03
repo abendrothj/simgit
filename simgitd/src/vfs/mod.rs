@@ -123,8 +123,10 @@ pub mod session_ops;
 ///
 /// - **FUSE** (Linux): Uses fuser crate to negotiate with kernel FUSE subsystem.
 ///   Registration happens via init → getattr → lookup → read/write.
-/// - **NFS-loopback** (macOS): Creates a plain directory tree at mount_path;
-///   no kernel involvement (Phase 0 stub).
+/// - **NFS-loopback** (macOS): Runs an embedded NFSv3 server (via `nfsserve`)
+///   bound to loopback and mounts it at mount_path. Every NFSv3 `WRITE` RPC is
+///   routed through `SessionVfsOps::write` → `BorrowRegistry`, giving the same
+///   write-time borrow-checking guarantee as the FUSE path.
 ///
 /// # Atomicity
 ///
@@ -154,9 +156,10 @@ pub trait VfsBackendTrait: Send + Sync {
 
     /// Synchronize backend-native mount writes into the delta store prior to commit.
     ///
-    /// Backends with in-kernel/write-intercept paths (FUSE) can keep the default no-op.
-    /// Backends that currently mount plain directories (macOS NFS-loopback stub) can
-    /// materialize changed files into the per-session delta manifest here.
+    /// Backends that intercept every write on the mount path (FUSE, NFS-loopback)
+    /// already record deltas as writes happen, so they keep the default no-op.
+    /// This hook exists for any future backend that mounts a plain directory tree
+    /// and needs to materialize changed files into the per-session delta manifest.
     fn capture_mount_delta(&self, _session: &SessionInfo) -> Result<()> {
         Ok(())
     }

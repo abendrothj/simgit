@@ -53,6 +53,24 @@ working tree never touches disk.
 | Conflict safety | Borrow-checker style exclusivity at commit time |
 | Observability | Structured conflict payloads, commit telemetry, Prometheus metrics |
 
+### Measured
+
+Standing up N isolated working trees over a 67 MB repo, real host disk consumed
+(`git worktree` full checkouts vs `sg worktree` sessions):
+
+| N sessions | `git worktree` | `sg worktree` |
+|---:|---:|---:|
+| 1  | 67.2 MB   | 0.11 MB |
+| 8  | 537.5 MB  | 0.25 MB |
+| 16 | 1075.1 MB | 0.41 MB |
+
+Disk grows linearly with `git worktree` and stays flat with simgit — ~2,600×
+less at N=16, and the gap widens with tree size. **At N=1–2, plain `git worktree`
+is simpler and the right call; the win only shows up at high fan-out.** simgit
+also trades local page-cache reads for a loopback FS layer, so it buys disk and
+setup-time scaling, not raw single-file read latency. Full method, caveats, and a
+reproduction script: [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
+
 ## Features
 
 - **Session lifecycle** — create, diff, commit, abort, status, garbage collection
@@ -109,10 +127,16 @@ borrow-checking guarantee through the shared `SessionVfsOps` trait:
 | macOS 15.4+ (future) | FSKit native provider | Yes — Apple's user-space FS framework, no kernel extension | One-time System Settings toggle; requires paid Apple Developer account to sign |
 | Windows | WinFSP (`winfsp_wrs`) | Yes — every WinFSP write callback goes through `SessionVfsOps::write()` → `BorrowRegistry` | One-time install of WinFSP runtime (MSI or `choco install winfsp`) |
 
-The nightly SLO/chaos suite currently runs on macOS with the NFSv3 backend. Linux
-FUSE correctness is covered by a separate integration suite that gates PRs
-(see `.github/workflows/fuse-linux-integration.yml`). Both backends share the
-same borrow-checking and CoW delta logic through `SessionVfsOps`.
+Test coverage by platform:
+
+| Platform | Backend | CI coverage |
+|---|---|---|
+| macOS | NFSv3 | Nightly SLO/chaos suite (primary exercised path) |
+| Linux | FUSE | Mount integration tests — real create/rename/unlink through the FUSE mount (`.github/workflows/fuse-linux-integration.yml`) |
+| Windows | WinFSP | Compile + link against the WinFSP runtime and cross-platform unit tests (`.github/workflows/windows-winfsp.yml`). Mount-level integration on Windows is **not yet covered** — the backend is build-verified, not mount-verified. |
+
+All backends share the same borrow-checking and CoW delta logic through
+`SessionVfsOps`; the FUSE and WinFSP backends additionally share `SessionFs`.
 
 ## Repository layout
 
