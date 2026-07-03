@@ -1,10 +1,9 @@
 //! # sg — simgit Command-Line Interface
 //!
-//! A command-line tool for managing simgit agent sessions with borrow-checked
-//! filesystem semantics.  Designed for large monorepos with many concurrent
-//! agents where `git worktree` disk and I/O overhead become prohibitive.
-//!
-//! For normal repos (< 500 MB, < 5 concurrent agents), use `git worktree`.
+//! A command-line tool for managing simgit agent sessions.  `sg worktree`
+//! avoids duplicating the working tree N times like `git worktree` does —
+//! every agent reads from a shared baseline and writes to a private
+//! copy-on-write overlay.
 //!
 //! ## Overview
 //!
@@ -55,9 +54,9 @@
 //!
 //! ## Command Reference
 //!
-//! - **worktree add/remove/list** — `sg worktree` for concurrent-agent
-//!   workflows at scale (auto-starts daemon, prints mount path, hooks
-//!   auto-inject socket).  For normal repos, use `git worktree`.
+//! - **worktree add/remove/list** — Per-agent sessions with zero-disk
+//!   copy-on-write working trees (auto-starts daemon, prints mount path).
+//!   Use any time you'd otherwise duplicate the repo with `git worktree`.
 //! - **init** — Initialize simgit + start daemon (one-time setup)
 //! - **new** — Create new session (`--branch <name>` for target branch)
 //! - **commit** — Flatten delta to git branch + close session
