@@ -12,15 +12,14 @@ cargo test --workspace
 You'll need:
 - Rust stable (1.75+)
 - Git (any recent version)
-- Linux: FUSE kernel module (standard on all distros)
-- macOS: no extra dependencies (NFS built-in)
-- Windows: [WinFSP runtime](https://github.com/winfsp/winfsp/releases)
+- macOS: no extra dependencies (APFS `clonefile`)
+- Linux: no extra dependencies (`overlayfs`, with a reflink-clone fallback)
 
 ## Project structure
 
 ```
 simgit/
-├── simgitd/          daemon — session manager, borrow checker, delta store, VFS
+├── simgitd/          daemon — session manager, borrow checker, delta store, CoW VFS
 ├── simgit-sdk/       Rust SDK — async JSON-RPC client + shared types
 ├── simgit-py/        Python bindings — PyO3, maturin wheel
 ├── sg/               CLI tool — `sg new`, `sg commit`, `sg status`…
@@ -43,7 +42,7 @@ simgit is a daemon that provides isolated copy-on-write filesystem overlays for 
 | **BorrowRegistry** | Per-path write lock enforcement (Rust-style borrow semantics) |
 | **DeltaStore** | Content-addressed CoW blob storage |
 | **CommitScheduler** | Per-path serialization for conflict-safe commits |
-| **VFS Backends** | FUSE (Linux), NFSv3 (macOS), WinFSP (Windows) — all share `SessionVfsOps` |
+| **CoW VFS** | Native copy-on-write working tree per session (Linux `overlayfs`, macOS `clonefile`); changes captured into the delta store at commit |
 | **RPC Server** | JSON-RPC 2.0 over TCP loopback |
 
 ## Before submitting a PR

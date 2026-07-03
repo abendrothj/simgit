@@ -1,67 +1,67 @@
-//! `sg worktree` — drop-in replacement for `git worktree`.
+//! Native Git linked worktrees populated with filesystem copy-on-write clones.
 //!
-//! # Commands
-//!
-//! - **add** `<branch>` `[path]` — create a session, auto-start daemon, print mount path
-//! - **remove** `[path|session]` — abort (or commit) a session, unmount, clean up
-//! - **list** — show all active sessions in worktree style
-//!
-//! # Examples
-//!
-//! ```bash
-//! cd $(sg worktree add feat/my-branch)
-//! # ... agent works ...
-//! git commit -m "done"      # forwarded to sg commit via hook
-//! sg worktree remove        # from inside the mount
-//! ```
+//! `sg worktree` deliberately has no daemon dependency. Git owns the refs,
+//! index, commits, and lifecycle; simgit only avoids repeatedly inflating the
+//! same checkout by cloning an immutable cached baseline when the filesystem
+//! supports it.
 
-use clap::{Args, Subcommand};
 use anyhow::{bail, Context, Result};
+use clap::{Args, Subcommand};
+use serde_json::json;
+use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, SystemTime};
+use uuid::Uuid;
 
-use simgit_sdk::Client;
-
-// ---------------------------------------------------------------------------
-// CLI types
-// ---------------------------------------------------------------------------
+const BASELINE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Subcommand)]
 pub enum Worktree {
-    /// Create a new worktree session on a branch.
+    /// Create a real Git linked worktree, using CoW clones when supported.
     Add(WorktreeAdd),
-    /// Remove a worktree session (abort or commit + cleanup).
+    /// Remove a linked worktree.
     Remove(WorktreeRemove),
-    /// List active worktree sessions.
+    /// List linked worktrees using Git's native registry.
     List(WorktreeList),
+    /// Prune stale Git registrations and old cached baselines.
+    Prune(WorktreePrune),
 }
 
 #[derive(Args)]
 pub struct WorktreeAdd {
-    /// Branch name to create (e.g. feat/my-feature).
+    /// Branch name to create (for example, feat/my-feature).
     pub branch: String,
 
-    /// Optional mount path. Defaults to `.git/simgit/worktrees/<branch>`.
-    pub path: Option<String>,
+    /// Worktree path. Defaults to `.git/simgit/worktrees/<branch>`.
+    pub path: Option<PathBuf>,
 
-    /// Base commit to start from. Defaults to HEAD.
+    /// Commit-ish to start from. Defaults to HEAD.
     #[arg(long)]
     pub base: Option<String>,
+
+    /// Fail instead of using a normal Git checkout when CoW is unavailable.
+    #[arg(long)]
+    pub require_cow: bool,
 }
 
 #[derive(Args)]
 pub struct WorktreeRemove {
-    /// Session ID or mount path to remove.
-    /// Defaults to the session that owns the current directory.
-    pub target: Option<String>,
+    /// Worktree path. Defaults to the worktree containing the current directory.
+    pub target: Option<PathBuf>,
 
-    /// Commit uncommitted changes before removing.
+    /// Commit all changes before removing the worktree.
     #[arg(long)]
     pub commit: bool,
 
     /// Commit message for --commit.
     #[arg(short, long, default_value = "simgit worktree remove")]
     pub message: String,
+
+    /// Discard uncommitted changes. Without this flag, Git refuses dirty removal.
+    #[arg(long, conflicts_with = "commit")]
+    pub force: bool,
 }
 
 #[derive(Args)]
@@ -71,308 +71,640 @@ pub struct WorktreeList {
     pub json: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
+#[derive(Args, Default)]
+pub struct WorktreePrune {
+    /// Also delete every cached baseline, including recently used entries.
+    #[arg(long)]
+    pub all: bool,
+}
 
-pub async fn run(cmd: Worktree, socket_override: &Option<String>, json: bool) -> Result<()> {
-    let socket = resolve_socket(socket_override)?;
+#[derive(Debug)]
+struct RepoContext {
+    top_level: PathBuf,
+    common_git_dir: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PopulateMode {
+    CowClone,
+    GitCheckout,
+}
+
+impl PopulateMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CowClone => "cow-clone",
+            Self::GitCheckout => "git-checkout",
+        }
+    }
+}
+
+pub fn run(cmd: Worktree, global_json: bool) -> Result<()> {
     match cmd {
-        Worktree::Add(a) => add(a, &socket).await,
-        Worktree::Remove(r) => remove(r, &socket).await,
-        Worktree::List(l) => list(l, &socket, json).await,
+        Worktree::Add(args) => add(args),
+        Worktree::Remove(args) => remove(args),
+        Worktree::List(args) => list(args.json || global_json),
+        Worktree::Prune(args) => prune(args),
     }
 }
 
-/// Resolve the daemon socket path. If `--socket` is explicitly provided,
-/// use it. Otherwise, discover from the git repository root.
-fn resolve_socket(socket_override: &Option<String>) -> Result<String> {
-    if let Some(ref s) = socket_override {
-        return Ok(s.clone());
+fn add(args: WorktreeAdd) -> Result<()> {
+    let repo = discover_repo(&std::env::current_dir()?)?;
+    validate_new_branch(&repo, &args.branch)?;
+    let base = resolve_commit(&repo, args.base.as_deref().unwrap_or("HEAD"))?;
+    let target = absolute_path(
+        args.path
+            .unwrap_or_else(|| default_worktree_path(&repo.common_git_dir, &args.branch)),
+    )?;
+
+    if target.exists() {
+        bail!("worktree path already exists: {}", target.display());
     }
-    match find_repo_root() {
-        Ok(repo) => Ok(repo_port_file(&repo).to_string_lossy().into_owned()),
-        Err(_) => {
-            // No repo — fall back to global default.
-            Ok(simgit_sdk::client::default_port_file()
-                .to_string_lossy()
-                .into_owned())
-        }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create worktree parent {}", parent.display()))?;
     }
-}
 
-// ---------------------------------------------------------------------------
-// add
-// ---------------------------------------------------------------------------
-
-async fn add(cmd: WorktreeAdd, socket: &str) -> Result<()> {
-    let repo_root = find_repo_root()?;
-    ensure_daemon(&repo_root, socket).await?;
-
-    let client = Client::new(socket);
-    let base = cmd.base.unwrap_or_else(|| "HEAD".to_owned());
-    let resolved_base = resolve_head_or_commit(&repo_root, &base)?;
-
-    let info = client
-        .session_create(
-            format!("worktree:{}", cmd.branch),
-            Some(format!("worktree:{}", cmd.branch)),
-            Some(resolved_base),
-            false,
-            Some(cmd.branch.clone()),
-        )
-        .await
-        .context("session.create RPC")?;
-
-    let mount = cmd.path.as_ref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| mount_default_path(&repo_root, &cmd.branch));
-
-    // Always print the session ID on stderr so scripts can capture the
-    // mount path from stdout and still see the session ID.
-    eprintln!("session: {}", info.session_id);
-
-    println!("{}", info.mount_path.display());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// remove
-// ---------------------------------------------------------------------------
-
-async fn remove(cmd: WorktreeRemove, socket: &str) -> Result<()> {
-    let session_id = if let Some(ref target) = cmd.target {
-        // Try parsing as UUID first, otherwise treat as path.
-        if let Ok(id) = target.parse::<uuid::Uuid>() {
-            id
-        } else {
-            find_session_by_path(socket, &PathBuf::from(target)).await?
-        }
-    } else {
-        let cwd = std::env::current_dir()?;
-        find_session_by_cwd(socket, &cwd).await?
-    };
-
-    let client = Client::new(socket);
-
-    if cmd.commit {
-        let result = client
-            .session_commit(session_id, None, Some(cmd.message))
-            .await
-            .context("session.commit RPC")?;
-        println!(
-            "Committed to branch {}",
-            result.session.branch_name.as_deref().unwrap_or("(none)")
+    let target_parent = target.parent().context("worktree path has no parent")?;
+    let mode = if cow_clone_supported(&repo.common_git_dir, target_parent)? {
+        PopulateMode::CowClone
+    } else if args.require_cow {
+        bail!(
+            "filesystem CoW cloning is unavailable; omit --require-cow to use a normal Git checkout"
         );
     } else {
-        client.session_abort(session_id).await.context("session.abort RPC")?;
-        println!("Session {} aborted", session_id);
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// list
-// ---------------------------------------------------------------------------
-
-async fn list(_cmd: WorktreeList, socket: &str, json: bool) -> Result<()> {
-    ensure_daemon_connectable(socket).await?;
-    let client = Client::new(socket);
-    let sessions = client.session_list(None).await?;
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&sessions)?);
-        return Ok(());
-    }
-
-    if sessions.is_empty() {
-        println!("(no active worktrees)");
-        return Ok(());
-    }
-
-    // Column widths
-    let max_branch = sessions.iter()
-        .filter_map(|s| s.branch_name.as_deref())
-        .map(|b| b.len())
-        .max()
-        .unwrap_or(10)
-        .max(10);
-
-    println!("{:<max_branch$}  {}  PATH", "BRANCH", "STATUS", max_branch = max_branch);
-    for s in &sessions {
-        let branch = s.branch_name.as_deref().unwrap_or("(detached)");
-        let status = match s.status {
-            simgit_sdk::SessionStatus::Active => "active",
-            simgit_sdk::SessionStatus::Committed => "committed",
-            simgit_sdk::SessionStatus::Aborted => "aborted",
-            simgit_sdk::SessionStatus::Stale => "stale",
-        };
-        println!("{:<max_branch$}  {:<8}  {}", branch, status, s.mount_path.display(), max_branch = max_branch);
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Daemon lifecycle helpers
-// ---------------------------------------------------------------------------
-
-/// Find the repository root from CWD.
-///
-/// Walks up the directory tree looking for a `.git` *directory* (not a file)
-/// so that simgit session mounts (which contain a `.git` gitdir-pointer file)
-/// are skipped in favour of the real repository above them.
-fn find_repo_root() -> Result<PathBuf> {
-    let mut dir = std::env::current_dir()?;
-    loop {
-        let dot_git = dir.join(".git");
-        if dot_git.is_dir() {
-            return Ok(dir);
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-    bail!("not in a git repository (no .git/ directory found)");
-}
-
-/// Resolve HEAD or a commit-ish to a full SHA.
-fn resolve_head_or_commit(repo: &Path, base: &str) -> Result<String> {
-    if base == "HEAD" {
-        let output = std::process::Command::new("git")
-            .current_dir(repo)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .context("git rev-parse HEAD")?;
-        if !output.status.success() {
-            bail!("cannot resolve HEAD in {}", repo.display());
-        }
-        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
-    }
-    // For non-HEAD, check if it resolves to a commit.
-    let output = std::process::Command::new("git")
-        .current_dir(repo)
-        .args(["rev-parse", "--verify", &format!("{}^{{commit}}", base)])
-        .output();
-    if let Ok(out) = output {
-        if out.status.success() {
-            return Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned());
-        }
-    }
-    // Fallback: try as raw commit SHA.
-    let output = std::process::Command::new("git")
-        .current_dir(repo)
-        .args(["rev-parse", "--verify", base])
-        .output()
-        .context("git rev-parse")?;
-    if !output.status.success() {
-        bail!("cannot resolve base commit '{}' in {}", base, repo.display());
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-/// Default mount path: `$repo/.git/simgit/worktrees/<branch>`.
-fn mount_default_path(repo: &Path, branch: &str) -> PathBuf {
-    repo.join(".git").join("simgit").join("worktrees").join(branch)
-}
-
-/// Generate the state-dir path for a repo: `$repo/.git/simgit`.
-fn repo_state_dir(repo: &Path) -> PathBuf {
-    repo.join(".git").join("simgit")
-}
-
-/// Generate the port-file path for a repo.
-fn repo_port_file(repo: &Path) -> PathBuf {
-    repo_state_dir(repo).join("control.port")
-}
-
-/// Try connecting to the daemon. Returns Ok(()) if the daemon responds,
-/// or an error if it's unreachable.
-async fn ensure_daemon_connectable(socket: &str) -> Result<()> {
-    let client = Client::new(socket);
-    // Use a short internal timeout by doing a quick session list.
-    match client.session_list(None).await {
-        Ok(_) => Ok(()),
-        Err(_) => bail!("daemon not reachable at {}", socket),
-    }
-}
-
-/// Ensure the daemon is running for this repo. If the port file exists and
-/// the daemon responds, return. Otherwise, spawn a new daemon.
-async fn ensure_daemon(repo: &Path, socket: &str) -> Result<()> {
-    if ensure_daemon_connectable(socket).await.is_ok() {
-        return Ok(());
-    }
-
-    let state_dir = repo_state_dir(repo);
-    std::fs::create_dir_all(&state_dir)
-        .with_context(|| format!("create {}", state_dir.display()))?;
-
-    // Find simgitd binary next to sg.
-    let sg_exe = std::env::current_exe().context("current_exe")?;
-    let simgitd_exe = sg_exe
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("simgitd");
-
-    let child = std::process::Command::new(&simgitd_exe)
-        .env("SIMGIT_REPO", repo)
-        .env("SIMGIT_STATE_DIR", &state_dir)
-        .env("SIMGIT_METRICS_ENABLED", "0")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("spawn simgitd at {}", simgitd_exe.display()))?;
-
-    let pid = child.id();
-    // Wait for the port file to appear.
-    let port_file = repo_port_file(repo);
-    for _ in 0..50 {
-        if port_file.exists() && std::fs::read_to_string(&port_file).map(|s| !s.trim().is_empty()).unwrap_or(false) {
-            // Verify the daemon is actually responding.
-            if ensure_daemon_connectable(socket).await.is_ok() {
-                return Ok(());
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    // Daemon didn't come up. Kill the child.
-    let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
-    bail!("daemon did not start within 10s (pid {})", pid);
-}
-
-// ---------------------------------------------------------------------------
-// Session discovery helpers
-// ---------------------------------------------------------------------------
-
-/// Find the session that owns `cwd` by walking up the directory tree and
-/// matching against known sessions.
-async fn find_session_by_cwd(socket: &str, cwd: &Path) -> Result<uuid::Uuid> {
-    let client = Client::new(socket);
-    let sessions = client.session_list(None).await?;
-
-    let mut dir = cwd.to_path_buf();
-    loop {
-        for s in &sessions {
-            if dir == s.mount_path || dir.starts_with(&s.mount_path) {
-                return Ok(s.session_id);
-            }
-        }
-        if !dir.pop() {
-            break;
-        }
-    }
-
-    bail!("no simgit session found for {}", cwd.display());
-}
-
-/// Find a session by its mount path.
-async fn find_session_by_path(socket: &str, path: &Path) -> Result<uuid::Uuid> {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
+        PopulateMode::GitCheckout
     };
-    find_session_by_cwd(socket, &abs).await
+
+    match mode {
+        PopulateMode::CowClone => add_cow_worktree(&repo, &args.branch, &target, &base)?,
+        PopulateMode::GitCheckout => add_git_worktree(&repo, &args.branch, &target, &base)?,
+    }
+
+    eprintln!("mode: {}", mode.label());
+    println!("{}", target.display());
+    Ok(())
+}
+
+fn validate_new_branch(repo: &RepoContext, branch: &str) -> Result<()> {
+    let format = git_output_common(repo, ["check-ref-format", "--branch", branch])?;
+    if !format.status.success() {
+        bail!("invalid branch name '{branch}'");
+    }
+    let reference = format!("refs/heads/{branch}");
+    let exists = git_output_common(repo, ["show-ref", "--verify", "--quiet", &reference])?;
+    match exists.status.code() {
+        Some(1) => Ok(()),
+        Some(0) => bail!("branch '{branch}' already exists"),
+        _ => Err(git_failure("git show-ref --verify", &exists)),
+    }
+}
+
+fn add_cow_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
+    let baseline = ensure_baseline(repo, base)?;
+    let add_result = run_git_common(
+        repo,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--no-checkout"),
+            OsStr::new("-b"),
+            OsStr::new(branch),
+            target.as_os_str(),
+            OsStr::new(base),
+        ],
+    );
+    if let Err(error) = add_result {
+        return Err(error.context("create linked worktree"));
+    }
+
+    let populate_result = (|| -> Result<()> {
+        run_git_at(target, ["read-tree", "HEAD"]).context("initialize linked-worktree index")?;
+        clone_tree(&baseline, target).context("clone cached baseline")?;
+        ensure_clean(target).context("verify cloned worktree")
+    })();
+
+    if let Err(error) = populate_result {
+        rollback_created_worktree(repo, target, branch);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn add_git_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
+    run_git_common(
+        repo,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("-b"),
+            OsStr::new(branch),
+            target.as_os_str(),
+            OsStr::new(base),
+        ],
+    )
+    .context("create linked worktree with normal Git checkout")?;
+    ensure_clean(target)
+}
+
+fn remove(args: WorktreeRemove) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo = discover_repo(&cwd)?;
+    let target = match args.target {
+        Some(path) => absolute_path(path)?,
+        None => repo.top_level.clone(),
+    };
+
+    if args.commit {
+        run_git_at(&target, ["add", "-A"]).context("stage worktree changes")?;
+        let diff = git_output_at(&target, ["diff", "--cached", "--quiet"])?;
+        match diff.status.code() {
+            Some(0) => eprintln!("no changes to commit"),
+            Some(1) => {
+                run_git_at(&target, ["commit", "-m", &args.message])
+                    .context("commit worktree changes")?;
+            }
+            _ => return Err(git_failure("git diff --cached --quiet", &diff)),
+        }
+    }
+
+    let mut command = Command::new("git");
+    command
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args(["worktree", "remove"]);
+    if args.force {
+        command.arg("--force");
+    }
+    command.arg(&target);
+    run_command(&mut command, "git worktree remove")?;
+    println!("{}", target.display());
+    Ok(())
+}
+
+fn list(json_output: bool) -> Result<()> {
+    let repo = discover_repo(&std::env::current_dir()?)?;
+    if !json_output {
+        let output = git_output_common(&repo, ["worktree", "list"])?;
+        if !output.status.success() {
+            return Err(git_failure("git worktree list", &output));
+        }
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        return Ok(());
+    }
+
+    let output = git_output_common(&repo, ["worktree", "list", "--porcelain"])?;
+    if !output.status.success() {
+        return Err(git_failure("git worktree list --porcelain", &output));
+    }
+    let mut entries = Vec::new();
+    let mut current = serde_json::Map::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.is_empty() {
+            if !current.is_empty() {
+                entries.push(serde_json::Value::Object(std::mem::take(&mut current)));
+            }
+            continue;
+        }
+        let (key, value) = line.split_once(' ').unwrap_or((line, "true"));
+        let value = if value == "true" {
+            json!(true)
+        } else {
+            json!(value)
+        };
+        current.insert(key.to_owned(), value);
+    }
+    if !current.is_empty() {
+        entries.push(serde_json::Value::Object(current));
+    }
+    println!("{}", serde_json::to_string_pretty(&entries)?);
+    Ok(())
+}
+
+fn prune(args: WorktreePrune) -> Result<()> {
+    let repo = discover_repo(&std::env::current_dir()?)?;
+    run_git_common(&repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
+    let removed = prune_baselines(&repo.common_git_dir, args.all)?;
+    println!("pruned {removed} cached baseline(s)");
+    Ok(())
+}
+
+fn discover_repo(path: &Path) -> Result<RepoContext> {
+    let top_level = git_path_output(path, ["rev-parse", "--show-toplevel"])
+        .context("not in a Git working tree")?;
+    let common = git_path_output(
+        path,
+        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .context("resolve Git common directory")?;
+    Ok(RepoContext {
+        top_level: PathBuf::from(top_level),
+        common_git_dir: PathBuf::from(common),
+    })
+}
+
+fn git_path_output<const N: usize>(path: &Path, args: [&str; N]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .context("run git")?;
+    if !output.status.success() {
+        return Err(git_failure("git rev-parse", &output));
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn resolve_commit(repo: &RepoContext, base: &str) -> Result<String> {
+    let spec = format!("{base}^{{commit}}");
+    let output = git_output_common(repo, ["rev-parse", "--verify", &spec])?;
+    if !output.status.success() {
+        bail!("cannot resolve base commit '{base}'");
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn default_worktree_path(common_git_dir: &Path, branch: &str) -> PathBuf {
+    common_git_dir
+        .join("simgit")
+        .join("worktrees")
+        .join(safe_path_component(branch))
+}
+
+fn safe_path_component(branch: &str) -> String {
+    let mut name: String = branch
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if name.is_empty() || name == "." || name == ".." {
+        name.insert_str(0, "branch-");
+    }
+    name
+}
+
+fn absolute_path(path: PathBuf) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn state_dir(common_git_dir: &Path) -> PathBuf {
+    common_git_dir.join("simgit")
+}
+
+fn cow_clone_supported(common_git_dir: &Path, destination_dir: &Path) -> Result<bool> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (common_git_dir, destination_dir);
+        return Ok(false);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let probe = state_dir(common_git_dir).join("clone-probes");
+        fs::create_dir_all(&probe)?;
+        let token = Uuid::new_v4().to_string();
+        let source = probe.join(format!("{token}.source"));
+        let destination = destination_dir.join(format!(".simgit-clone-probe-{token}"));
+        fs::write(&source, b"simgit-cow-probe")?;
+        let status = clone_file_command(&source, &destination)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_file(&destination);
+        Ok(status.map(|status| status.success()).unwrap_or(false))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file_command(source: &Path, destination: &Path) -> Command {
+    let mut command = Command::new("cp");
+    command.args([
+        OsStr::new("-c"),
+        source.as_os_str(),
+        destination.as_os_str(),
+    ]);
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn clone_file_command(source: &Path, destination: &Path) -> Command {
+    let mut command = Command::new("cp");
+    command.args([
+        OsStr::new("--reflink=always"),
+        source.as_os_str(),
+        destination.as_os_str(),
+    ]);
+    command
+}
+
+fn ensure_baseline(repo: &RepoContext, commit: &str) -> Result<PathBuf> {
+    let root = state_dir(&repo.common_git_dir).join("baselines");
+    let final_dir = root.join(commit);
+    let final_tree = final_dir.join("tree");
+    let ready = final_dir.join("ready");
+    if ready.is_file() && final_tree.is_dir() {
+        touch(&ready)?;
+        let _ = prune_baselines(&repo.common_git_dir, false);
+        return Ok(final_tree);
+    }
+
+    fs::create_dir_all(&root)?;
+    if final_dir.exists() {
+        fs::remove_dir_all(&final_dir).context("remove incomplete cached baseline")?;
+    }
+    let temporary = root.join(format!(".{commit}.{}", Uuid::new_v4()));
+    let cache = temporary.join("cache");
+    let temporary_tree = cache.join("tree");
+    fs::create_dir_all(&temporary_tree)?;
+    if let Err(error) = materialize_baseline(repo, commit, &temporary_tree) {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+    fs::write(cache.join("ready"), commit)?;
+
+    match fs::rename(&cache, &final_dir) {
+        Ok(()) => {}
+        Err(_) if ready.is_file() && final_tree.is_dir() => {
+            let _ = fs::remove_dir_all(&temporary);
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error).with_context(|| format!("publish baseline {commit}"));
+        }
+    }
+    let _ = fs::remove_dir_all(&temporary);
+    let _ = prune_baselines(&repo.common_git_dir, false);
+    Ok(final_tree)
+}
+
+fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) -> Result<()> {
+    let index = destination
+        .parent()
+        .context("baseline destination has no parent")?
+        .join("index");
+    let mut read_tree = Command::new("git");
+    read_tree
+        .env("GIT_INDEX_FILE", &index)
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args(["read-tree", commit]);
+    run_command(&mut read_tree, "initialize baseline index")?;
+
+    let mut checkout = Command::new("git");
+    checkout
+        .env("GIT_INDEX_FILE", &index)
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .arg(format!("--work-tree={}", destination.display()))
+        .args(["checkout-index", "--all", "--force"]);
+    let result = run_command(
+        &mut checkout,
+        "materialize baseline with Git checkout-index",
+    );
+    let _ = fs::remove_file(index);
+    result
+}
+
+fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("cp");
+        command.args(["-c", "-R"]);
+        command
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new("cp");
+        command.args(["--reflink=always", "-R"]);
+        command
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    bail!("CoW tree cloning is not supported on this platform");
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        command.arg(source.join(".")).arg(destination);
+        run_command(&mut command, "copy-on-write tree clone")
+    }
+}
+
+fn ensure_clean(worktree: &Path) -> Result<()> {
+    let output = git_output_at(worktree, ["status", "--porcelain"])?;
+    if !output.status.success() {
+        return Err(git_failure("git status --porcelain", &output));
+    }
+    if !output.stdout.is_empty() {
+        bail!(
+            "populated worktree does not match its index:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    Ok(())
+}
+
+fn rollback_created_worktree(repo: &RepoContext, target: &Path, branch: &str) {
+    let _ = remove_worktree_force(repo, target);
+    let _ = Command::new("git")
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args(["branch", "-D", branch])
+        .status();
+}
+
+fn remove_worktree_force(repo: &RepoContext, target: &Path) -> Result<()> {
+    let mut command = Command::new("git");
+    command
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args(["worktree", "remove", "--force"])
+        .arg(target);
+    run_command(&mut command, "git worktree remove --force")
+}
+
+fn prune_baselines(common_git_dir: &Path, all: bool) -> Result<usize> {
+    let root = state_dir(common_git_dir).join("baselines");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error).context("read baseline cache"),
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let age_source = if path.join("ready").is_file() {
+            path.join("ready")
+        } else {
+            path.clone()
+        };
+        let old = age_source
+            .metadata()?
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .map(|age| age >= BASELINE_MAX_AGE)
+            .unwrap_or(false);
+        if all || old {
+            if path.is_dir() {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn touch(path: &Path) -> Result<()> {
+    let contents = fs::read(path)?;
+    fs::write(path, contents)?;
+    Ok(())
+}
+
+fn run_git_common<I, S>(repo: &RepoContext, args: I) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new("git");
+    command
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args(args);
+    run_command(&mut command, "git")
+}
+
+fn run_git_at<const N: usize>(path: &Path, args: [&str; N]) -> Result<()> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(path).args(args);
+    run_command(&mut command, "git")
+}
+
+fn git_output_common<const N: usize>(repo: &RepoContext, args: [&str; N]) -> Result<Output> {
+    Command::new("git")
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args(args)
+        .output()
+        .context("run git")
+}
+
+fn git_output_at<const N: usize>(path: &Path, args: [&str; N]) -> Result<Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .context("run git")
+}
+
+fn run_command(command: &mut Command, description: &str) -> Result<()> {
+    let output = command.output().with_context(|| description.to_owned())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(git_failure(description, &output))
+    }
+}
+
+fn git_failure(description: &str, output: &Output) -> anyhow::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    anyhow::anyhow!("{description} failed ({}): {detail}", output.status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_names_become_single_safe_path_components() {
+        assert_eq!(safe_path_component("feat/auth"), "feat-auth");
+        assert_eq!(safe_path_component("../../escape"), "..-..-escape");
+        assert_eq!(safe_path_component(".."), "branch-..");
+    }
+
+    #[test]
+    fn native_worktree_fallback_is_clean_and_registered() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let target = fixture.root.join("fallback");
+        let base = resolve_commit(&repo, "HEAD")?;
+        add_git_worktree(&repo, "fallback-test", &target, &base)?;
+        ensure_clean(&target)?;
+        let listed = git_output_common(&repo, ["worktree", "list", "--porcelain"])?;
+        assert!(String::from_utf8_lossy(&listed.stdout).contains(target.to_string_lossy().as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn cow_worktree_is_clean_when_filesystem_supports_clones() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        if !cow_clone_supported(&repo.common_git_dir, &fixture.root)? {
+            return Ok(());
+        }
+        let target = fixture.root.join("cow");
+        let base = resolve_commit(&repo, "HEAD")?;
+        add_cow_worktree(&repo, "cow-test", &target, &base)?;
+        ensure_clean(&target)?;
+        assert_eq!(fs::read_to_string(target.join("file.txt"))?, "content\n");
+        assert_eq!(
+            fs::read_to_string(target.join("archive-excluded.txt"))?,
+            "still part of a checkout\n"
+        );
+        Ok(())
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        repo: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Result<Self> {
+            let root =
+                std::env::temp_dir().join(format!("simgit-worktree-test-{}", Uuid::new_v4()));
+            let repo = root.join("repo");
+            fs::create_dir_all(&repo)?;
+            git(&repo, ["init", "-q"])?;
+            git(&repo, ["config", "user.email", "test@example.com"])?;
+            git(&repo, ["config", "user.name", "Test User"])?;
+            fs::write(repo.join("file.txt"), "content\n")?;
+            fs::write(
+                repo.join(".gitattributes"),
+                "archive-excluded.txt export-ignore\n",
+            )?;
+            fs::write(
+                repo.join("archive-excluded.txt"),
+                "still part of a checkout\n",
+            )?;
+            git(&repo, ["add", "."])?;
+            git(&repo, ["commit", "-q", "-m", "initial"])?;
+            Ok(Self { root, repo })
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn git<const N: usize>(path: &Path, args: [&str; N]) -> Result<()> {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(path).args(args);
+        run_command(&mut command, "test git")
+    }
 }

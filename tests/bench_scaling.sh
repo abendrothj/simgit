@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Scaling benchmark: does simgit's "avoid N copies of the working tree" claim hold?
 # Compares real host disk and time-to-ready for N `git worktree` checkouts vs
-# N `sg worktree` sessions. See docs/scaling_benchmark.md for a recorded run.
+# N native CoW-backed `sg worktree` checkouts. See docs/scaling_benchmark.md.
 #
 #   NFILES=400 FSIZE_KB=128 NS="1 2 4 8 16" bash tests/bench_scaling.sh
 #
@@ -10,20 +10,17 @@
 #   their full per-file block count even when their extents are shared.
 # - the `df` used-block delta observes physical filesystem allocation, including
 #   shared-clone behavior, but is noisy if other processes write to the volume.
-set -u
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SG="${SG:-$REPO_ROOT/target/debug/sg}"
-SIMGITD="${SIMGITD:-$REPO_ROOT/target/debug/simgitd}"
 WORK="${WORK:-$(mktemp -d)}"
 NFILES="${NFILES:-400}"        # files in the working tree
 FSIZE_KB="${FSIZE_KB:-128}"    # size per file
 NS="${NS:-1 2 4 8}"            # session counts to test
 DISK_SETTLE_SECS="${DISK_SETTLE_SECS:-1}"
 
-for bin in "$SG" "$SIMGITD"; do
-  [ -x "$bin" ] || { echo "missing $bin — run: cargo build --workspace"; exit 1; }
-done
+[ -x "$SG" ] || { echo "missing $SG — run: cargo build -p simgit-cli"; exit 1; }
 
 kb() { local v; v=$(du -sxk "$1" 2>/dev/null | awk '{print $1; exit}'); echo "${v:-0}"; }
 used_kb() { df -Pk "$1" | awk 'NR == 2 {print $3}'; }
@@ -45,15 +42,8 @@ make_repo() {
     git add -A; git commit -qm init )
 }
 
-stop_daemon() {
-  mount 2>/dev/null | grep -i "simgit/mnt" | awk '{print $3}' | while read -r m; do
-    umount -f "$m" 2>/dev/null || fusermount -u "$m" 2>/dev/null || true
-  done
-  pkill -f "$SIMGITD" 2>/dev/null || true; sleep 1
-}
-
 TREE_KB=""
-printf '%-6s | %-34s | %-34s\n' "N" "git worktree" "simgit CoW sessions"
+printf '%-6s | %-34s | %-34s\n' "N" "git worktree" "sg native CoW worktree"
 printf '%-6s | %-9s %-10s %-9s | %-9s %-10s %-9s\n' "" "du(MB)" "phys(MB)" "time(s)" "du(MB)" "phys(MB)" "time(s)"
 echo "-------|------------------------------------|------------------------------------"
 
@@ -77,7 +67,7 @@ for N in $NS; do
   rm -rf "$WORK"/bench-gw-wt-* "$GWREPO"
   settle_disk
 
-  # ---------- simgit sessions ----------
+  # ---------- native CoW-backed linked worktrees ----------
   SGREPO="$WORK/bench-sg"
   make_repo "$SGREPO"
   settle_disk
@@ -91,7 +81,6 @@ for N in $NS; do
   sg_kb=$(kb "$SGREPO/.git/simgit")
   sg_mb=$(awk -v k="$sg_kb" 'BEGIN{printf "%.1f", k/1024}')
   sg_phys_mb=$(delta_mb "$sg_after" "$sg_before")
-  stop_daemon
   rm -rf "$SGREPO"
   settle_disk
 

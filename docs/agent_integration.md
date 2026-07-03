@@ -2,16 +2,12 @@
 
 This guide is for building production-grade agent runners on top of simgit using either Python bindings or the Rust SDK.
 
-## Drop-in worktree replacement — using simgit sessions like `git worktree add`
+## Lean agent worktrees — native Git plus filesystem CoW
 
-`git worktree` duplicates the full working tree for each session.  simgit
-sessions materialize one baseline and create native copy-on-write trees from
-it. Unchanged file extents remain physically shared; each session allocates
-private blocks only as it writes.
-
-simgit sessions bootstrap a minimal `.git` directory at the mount root so that
-existing LLM coding agents that shell out to `git` work **without
-modification** inside a session mount.  This means you can replace:
+Ordinary `git worktree add` inflates every tracked file for every agent.
+`sg worktree add` keeps Git's linked-worktree model but populates the checkout
+from one immutable cached baseline using filesystem CoW clones. Existing agents
+still use Git without modification:
 
 ```bash
 git worktree add ../agent-1-session main
@@ -24,90 +20,74 @@ with:
 cd $(sg worktree add feat/my-feature)
 ```
 
-and every subsequent `git` command the agent runs behaves correctly.
+The printed path is a real Git worktree. It appears in both `git worktree list`
+and `sg worktree list`; its `.git` file points at the common repository, and
+its branch, index, reflog, hooks, remotes, config, and object database all use
+Git's standard implementation.
 
 ### How it works
 
-At session creation, the daemon bootstraps a minimal `.git/` at the mount
-root:
+Creation is intentionally small:
 
-| File | What it does |
+| Step | What it does |
 |---|---|
-| `.git/refs` → copy of real repo's `refs/` | Every branch, tag, and remote ref is available locally. ~10-600 KB per session. Copied at bootstrap so git treats the session as having a real local commit history — required for `git stash`, `git blame`, and `git merge`. |
-| `.git/packed-refs` → copy of real repo's `packed-refs` | Ref entries stored in packed format (common for tags and stale branches) are visible. |
-| `.git/logs/` | Empty reflog directory so `git reflog` and `git stash` log history work. |
-| `.git/HEAD` → `base_commit` | Git knows what commit the session is on. |
-| `.git/objects/info/alternates` → real repo's object store | All blobs, trees, and commits are reachable without copying data. |
-| `.git/config` | Inherits `user.name`, `user.email`, `remote.origin.url`, and key `core.*`/`pull.*`/`push.*` values from the real repo. |
-| `.git/index` → one-time init via `git read-tree HEAD` | `git status` and `git diff` compare the native CoW working tree against this baseline snapshot. Optional NFS/FUSE backends instead serve delta versions through a VFS overlay. |
+| `git worktree add --no-checkout -b ...` | Registers the worktree and creates its private HEAD/index administration. |
+| `git read-tree HEAD` | Initializes that private index before files are populated. |
+| Cached native checkout | `git checkout-index` materializes each commit once under `.git/simgit/baselines/<commit>/tree`, preserving checkout filters and attributes without running hooks. |
+| APFS clone / Linux reflink | Populates ordinary files whose unchanged extents remain physically shared. |
+| `git status --porcelain` | Verifies the populated tree exactly matches its index before returning it. |
 
-Six hooks handle the remaining integration. **Each hook embeds the daemon's
-socket path** so they work without any environment variables — `sg worktree
-add` handles this automatically at session creation.
-
-| Hook | What it does |
-|---|---|
-| `.git/hooks/pre-commit` | Forwards `git commit` to `sg commit` via the daemon's commit scheduler (conflict-aware, idempotent). Returns 0 so git proceeds with a local commit afterwards (harmless duplicate; the real commit already exists in the shared repo). |
-| `.git/hooks/post-checkout` | Called after `git checkout`. Notifies the daemon that the session's base commit changed, clears stale deltas, and reinitializes the delta store for the new base. |
-| `.git/hooks/post-merge` | Called after `git merge` / `git pull`. Updates the session's base commit to the merge result. |
-| `.git/hooks/post-rewrite` | Called after `git rebase` / `git commit --amend`. Updates the session's base commit to the rewritten HEAD. |
-| `.git/hooks/commit-msg` | Pass-through for agent commit-message validation hooks. |
-| `.git/hooks/pre-push` | Refreshes session state before `git push` so the daemon sees the latest base commit. |
+If the capability probe cannot clone a file, `sg` performs a normal Git
+checkout. Pass `--require-cow` when silently consuming full checkout disk would
+be unacceptable. Failed setup is rolled back, including its newly created
+branch.
 
 ### Every git command works
 
 | Command | Status | Notes |
 |---|---|---|
-| `git status` | ✓ | Native CoW working tree vs index (baseline snapshot). Modified files appear normally. |
+| `git status` | ✓ | Standard linked-worktree index and ordinary local files. |
 | `git diff` | ✓ | Same comparison. |
 | `git diff --cached` | ✓ | Staging area vs HEAD. |
-| `git log` / `git blame` | ✓ | Objects via alternates, refs via symlink. |
+| `git log` / `git blame` | ✓ | Shared Git object database and refs. |
 | `git show` | ✓ | Any commit reachable from the real repo. |
-| `git add` | ✓ | Idempotent — the VFS serves the written version, git sees the change. |
-| `git commit` | ✓ | Forwarded by pre-commit hook → `sg commit`. Hook returns 0 so the agent sees success. |
-| `git checkout <branch>` | ✓ | Resolves the branch via refs and updates the private working tree. Post-checkout updates the daemon's base commit. Verified with full hash parity. |
+| `git add` | ✓ | Native Git index. |
+| `git commit` | ✓ | Native commit and branch-ref update; repository hooks run normally. |
+| `git checkout <branch>` | ✓ | Native Git behavior and linked-worktree branch exclusivity. |
 | `git checkout <file>` | ✓ | Restores the file from the index in the private working tree. |
 | `git cherry-pick` | ✓ | Applies commits via checkout + write path. |
-| `git push` / `git fetch` | ✓ | Remote URL in `.git/config`. Refs update through the local refs copy. |
-| `git merge` / `git rebase` | ✓ | Git resolves refs, performs operation, writes through VFS. Post-merge / post-rewrite hooks notify the daemon. |
-| `git commit --amend` | ✓ | Post-rewrite hook notifies the daemon of the new HEAD. |
-| `git stash` | ✓ | Stash refs are stored under the local `refs/stash`. Create/overwrite semantics support stash pop. |
-| `git bisect` | ✓ | Git checks out commits, each firing the post-checkout hook. |
-| `git clean` | ✓ | Removes untracked files normally. The optional NFS backend has a documented negative-cache workaround. |
+| `git push` / `git fetch` | ✓ | Shared repository config, remotes, and refs. |
+| `git merge` / `git rebase` | ✓ | Native Git behavior. |
+| `git commit --amend` / `git stash` / `git bisect` | ✓ | Native Git behavior. |
+| `git clean` | ✓ | Native filesystem and Git behavior. |
 
 ### Session isolation
 
-The `.git/refs` is a copy of the shared real repo's refs. With the default CoW
-backend, agents write directly through the kernel into distinct private trees;
-overlaps are reconciled at commit. The optional NFS/FUSE/WinFSP backends route
-writes through `BorrowRegistry` for synchronous rejection instead. In either
-mode, one session cannot mutate another session's working tree.
+Each agent writes to a distinct directory and a distinct linked-worktree index.
+CoW shares physical extents, not mutable file identity: writing one clone does
+not change another worktree. Git prevents the same branch from being checked
+out in multiple linked worktrees. Cross-branch semantic conflicts remain Git's
+normal merge/rebase concern; use daemon-managed `sg new` sessions when
+simgit's path-lease and commit-scheduler semantics are required.
 
 ### When to use simgit vs git worktree
 
-- **Using `git worktree` directly** → simpler, no daemon.  Fine for one or two
-  sessions.
-- **Using `sg worktree`** → any time you'd otherwise have N copies of the
-  working tree on disk. The more mostly-read, sparsely edited sessions, the
-  more one-baseline CoW pays off.
+- **`git worktree`** → no baseline cache and a full checkout per worktree.
+- **`sg worktree`** → same Git integration and local-I/O path, with one cached
+  baseline plus private changed extents. Best for many mostly-read, sparsely
+  edited agents.
+- **Daemon sessions (`sg new`, SDK, Python)** → stronger coordinated commit and
+  observability semantics, with more machinery and a non-native lifecycle.
 
-### Why sessions aren't git worktrees
+### Lifecycle and cleanup
 
-simgit sessions are **not** registered as `git worktree` entries in the real
-repo's `.git/worktrees/`.  This is intentional:
-
-- **`git worktree list` won't show simgit sessions**. Each session has an
-  independent working tree and synthetic `.git/`; the real repo is unaware of
-  its lifecycle.
-- **Shared physical baseline**. Real worktrees allocate approximately N full
-  trees. simgit allocates one baseline, shared session extents, private changed
-  blocks, and captured changed-file data.
-- **Amortized setup**. The first session pays for daemon startup and baseline
-  materialization; later sessions use native clone/reflink creation. Git is
-  generally faster at low fan-out, while simgit can cross over at higher N.
-
-The tradeoff is that tooling expecting `git worktree list` or `.git/worktrees/`
-entries won't discover simgit sessions.  Use `sg session list` instead.
+`sg worktree remove` delegates to `git worktree remove` and therefore refuses
+to delete dirty state. `--commit` stages and commits all changes first;
+`--force` explicitly discards them. `sg worktree prune` removes stale Git
+registrations and cached baselines unused for seven days, while
+`sg worktree prune --all` drops the entire baseline cache. Existing worktrees
+remain valid after cache pruning because cloned extents have independent
+filesystem references.
 
 ### Disabling the git proxy
 
@@ -220,17 +200,18 @@ async fn main() -> anyhow::Result<()> {
 
 ### Using with Claude Code agents
 
-Assign each Claude Code agent instance a distinct session via `sg worktree`.
-The agents never need to know about each other — isolation and conflict
-detection are handled entirely by the daemon, which auto-starts on first use.
+Assign each Claude Code agent instance a distinct linked worktree via
+`sg worktree`.
+The agents get separate native branches, indexes, and working directories. No
+daemon or environment setup is involved.
 
 ```bash
 # Agent 1 shell
 cd $(sg worktree add feat/auth-refactor)
-# agent writes files, runs `git commit` — forwarded by pre-commit hook
+# agent writes files and commits with native Git
 sg worktree remove --commit --message "auth refactor"
 
-# Agent 2 shell (runs simultaneously; daemon already running)
+# Agent 2 shell (runs simultaneously)
 cd $(sg worktree add feat/api-v2)
 # agent writes files, runs `git commit`
 sg worktree remove --commit --message "api v2"
@@ -283,15 +264,14 @@ assigned port number to a discovery file.  Clients read this file to connect.
 No platform-specific IPC primitives — works identically on Linux, macOS, and
 Windows.
 
-**With `sg worktree` (recommended for agent workflows):** No env vars needed.
-The daemon auto-starts in `.git/simgit/`, and the socket path is automatically
-discovered from the git repository root and injected into git hooks.
+**With `sg worktree` (recommended for lean agent workflows):** No daemon,
+socket, mount, or environment variable is involved.
 
 ```bash
 cd $(sg worktree add feat/my-branch)
 ```
 
-**For manual daemon management:**
+**For daemon-managed SDK/Python sessions:**
 
 ```bash
 export SIMGIT_STATE_DIR=/tmp/simgit-dev

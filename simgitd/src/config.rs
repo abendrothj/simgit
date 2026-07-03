@@ -6,7 +6,6 @@
 //! - Repository location (git workspace to serve)
 //! - State directory (SQLite database, delta blobs, sockets)
 //! - Session limits and quotas
-//! - VFS backend selection (FUSE, NFS-loopback, or WinFSP)
 //!
 //! # Configuration Sources
 //!
@@ -59,7 +58,6 @@ use std::path::PathBuf;
 ///   enforced by delta store write path). Default 2 GiB.
 /// - **lock_ttl_seconds**: Default TTL for write locks (seconds). 0 = no TTL
 ///   (locks never auto-expire). Default 3600 (1 hour).
-/// - **vfs_backend**: Backend VFS implementation (platform-specific selection).
 ///
 /// # Example
 ///
@@ -67,7 +65,6 @@ use std::path::PathBuf;
 /// let cfg = Config::load()?;
 /// println!("Repo: {}", cfg.repo_path.display());
 /// println!("State: {}", cfg.state_dir.display());
-/// println!("VFS Backend: {:?}", cfg.vfs_backend);
 /// ```
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -95,9 +92,6 @@ pub struct Config {
     /// Default 86400 seconds (24 hours). 0 = keep indefinitely (not recommended).
     pub session_recovery_ttl_seconds: u64,
 
-    /// VFS backend to use.
-    pub vfs_backend: VfsBackend,
-
     /// Enable embedded Prometheus endpoint.
     pub metrics_enabled: bool,
 
@@ -114,65 +108,6 @@ pub struct Config {
     pub commit_wait_secs: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VfsBackend {
-    /// Native copy-on-write working tree (default on all platforms).
-    ///
-    /// Each session is a real working tree that is a CoW clone of a shared
-    /// baseline (APFS `clonefile` on macOS; `cp --reflink=auto` elsewhere).
-    /// Reads/writes are ordinary filesystem ops at native latency; the
-    /// disk-scaling benefit (one shared baseline + per-session deltas) is
-    /// preserved. Conflict detection happens at commit time (via
-    /// `capture_mount_delta` → delta store → commit scheduler) rather than
-    /// synchronously at write. See [crate::vfs::cow_backend].
-    Cow,
-
-    /// FUSE (Linux primary; opt-in on macOS).
-    ///
-    /// Uses the `fuser` crate to handle filesystem requests.
-    /// Requires FUSE kernel module loaded (present on all Linux distros).
-    /// On macOS, build with `--features macos-fuse` and install either:
-    ///   - macFUSE 5.2+ (FSKit backend, no kernel extension on macOS 26+),
-    ///     installed via `brew install --cask macfuse` and enabled in System Settings.
-    ///   - fuse-t (kext-less, uses local NFSv4/SMB/FSKit), installed via
-    ///     `brew install macos-fuse-t/homebrew-cask/fuse-t`.
-    ///
-    /// The `fuser` crate docs mark macOS support as "untested" — this is a
-    /// community-supported path.  If FUSE fails to mount, fall back to
-    /// `NfsLoopback`.
-    ///
-    /// See [crate::vfs::fuse_backend].
-    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macos-fuse")))]
-    Fuse,
-
-    /// Embedded NFSv3 server (macOS default, also available on Linux).
-    ///
-    /// Binds an NFSv3 server on 127.0.0.1 and mounts via the system's
-    /// built-in NFS client.  No kernel extension, no third-party install —
-    /// zero friction on macOS and most Linux distros.
-    ///
-    /// Write-time borrow-checking is enforced synchronously through the
-    /// NFSv3 RPC handler → SessionVfsOps → BorrowRegistry (identical guarantee
-    /// to FUSE).
-    ///
-    /// See [crate::vfs::nfs_backend].
-    NfsLoopback,
-
-    /// WinFSP (Windows default).
-    ///
-    /// Uses the WinFSP user-mode filesystem driver (https://winfsp.dev)
-    /// via the `winfsp_wrs` crate to provide a kernel-level VFS mount.
-    /// Requires the WinFSP runtime installed on the machine (MSI installer,
-    /// Chocolatey, or bundled).  No reboot required.
-    ///
-    /// Write-time borrow-checking is enforced through WinFSP write callbacks →
-    /// SessionVfsOps → BorrowRegistry (identical guarantee to FUSE/NFS).
-    ///
-    /// See [crate::vfs::winfsp_backend].
-    #[cfg(windows)]
-    WinFsp,
-}
-
 impl Config {
     /// Load configuration from environment variables and defaults.
     ///
@@ -180,14 +115,6 @@ impl Config {
     ///
     /// - `SIMGIT_REPO`: Path to git repository (defaults to cwd)
     /// - `SIMGIT_STATE_DIR`: State directory (defaults to `$XDG_STATE_HOME/simgit`)
-    ///
-    /// # VFS Backend Selection
-    ///
-    /// Auto-detected by platform:
-    /// - Linux: FUSE
-    /// - macOS: NFS-loopback
-    /// - Windows: WinFSP
-    /// - Other: FUSE (requires user configuration)
     ///
     /// # Returns
     ///
@@ -217,42 +144,6 @@ impl Config {
 
         let mnt_dir = state_dir.join("mnt");
 
-        // Default by platform; override via SIMGIT_BACKEND env if set.
-        let vfs_backend = if let Ok(val) = std::env::var("SIMGIT_BACKEND") {
-            match val.to_lowercase().as_str() {
-                "cow" | "clonefile" | "reflink" => VfsBackend::Cow,
-                #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macos-fuse")))]
-                "fuse" => VfsBackend::Fuse,
-                #[cfg(all(target_os = "macos", not(feature = "macos-fuse")))]
-                "fuse" => {
-                    eprintln!(
-                        "simgitd: SIMGIT_BACKEND=fuse requires a build with \
-                         --features macos-fuse; falling back to native CoW"
-                    );
-                    platform_default_backend()
-                }
-                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-                "fuse" => {
-                    eprintln!(
-                        "simgitd: SIMGIT_BACKEND=fuse is unsupported on this platform; \
-                         falling back to the platform default"
-                    );
-                    platform_default_backend()
-                }
-                "nfs" | "nfs-loopback" => VfsBackend::NfsLoopback,
-                #[cfg(windows)]
-                "winfsp" => VfsBackend::WinFsp,
-                other => {
-                    eprintln!(
-                        "simgitd: unknown SIMGIT_BACKEND={other}, falling back to platform default"
-                    );
-                    platform_default_backend()
-                }
-            }
-        } else {
-            platform_default_backend()
-        };
-
         Ok(Self {
             repo_path,
             state_dir,
@@ -264,7 +155,6 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(86400),
-            vfs_backend,
             metrics_enabled: std::env::var("SIMGIT_METRICS_ENABLED")
                 .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
                 .unwrap_or(true),
@@ -290,22 +180,6 @@ fn default_state_dir() -> PathBuf {
         return PathBuf::from(xdg).join("simgit");
     }
     dirs_home().join(".local").join("state").join("simgit")
-}
-
-fn platform_default_backend() -> VfsBackend {
-    // Native copy-on-write is the default on Unix: native I/O latency with the
-    // same disk-scaling benefit. The write-intercepting VFS backends (fuse /
-    // nfs / winfsp) remain available via SIMGIT_BACKEND for workflows that need
-    // synchronous write-time borrow-checking. Windows keeps WinFSP for now
-    // (no `cp --reflink`/`clonefile` equivalent wired up yet).
-    #[cfg(windows)]
-    {
-        VfsBackend::WinFsp
-    }
-    #[cfg(not(windows))]
-    {
-        VfsBackend::Cow
-    }
 }
 
 fn dirs_home() -> PathBuf {

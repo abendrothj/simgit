@@ -2,7 +2,10 @@
 
 **Concurrent filesystem sessions for multi-agent coding pipelines.**
 
-simgit is a daemon that lets many agents work against the same repository at the same time. Each agent gets an isolated copy-on-write overlay backed by a shared baseline. Path conflicts are detected and reported at commit time. Non-conflicting branches commit in parallel.
+simgit provides two concurrency layers: a lean `sg worktree` path built from
+native Git linked worktrees and filesystem CoW clones, plus daemon-managed
+sessions for workflows that need path leases, RPC lifecycle control, and
+commit scheduling.
 
 ## Run many agents on many branches — simultaneously
 
@@ -42,17 +45,18 @@ If you run multiple agents against the same repository, `git worktree` gives
 each one a full copy of the working tree.  That gets expensive fast —
 N agents × repo size sitting on disk.
 
-**simgit avoids duplicating the working tree.**  Every agent reads from
-a shared materialized baseline and writes to a private copy-on-write clone.
-The baseline occupies disk once; unchanged file extents remain physically
-shared across sessions.
+**`sg worktree` avoids duplicating the working tree without replacing Git.**
+Every agent gets a real linked worktree populated from a shared immutable
+baseline using APFS clones or Linux reflinks. Git still owns HEAD, the index,
+refs, commits, hooks, and worktree registration. On unsupported filesystems the
+command falls back to an ordinary Git checkout.
 
 | Property | How simgit achieves it |
 |---|---|
 | Shared reads | All agents read from one repository baseline |
 | Isolated writes | Per-session copy-on-write overlays |
-| Conflict safety | Borrow-checker style exclusivity at commit time |
-| Observability | Structured conflict payloads, commit telemetry, Prometheus metrics |
+| Git integration | Real `.git/worktrees` registration and native Git behavior |
+| Optional coordination | Daemon sessions provide path leases and commit scheduling |
 
 ### Measured
 
@@ -60,14 +64,13 @@ Standing up eight isolated views of a 300 MiB tree on APFS:
 
 | Path | Physical disk added | Cold setup |
 |---|---:|---:|
-| 8 × `git worktree` | 2401.5 MiB | 1.38 s |
-| 8 × `sg worktree` | 327.3 MiB | 2.34 s |
+| 8 × `git worktree` | 2405.9–2583.4 MiB | 6.32–6.66 s |
+| 8 × `sg worktree` | 301.2 MiB | 14.10–14.15 s |
 
-simgit used **7.3× less physical disk**. Its fixed daemon/baseline cost makes
-Git faster at low fan-out; setup crossed over around 8–16 sessions on a smaller
-67 MiB test tree. CoW uses ordinary filesystem I/O, with measured hot-operation
-overhead of roughly 15–46% and a higher first-write cost when shared extents
-split. Full method and caveats: [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
+The native CoW path used **at least 8.0× less physical disk** at **2.1–2.2× the sequential
+cold setup time**. Hot read and metadata ranges overlap ordinary worktree I/O;
+the first durable write is slower while the filesystem splits shared extents.
+Full method: [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
 
 ## Features
 
@@ -79,10 +82,10 @@ split. Full method and caveats: [docs/scaling_benchmark.md](docs/scaling_benchma
 - **OTLP tracing** — optional distributed trace export for orchestrator-level visibility
 - **Python bindings** — PyO3-backed, works with asyncio orchestrators
 - **Rust SDK** — async JSON-RPC client with typed request/response models
-- **`sg` CLI** — `sg worktree` creates per-agent CoW sessions backed by one
-  physical baseline instead of N independent full-tree copies.
-- **`sg worktree`** — boots a minimal `.git/` so every git command works
-  inside the session mount.  Auto-starts the daemon; no manual env var setup.
+- **`sg worktree`** — creates real linked worktrees backed by one physical CoW
+  baseline; no daemon, mount, synthetic repository, or agent integration layer.
+- **Safe fallback** — uses an ordinary Git checkout when clone/reflink support
+  is absent; `--require-cow` makes disk-saving support mandatory.
 - **Chaos-validated** — SLO gate suite covering disjoint commits, hotspot contention, transport faults, and abandon storms
 
 ## Architecture
@@ -111,56 +114,38 @@ Agent runner / CLI / SDK
 - Idempotent commit resolution under ambiguous transport outcomes
 - Explicit terminal states for all commit requests (pending → success | failed)
 
-### Backends: native copy-on-write (default) vs. write-intercepting VFS
+### Daemon-session backend: native copy-on-write
 
-The **default** backend is a native copy-on-write working tree — no user-space
-filesystem in the hot path. Each session is a real working tree over a shared
-baseline, materialized per platform:
+For `sg new`/SDK sessions, the daemon gives each session a native copy-on-write
+working tree — no user-space filesystem in the hot path. Each session is a real
+working tree over a shared baseline, materialized per platform:
 
 - **Linux**: `overlayfs` — `lowerdir` = shared baseline, per-session `upperdir`
   for writes. Only changed files land in the upper, so commit-time capture scans
   the upper (`O(changes)`); deletions are overlay whiteouts. Falls back to a
   reflink clone if the overlay mount isn't permitted.
 - **macOS**: APFS `clonefile` (`cp -c`) — blocks shared until written.
-- **Windows** (opt-in; default stays WinFSP): recursive copy for now.
 
 Reads and writes are ordinary filesystem ops at **native latency**, while the
 disk-scaling benefit (one shared baseline per `base_commit` + per-session
 deltas) is preserved; idle baselines are garbage-collected. Conflict detection
-happens **at commit time**: the working tree is diffed into the delta store and
-the commit scheduler performs the same path-level overlap check. Same
-no-corruption guarantee, detected at commit rather than rejected at write.
-
-For workflows that need **synchronous write-time** borrow-checking (a write to a
-path another session holds fails immediately with `EBUSY`), the write-
-intercepting VFS backends remain available via `SIMGIT_BACKEND`:
-
-| `SIMGIT_BACKEND` | Backend | Enforcement | Latency | Friction |
-|---|---|---|---|---|
-| _(default)_ | Native CoW (`clonefile`/reflink) | Commit-time overlap check | **Native** (page cache) | None |
-| `fuse` | FUSE (`fuser`) | Write-time (`SessionFs` → `BorrowRegistry`) | User-space upcall per op | Linux built-in; macOS requires `--features macos-fuse` plus macFUSE/fuse-t |
-| `nfs` | Embedded NFSv3 (`nfsserve`) | Write-time (`WRITE` RPC → `BorrowRegistry`) | Loopback RPC per op (slowest) | None (macOS built-in client) |
-| `winfsp` | WinFSP (`winfsp_wrs`) | Write-time (write callback → `BorrowRegistry`) | User-space callback per op | WinFSP runtime install |
+happens **at commit time**: the working tree is diffed into the delta store
+(`capture_mount_delta`) and the commit scheduler performs a path-level overlap
+check. Same no-corruption guarantee, detected at commit rather than rejected at
+each write.
 
 Measured hot-cache cost on macOS: CoW `stat` is ~42–46% slower than a Git
 worktree (about 1.3 vs 0.9 µs/file), 4 KiB reads are ~15–21% slower (about
 9.4 vs 8.0 µs/file), and durable first writes to shared extents cost ~1.6–2.3×
-more. CoW remains orders of magnitude faster than the NFS-loopback path.
+more — all still native filesystem latency.
 See [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
 
-Test coverage by platform:
-
-| Platform | Backend | CI coverage |
-|---|---|---|
-| macOS | Native CoW | Nightly SLO/chaos suite (default exercised path) |
-| Linux | FUSE | Mount integration tests — real create/rename/unlink through the FUSE mount (`.github/workflows/fuse-linux-integration.yml`) |
-| Windows | WinFSP | Compile + link against the WinFSP runtime and cross-platform unit tests (`.github/workflows/windows-winfsp.yml`). Mount-level integration on Windows is **not yet covered** — the backend is build-verified, not mount-verified. |
-
-The write-intercepting backends share the same borrow-checking and delta logic
-through `SessionVfsOps` (FUSE and WinFSP additionally share `SessionFs`). The
-default CoW backend reuses the same delta store and commit scheduler, but
-populates deltas by diffing the working tree at commit (`capture_mount_delta`)
-instead of intercepting each write.
+macOS is the primary supported platform (nightly SLO/chaos suite exercises the
+CoW path); Linux overlayfs shares the same delta store and commit scheduler.
+Earlier prototypes explored write-intercepting VFS backends (FUSE, embedded
+NFSv3, WinFSP) that rejected conflicting writes synchronously; those were
+removed in favor of standing on the faster CoW path, and remain in git history
+for reference.
 
 ## Repository layout
 
@@ -183,20 +168,20 @@ simgit/
 cargo build --workspace
 ```
 
-### 2. Create a worktree session
+### 2. Create a native CoW worktree
 
 ```bash
 cd $(sg worktree add feat/my-feature)
 ```
 
-The daemon auto-starts on first use. State is stored per-repo in
-`.git/simgit/`. The session mount is fully isolated — every git command
-works inside it as if it were a normal checkout.
+The worktree is registered in Git's normal `.git/worktrees/` registry. A cached
+baseline is stored under `.git/simgit/baselines/`; unchanged extents remain
+shared on APFS and reflink-capable Linux filesystems. No daemon starts.
 
 ### 3. Use git commands directly inside the session
 
-`sg worktree` bootstraps a full `.git` directory inside the mount.
-All standard git commands work without extra setup:
+The worktree is a standard linked checkout, so all Git commands and existing
+hooks work without a proxy:
 
 ```bash
 cd $(sg worktree add feat/demo)
@@ -204,22 +189,20 @@ cd $(sg worktree add feat/demo)
 # Edit files with any tool...
 echo "hello" > README.md
 
-# Standard git commands — commit is forwarded via pre-commit hook
+# Standard git commands commit directly to the linked branch
 git add README.md
 git commit -m "demo"
 
-# Inspect session state
-sg status
-sg diff
+# Inspect native worktree state
+git status
+git diff
 
 # Commit uncommitted changes and remove the session
 sg worktree remove --commit --message "clean up"
 ```
 
-For programmatic commit control:
-```bash
-sg commit --branch feat/demo --message "demo"
-```
+Use `sg worktree remove --force` only when changes should be discarded. Plain
+removal delegates to Git and refuses a dirty worktree.
 
 ### 4. Run multiple agents in parallel
 

@@ -1,9 +1,8 @@
 //! # sg — simgit Command-Line Interface
 //!
-//! A command-line tool for managing simgit agent sessions.  `sg worktree`
-//! avoids duplicating the working tree N times like `git worktree` does —
-//! every agent reads from a shared baseline and writes to a private
-//! copy-on-write overlay.
+//! A command-line tool for native CoW-backed Git worktrees and daemon-managed
+//! simgit sessions. `sg worktree` creates real linked worktrees whose unchanged
+//! extents share an immutable baseline; it does not require the daemon.
 //!
 //! ## Overview
 //!
@@ -27,12 +26,9 @@
 //! simgitd ← processes requests, manages sessions/locks/VFS
 //! ```
 //!
-//! ## Port File Discovery
+//! ## Port File Discovery (daemon commands only)
 //!
-//! `sg worktree` discovers the daemon's port file automatically from the
-//! git repository root (`.git/simgit/control.port`). No configuration needed.
-//!
-//! For other commands, `sg` reads the TCP port from the daemon's discovery
+//! Session, lock, peer, and status commands read the TCP port from discovery
 //! file at these platform defaults:
 //! - Linux: `$XDG_RUNTIME_DIR/simgit/control.port`
 //! - macOS: `$HOME/.local/state/simgit/control.port`
@@ -54,9 +50,8 @@
 //!
 //! ## Command Reference
 //!
-//! - **worktree add/remove/list** — Per-agent sessions with zero-disk
-//!   copy-on-write working trees (auto-starts daemon, prints mount path).
-//!   Use any time you'd otherwise duplicate the repo with `git worktree`.
+//! - **worktree add/remove/list/prune** — Real Git linked worktrees populated
+//!   with APFS clones/Linux reflinks, with ordinary checkout fallback.
 //! - **init** — Initialize simgit + start daemon (one-time setup)
 //! - **new** — Create new session (`--branch <name>` for target branch)
 //! - **commit** — Flatten delta to git branch + close session
@@ -76,16 +71,16 @@
 //! ### Quick: `sg worktree` (recommended)
 //!
 //! ```bash
-//! # One command: create session, auto-start daemon, cd into mount
+//! # One command: create a linked worktree and cd into it
 //! cd $(sg worktree add feature-1)
 //!
-//! # All standard git commands work (commit is forwarded via hook)
+//! # All standard git commands use native linked-worktree behavior
 //! git add <files>
 //! git commit -m "feature work"
 //!
 //! # Inspect or clean up
-//! sg diff                             # Preview changes
-//! sg worktree remove --commit         # Commit and unmount
+//! git diff                            # Preview changes
+//! sg worktree remove --commit         # Commit and remove
 //! ```
 //!
 //! ### Manual: `sg new` / `sg commit`
@@ -122,8 +117,8 @@
 
 mod commands;
 
-use clap::{Parser, Subcommand};
 use anyhow::Result;
+use clap::{Parser, Subcommand};
 
 /// Command-line arguments for the sg CLI.
 ///
@@ -136,7 +131,10 @@ use anyhow::Result;
 ///
 /// See [`Commands`] enum for available subcommands.
 #[derive(Parser)]
-#[command(name = "sg", about = "simgit — borrow-checked filesystem sessions for AI agents")]
+#[command(
+    name = "sg",
+    about = "simgit — borrow-checked filesystem sessions for AI agents"
+)]
 struct Cli {
     /// Override the daemon port-file path (reads TCP port from this file).
     #[arg(long, env = "SIMGIT_SOCKET", global = true)]
@@ -197,7 +195,7 @@ enum Commands {
     /// Daemon management.
     #[command(subcommand)]
     Daemon(commands::daemon::Daemon),
-    /// Worktree sessions (like git worktree).
+    /// Native CoW-backed linked worktrees.
     #[command(subcommand)]
     Worktree(commands::worktree::Worktree),
     /// Update a session's base commit (called by git hooks).
@@ -242,17 +240,17 @@ async fn main() -> Result<()> {
     let client = simgit_sdk::Client::new(&socket);
 
     match cli.command {
-        Commands::Init(cmd)     => commands::init::run(cmd).await,
-        Commands::New(cmd)      => commands::new::run(cmd, &client, cli.json).await,
-        Commands::Commit(cmd)   => commands::commit::run(cmd, &client, cli.json).await,
-        Commands::Abort(cmd)    => commands::abort::run(cmd, &client).await,
-        Commands::Diff(cmd)     => commands::diff::run(cmd, &client, cli.json).await,
-        Commands::Status(cmd)   => commands::status::run(cmd, &client, cli.json).await,
-        Commands::Lock(cmd)     => commands::lock::run(cmd, &client, cli.json).await,
-        Commands::Peer(cmd)     => commands::peer::run(cmd, &client, cli.json).await,
-        Commands::Gc(cmd)       => commands::gc::run(cmd, &client).await,
-        Commands::Daemon(cmd)   => commands::daemon::run(cmd).await,
-        Commands::Worktree(cmd)       => commands::worktree::run(cmd, &cli.socket, cli.json).await,
+        Commands::Init(cmd) => commands::init::run(cmd).await,
+        Commands::New(cmd) => commands::new::run(cmd, &client, cli.json).await,
+        Commands::Commit(cmd) => commands::commit::run(cmd, &client, cli.json).await,
+        Commands::Abort(cmd) => commands::abort::run(cmd, &client).await,
+        Commands::Diff(cmd) => commands::diff::run(cmd, &client, cli.json).await,
+        Commands::Status(cmd) => commands::status::run(cmd, &client, cli.json).await,
+        Commands::Lock(cmd) => commands::lock::run(cmd, &client, cli.json).await,
+        Commands::Peer(cmd) => commands::peer::run(cmd, &client, cli.json).await,
+        Commands::Gc(cmd) => commands::gc::run(cmd, &client).await,
+        Commands::Daemon(cmd) => commands::daemon::run(cmd).await,
+        Commands::Worktree(cmd) => commands::worktree::run(cmd, cli.json),
         Commands::SessionSetBase(cmd) => commands::session_set_base::run(cmd, &client).await,
     }
 }

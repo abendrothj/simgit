@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::borrow::BorrowRegistry;
-use crate::config::{Config, VfsBackend};
+use crate::config::Config;
 use crate::daemon::AppState;
 use crate::delta::DeltaStore;
 use crate::events::EventBroker;
@@ -67,7 +67,6 @@ pub(super) async fn build_state_for_commit_tests() -> (Arc<AppState>, std::path:
         max_delta_bytes: 2 * 1024 * 1024,
         lock_ttl_seconds: 3600,
         session_recovery_ttl_seconds: 86400,
-        vfs_backend: VfsBackend::NfsLoopback,
         metrics_enabled: false,
         metrics_addr: "127.0.0.1:0".to_owned(),
         commit_peer_capture_concurrency: 4,

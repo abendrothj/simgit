@@ -3,34 +3,6 @@
 //! Everything that currently calls `libc` directly or checks `cfg!(target_os)`
 //! should route through this module instead.
 
-/// Return the current user's numeric UID.
-///
-/// On Unix this is a real uid.  On Windows we return 0 because Windows uses
-/// SIDs, not uids, and the value is only used for filesystem identity in VFS
-/// attributes (FUSE/NFS).  Root ownership (0) is the safest default.
-pub fn current_uid() -> u32 {
-    #[cfg(unix)]
-    {
-        unsafe { libc::getuid() }
-    }
-    #[cfg(windows)]
-    {
-        0
-    }
-}
-
-/// Return the current user's numeric GID.
-pub fn current_gid() -> u32 {
-    #[cfg(unix)]
-    {
-        unsafe { libc::getgid() }
-    }
-    #[cfg(windows)]
-    {
-        0
-    }
-}
-
 /// Secure the daemon's control endpoint so only the current user can connect.
 ///
 /// On Unix this sets `0600` on the socket.  On Windows this is a no-op

@@ -449,7 +449,7 @@ fn row_to_info(row: &SessionRow) -> Result<SessionInfo> {
 mod tests {
     use super::SessionManager;
     use crate::borrow::BorrowRegistry;
-    use crate::config::{Config, VfsBackend};
+    use crate::config::Config;
     use crate::daemon::AppState;
     use crate::delta::DeltaStore;
     use crate::events::EventBroker;
@@ -567,7 +567,6 @@ mod tests {
             max_delta_bytes: 2 * 1024 * 1024,
             lock_ttl_seconds: 3600,
             session_recovery_ttl_seconds: 1, // 1-second TTL forces immediate expiry
-            vfs_backend: VfsBackend::NfsLoopback,
             metrics_enabled: false,
             metrics_addr: "127.0.0.1:0".to_owned(),
             commit_peer_capture_concurrency: 4,

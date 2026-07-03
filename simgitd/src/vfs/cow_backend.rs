@@ -445,9 +445,8 @@ fn is_whiteout(md: &std::fs::Metadata) -> bool {
     md.file_type().is_char_device() && md.rdev() == 0
 }
 
-#[async_trait::async_trait]
-impl super::VfsBackendTrait for CowBackend {
-    async fn mount(&self, session: &SessionInfo) -> Result<()> {
+impl CowBackend {
+    pub async fn mount(&self, session: &SessionInfo) -> Result<()> {
         let mount = session.mount_path.clone();
         if let Some(parent) = mount.parent() {
             std::fs::create_dir_all(parent)
@@ -492,7 +491,7 @@ impl super::VfsBackendTrait for CowBackend {
         Ok(())
     }
 
-    async fn unmount(&self, session_id: Uuid) -> Result<()> {
+    pub async fn unmount(&self, session_id: Uuid) -> Result<()> {
         let state = self.mounts.lock().unwrap().remove(&session_id);
         let Some(state) = state else {
             let path = self.cfg.mnt_dir.join(session_id.to_string());
@@ -522,7 +521,7 @@ impl super::VfsBackendTrait for CowBackend {
         Ok(())
     }
 
-    fn capture_mount_delta(&self, session: &SessionInfo) -> Result<()> {
+    pub fn capture_mount_delta(&self, session: &SessionInfo) -> Result<()> {
         if !session.mount_path.exists() {
             return Ok(());
         }
@@ -577,6 +576,12 @@ impl super::VfsBackendTrait for CowBackend {
         self.metrics.record_peer_capture_skip("miss");
         Ok(())
     }
+
+    /// Notify the backend that the session's base commit changed.
+    ///
+    /// A no-op: with a real working tree, base changes flow through native
+    /// `git checkout`, so there is no VFS-side tree to swap.
+    pub fn update_base_commit(&self, _session_id: Uuid, _new_base: &str) {}
 }
 
 /// Absolute path to the `sg` CLI binary, which lives next to `simgitd`.

@@ -1,97 +1,38 @@
-//! Virtual filesystem layer — abstracts FUSE (Linux), NFS-loopback (macOS), and WinFSP (Windows) backends.
+//! Virtual filesystem layer — native copy-on-write working trees.
 //!
 //! # Overview
 //!
-//! The VFS layer presents a unified interface for mounting read-only git trees + delta CoW overlays.
-//! It abstracts platform-specific details (FUSE XDR, NFS RPC, WinFSP callbacks) behind a simple trait:
+//! Each session gets a **real working tree** that is a copy-on-write clone of a
+//! shared read-only baseline materialized from `base_commit`:
 //!
-//! ```ignore
-//! pub trait VfsBackendTrait {
-//!     async fn mount(&self, session: &SessionInfo) -> Result<()>;
-//!     async fn unmount(&self, session_id: Uuid) -> Result<()>;
-//! }
-//! ```
+//! - **Linux**: overlayfs (`lowerdir` = shared baseline, per-session `upperdir`
+//!   for writes), falling back to a reflink clone if overlay is not permitted.
+//! - **macOS / other Unix**: APFS `clonefile` (`cp -c`) or `cp --reflink=auto`.
 //!
-//! # Supported Platforms
-//!
-//! - **Linux**: FUSE (via `fuser` crate, all distros)
-//! - **macOS**: NFS-loopback (full NFSv3 server via `nfsserve`)
-//! - **Windows**: WinFSP (via `winfsp_wrs` crate, requires WinFSP runtime)
+//! Reads and writes are ordinary filesystem operations at native latency. The
+//! disk-scaling benefit — one shared baseline plus per-session deltas instead of
+//! N full checkouts — is preserved by the CoW clone.
 //!
 //! # Architecture
 //!
-//! Each session gets a VFS mount at `/vdev/<session-uuid>/` containing:
+//! Each session's working tree lives at `<mnt_dir>/<session-uuid>/` and contains
+//! a real in-tree `.git` (bootstrapped by [`crate::git_proxy`]) so native git
+//! commands work and the pre-commit hook forwards commits to the daemon.
 //!
-//! ```text
-//! /vdev/<session-uuid>/
-//!   ├── (read-only git tree from base_commit)
-//!   ├── (delta writes from this session, CoW)
-//!   └── (merged view: git tree + alterations)
-//! ```
+//! # Conflict detection
 //!
-//! Reads and directory listings merge:
-//! - **Git tree** (baseline): Files from HEAD commit
-//! - **Delta additions**: Files written by this session
-//! - **Deletions**: Paths marked as deleted in delta manifest
-//!
-//! # Read Flow
-//!
-//! ```text
-//! Agent reads /src/main.rs
-//!       ↓
-//! VFS receives read request → SessionFs::read()
-//!       ↓
-//! Check delta layer (has this session written it?)
-//!       ├─ YES → return delta version
-//!       └─ NO → read from git blob
-//! ```
-//!
-//! # Write Flow
-//!
-//! ```text
-//! Agent writes /src/main.rs
-//!       ↓
-//! VFS receives write request → SessionFs::write()
-//!       ↓
-//! BorrowRegistry: acquire_write(session_id, path)
-//!       ├─ SUCCESS → proceed to delta store
-//!       └─ CONFLICT → return BorrowError immediately
-//!       ↓
-//! DeltaStore::write(content) → hash, save to blob store
-//!       ↓
-//! Update delta manifest
-//!       ↓
-//! Return success to agent
-//! ```
+//! Unlike a write-intercepting VFS, conflicts are detected at **commit time**:
+//! [`CowBackend::capture_mount_delta`] diffs the working tree (overlayfs upperdir
+//! scan on Linux, `git status` otherwise) into the per-session delta store, and
+//! the commit scheduler / borrow registry resolves overlaps from there.
 //!
 //! # Lifecycle
 //!
 //! 1. **Create Session** → SessionManager.create()
-//! 2. **Mount VFS** → VfsManager.mount() (blocks until FUSE/NFS is ready)
-//! 3. **Agent Works** → reads/writes via `/vdev/...` (VFS intercepts)
-//! 4. **Unmount** → VfsManager.unmount_session() (clean up kernel resources)
-//! 5. **Flatten** → Apply delta to git branch
-//!
-//! # Configuration
-//!
-//! Configured in `simgitd.toml`:
-//!
-//! ```toml
-//! [vfs]
-//! backend = "fuse"      # or "nfs-loopback"
-//! mount_dir = "/vdev"
-//! ```
-//!
-//! On macOS, the backend is selected automatically (always NFS-loopback for now).
-//!
-//! # Phase Roadmap
-//!
-//! - **Phase 0**: Backend abstraction, FUSE skeleton on Linux, NFS stub on macOS
-//! - **Phase 1**: Git tree traversal + inode caching, read-only serving
-//! - **Phase 2**: Delta write interception, manifest tracking
-//! - **Phase 3**: Borrow checking integrated into write path
-//! - **Phase 4**: Three-way merge on flatten
-//! - **Phase 1+**: Full NFSv3 XDR server for macOS (no kernel extensions)
+//! 2. **Mount** → [`VfsManager::mount`] materializes the CoW working tree
+//! 3. **Agent Works** → ordinary reads/writes against the working tree
+//! 4. **Commit** → [`VfsManager::capture_mount_delta`] captures changes
+//! 5. **Unmount** → [`VfsManager::unmount_session`] removes the tree + GCs baselines
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -104,150 +45,59 @@ use uuid::Uuid;
 use simgit_sdk::SessionInfo;
 
 use crate::borrow::BorrowRegistry;
-use crate::config::{Config, VfsBackend};
+use crate::config::Config;
 use crate::delta::DeltaStore;
 
 mod cow_backend;
-#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macos-fuse")))]
-mod fuse_backend;
-mod git_resolver;
-mod nfs_backend;
-pub mod session_ops;
-#[cfg(windows)]
-mod winfsp_backend;
 
-/// Trait implemented by both the FUSE and NFS-loopback backends.
-///
-/// Each backend must implement mounting and unmounting of a session's filesystem.
-/// The VfsManager delegates to the appropriate backend based on platform/config.
-///
-/// # Implementation Notes
-///
-/// - **FUSE** (Linux): Uses fuser crate to negotiate with kernel FUSE subsystem.
-///   Registration happens via init → getattr → lookup → read/write.
-/// - **NFS-loopback** (macOS): Runs an embedded NFSv3 server (via `nfsserve`)
-///   bound to loopback and mounts it at mount_path. Every NFSv3 `WRITE` RPC is
-///   routed through `SessionVfsOps::write` → `BorrowRegistry`, giving the same
-///   write-time borrow-checking guarantee as the FUSE path.
-///
-/// # Atomicity
-///
-/// Mount operations are NOT atomic across the filesystem. If a mount fails partway
-/// (e.g., kernel permission denied), cleanup is backend-specific. Backends should
-/// be idempotent: calling mount twice with the same session should succeed on
-/// the second attempt or return the existing mount point.
-#[async_trait::async_trait]
-pub trait VfsBackendTrait: Send + Sync {
-    /// Mount a session's VFS at [`SessionInfo::mount_path`].
-    ///
-    /// Blocks until the mount is ready (FUSE negotiated with kernel, NFS RPC listening).
-    /// Returns immediately; the mount persists across multiple file operations.
-    ///
-    /// # Errors
-    ///
-    /// - Permission denied (session mount_path not writable)
-    /// - Mount point already exists (race condition)
-    /// - Backend resource exhaustion (too many mounts)
-    async fn mount(&self, session: &SessionInfo) -> Result<()>;
+use cow_backend::CowBackend;
 
-    /// Unmount a session's VFS by its session ID.
-    ///
-    /// Best-effort; errors are logged but don't fail the unmount operation.
-    /// Cleans up kernel resources (FUSE fd, inode cache) or directory tree.
-    async fn unmount(&self, session_id: Uuid) -> Result<()>;
-
-    /// Synchronize backend-native mount writes into the delta store prior to commit.
-    ///
-    /// Backends that intercept every write on the mount path (FUSE, NFS-loopback)
-    /// already record deltas as writes happen, so they keep the default no-op.
-    /// This hook exists for any future backend that mounts a plain directory tree
-    /// and needs to materialize changed files into the per-session delta manifest.
-    fn capture_mount_delta(&self, _session: &SessionInfo) -> Result<()> {
-        Ok(())
-    }
-
-    /// Update the base commit for a mounted session so the VFS serves
-    /// files from the new tree (e.g. after `git checkout`).
-    fn update_base_commit(&self, _session_id: Uuid, _new_base: &str) {}
-}
-
-/// VFS manager — dispatches mount/unmount to the appropriate backend.
-///
-/// Tracks active mounts and coordinates lifecycle across sessions.
+/// VFS manager — owns the copy-on-write backend and tracks active mounts.
 ///
 /// # Example
 ///
 /// ```ignore
-/// let cfg = Arc::new(Config::load("simgitd.toml")?);
-/// let vfs = VfsManager::new(cfg);
+/// let cfg = Arc::new(Config::load()?);
+/// let vfs = VfsManager::new(cfg, deltas, borrows, metrics);
 ///
 /// let session = SessionInfo {
 ///     session_id: Uuid::new_v7(),
-///     mount_path: PathBuf::from("/vdev/sess-001"),
+///     mount_path: PathBuf::from("/mnt/sess-001"),
 ///     ..Default::default()
 /// };
 ///
-/// vfs.mount(&session).await?;  // Blocks until VFS is ready
-///
-/// // Agent reads/writes via /vdev/sess-001/
-///
+/// vfs.mount(&session).await?;             // Materialize CoW working tree
+/// // Agent reads/writes via the working tree
 /// vfs.unmount_session(session.session_id).await;  // Clean up
 /// ```
-
 pub struct VfsManager {
-    backend: Box<dyn VfsBackendTrait>,
+    backend: CowBackend,
     /// Track which sessions are currently mounted.
     mounted: Mutex<HashMap<Uuid, PathBuf>>,
 }
 
 impl VfsManager {
-    /// Create a new VFS manager with the appropriate backend.
-    ///
-    /// Backend selection:
-    /// - Linux: Always FUSE (or explicitly configured)
-    /// - macOS: Always NFS-loopback
-    /// - Windows: Always WinFSP (requires WinFSP runtime)
-    ///
-    /// # Panics
-    ///
-    /// None. Backend instantiation is always fallible via async mount calls.
+    /// Create a new VFS manager backed by the copy-on-write backend.
     pub fn new(
         cfg: Arc<Config>,
         deltas: Arc<DeltaStore>,
         borrows: Arc<BorrowRegistry>,
         metrics: Arc<crate::metrics::Metrics>,
     ) -> Self {
-        let backend: Box<dyn VfsBackendTrait> = match cfg.vfs_backend {
-            VfsBackend::Cow => {
-                Box::new(cow_backend::CowBackend::new(cfg, deltas, borrows, metrics))
-            }
-            #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macos-fuse")))]
-            VfsBackend::Fuse => Box::new(fuse_backend::FuseBackend::new(cfg, deltas, borrows)),
-            VfsBackend::NfsLoopback => Box::new(nfs_backend::NfsLoopbackBackend::new(
-                cfg, deltas, borrows, metrics,
-            )),
-            #[cfg(windows)]
-            VfsBackend::WinFsp => Box::new(winfsp_backend::WinFspBackend::new(
-                cfg, deltas, borrows, metrics,
-            )),
-        };
         Self {
-            backend,
+            backend: CowBackend::new(cfg, deltas, borrows, metrics),
             mounted: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Mount a session's VFS.
+    /// Mount a session's VFS by materializing its CoW working tree.
     ///
-    /// Delegates to the backend (FUSE or NFS-loopback) and tracks the mount in the manager.
-    /// Blocks until the mount is ready for I/O.
+    /// Blocks until the working tree is ready for I/O.
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - Mount directory doesn't exist or is not writable
-    /// - Backend resource exhaustion
-    /// - Platform-specific setup failed (e.g., FUSE module not loaded)
+    /// Returns an error if the mount directory can't be created or the CoW
+    /// clone / overlay mount fails.
     pub async fn mount(&self, session: &SessionInfo) -> Result<()> {
         self.backend.mount(session).await?;
         self.mounted
@@ -260,11 +110,8 @@ impl VfsManager {
 
     /// Unmount a single session's VFS.
     ///
-    /// Best-effort cleanup:
-    /// - Removes tracking from manager
-    /// - Delegates unmount to backend (FUSE fd close, directory cleanup)
-    /// - Logs errors instead of propagating (don't want daemon crashes on unmount)
-    ///
+    /// Best-effort cleanup: removes tracking, tears down the working tree
+    /// (overlay umount + dir removal, or clone removal), and GCs baselines.
     /// Safe to call multiple times (idempotent).
     pub async fn unmount_session(&self, session_id: Uuid) {
         if self.mounted.lock().unwrap().remove(&session_id).is_some() {
@@ -275,10 +122,7 @@ impl VfsManager {
 
     /// Unmount all active sessions.
     ///
-    /// Called during daemon shutdown. Ensures all kernel resources (FUSE fds, etc.)
-    /// are cleaned up before the daemon exits.
-    ///
-    /// Errors are logged, not returned (best-effort).
+    /// Called during daemon shutdown. Errors are logged, not returned.
     pub async fn unmount_all(&self) {
         let ids: Vec<Uuid> = self.mounted.lock().unwrap().keys().copied().collect();
         for id in ids {
@@ -286,12 +130,17 @@ impl VfsManager {
         }
     }
 
-    /// Ask the backend to synchronize mount-side writes into the session delta store.
+    /// Capture the session's working-tree changes into the delta store.
+    ///
+    /// Called before commit to materialize CoW writes as delta entries.
     pub fn capture_mount_delta(&self, session: &SessionInfo) -> Result<()> {
         self.backend.capture_mount_delta(session)
     }
 
     /// Notify the backend that the session's base commit changed.
+    ///
+    /// A no-op for the CoW backend: base changes flow through native `git
+    /// checkout` inside the working tree, so there is no VFS-side tree to swap.
     pub fn update_base_commit(&self, session_id: Uuid, new_base: &str) {
         self.backend.update_base_commit(session_id, new_base);
     }
