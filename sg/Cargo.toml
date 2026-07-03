@@ -1,9 +1,14 @@
 [package]
 name        = "simgit-cli"
-description = "simgit CLI — native copy-on-write Git worktrees"
+description = "sg — cheap, isolated copy-on-write Git worktrees for running many agents at once"
 version.workspace     = true
 edition.workspace     = true
 license.workspace     = true
+repository.workspace  = true
+homepage    = "https://github.com/abendrothj/simgit"
+readme      = "../README.md"
+keywords    = ["git", "worktree", "copy-on-write", "agents", "cli"]
+categories  = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "sg"
@@ -14,3 +19,10 @@ clap.workspace        = true
 serde_json.workspace  = true
 anyhow.workspace      = true
 uuid.workspace        = true
+
+# cargo-binstall: fetch a prebuilt `sg` from GitHub Releases instead of
+# compiling. Expects release assets named sg-<target>.tar.gz once published.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/sg-{ target }{ archive-suffix }"
+bin-dir = "sg-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"

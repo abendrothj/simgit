@@ -3,19 +3,27 @@
 **Cheap, isolated Git worktrees for running many agents on one repository at once.**
 
 `sg worktree` creates real Git linked worktrees populated from a shared,
-immutable baseline using filesystem copy-on-write (APFS `clonefile` on macOS,
-reflink on Linux). Each agent gets its own fully isolated working tree, but
-unchanged files share physical disk instead of being duplicated. There is no
-daemon and no server: **Git owns the refs, the filesystem owns the data.**
+immutable baseline using copy-on-write:
+
+- **macOS**: APFS `clonefile`.
+- **Linux with reflink** (btrfs, xfs): reflink clone.
+- **Linux without reflink** (ext4, …): `fuse-overlayfs` — unprivileged, no
+  root, no kernel mount — so the disk win also lands on stock ext4 and CI.
+- **Anywhere else / no CoW available**: transparent fallback to an ordinary
+  `git checkout` (pass `--require-cow` to fail instead).
+
+Each agent gets its own fully isolated working tree, but unchanged files share
+physical disk instead of being duplicated. There is no daemon and no server:
+**Git owns the refs, the filesystem owns the data.**
 
 ## Why
 
 If you run several agents against one repository, plain `git worktree` gives
 each a full copy of the working tree — N agents × repo size on disk. `sg
 worktree` keeps the isolation but drops the duplication: every worktree is a
-real `.git/worktrees` checkout whose unchanged extents are CoW-shared with one
-cached baseline. On filesystems without clone support it transparently falls
-back to an ordinary `git checkout` (use `--require-cow` to make CoW mandatory).
+real `.git/worktrees` checkout whose unchanged data is CoW-shared with one
+cached baseline (via reflink, or a fuse-overlayfs mount where reflink isn't
+available).
 
 Agents work in parallel on their own branches and integrate through normal Git
 merges — no coordination layer, no conflict arbitration, no lock service.
@@ -37,7 +45,28 @@ is slower while the filesystem splits shared extents. Full method:
 ## Install
 
 ```bash
+# From crates.io
+cargo install simgit-cli
+
+# Prebuilt binary (no compile), once releases are published
+cargo binstall simgit-cli
+
+# Homebrew (tap)
+brew install abendrothj/tap/simgit
+
+# From source
 cargo build --release   # binary at target/release/sg
+```
+
+On Linux without a reflink filesystem, install `fuse-overlayfs` to get the CoW
+path (e.g. `apt-get install fuse-overlayfs`); otherwise `sg` falls back to a
+plain checkout.
+
+Prefer it as a Git subcommand? Add an alias:
+
+```bash
+git config --global alias.wt '!sg worktree'
+git wt add feat/x
 ```
 
 ## Usage
@@ -60,33 +89,48 @@ sg worktree remove --commit --message "clean up"
 # Or discard uncommitted changes explicitly
 sg worktree remove --force
 
+# Reap idle/abandoned worktrees (see "Running agents in parallel")
+sg worktree gc --older-than 24h
+
 # Prune stale registrations and old cached baselines
 sg worktree prune
 ```
 
-The worktree is registered in Git's normal `.git/worktrees/` registry; the
-cached baseline lives under `.git/simgit/baselines/`. Plain `remove` delegates
-to Git and refuses a dirty worktree unless you pass `--force`.
+`remove` accepts either a path or a branch name. The worktree is registered in
+Git's normal `.git/worktrees/` registry; the cached baseline lives under
+`.git/simgit/baselines/`. Plain `remove` refuses a dirty worktree unless you
+pass `--force`.
 
 ### Running agents in parallel
 
-```bash
-# Shell 1
-cd $(sg worktree add feat/auth)     # agent writes files, runs git commit
+Give each agent its own ephemeral worktree, then reap abandoned ones in bulk:
 
-# Shell 2
-cd $(sg worktree add feat/api)      # another agent, fully isolated
+```bash
+# Spawn N isolated agent sandboxes (each on its own branch)
+for i in 1 2 3; do
+  dir=$(sg worktree add "agent/$i" --ephemeral --json | jq -r .worktree)
+  run_my_agent --cwd "$dir" &   # your orchestrator; agent commits to agent/$i
+done
+wait
+
+# Integrate whichever branches you want with normal git, then bulk-clean:
+sg worktree gc --ephemeral --older-than 1h     # reap idle agent sandboxes
 ```
 
+`--json` on `add` / `remove` / `gc` gives orchestrators structured output.
+`gc` skips worktrees with uncommitted changes unless `--force`, and takes
+`--prefix <branch-prefix>`, `--older-than <90s|30m|24h|7d>`, and `--dry-run`.
+
 Each agent commits to its own branch; you integrate with `git merge`/`rebase`
-as usual.
+as usual — there is no shared state to coordinate.
 
 ## Repository layout
 
 ```text
 simgit/
 ├── sg/                 the CLI (`sg worktree`)
-├── tests/              CoW scaling benchmarks
+├── tests/              CoW scaling benchmarks + overlay integration test
+├── packaging/          Homebrew formula
 └── docs/               scaling benchmark methodology
 ```
 

@@ -25,6 +25,20 @@ cd "$("$sg" worktree add feature-x)"   # creates + enters a CoW worktree
 "$sg" worktree remove "$PWD" --force    # tears it down
 ```
 
+## Overlay mode (Linux)
+
+The `fuse-overlayfs` populate mode can't run on macOS, so it's exercised by an
+integration script (also run by the `overlay-linux` CI job):
+
+```bash
+sudo apt-get install -y fuse-overlayfs
+cargo build --release
+SG="$PWD/target/release/sg" bash tests/overlay_integration.sh
+```
+
+`SIMGIT_POPULATE=reflink|overlay|checkout` forces a populate mode, which the
+script uses to assert the overlay path regardless of the host filesystem.
+
 ## CoW scaling benchmarks
 
 These measure the physical-disk and I/O properties of `sg worktree` versus
