@@ -172,7 +172,7 @@ pub(super) fn is_mounted(worktree: &Path) -> bool {
         let wanted = worktree
             .canonicalize()
             .unwrap_or_else(|_| worktree.to_path_buf());
-        return fs::read_to_string("/proc/self/mountinfo")
+        fs::read_to_string("/proc/self/mountinfo")
             .map(|mounts| {
                 mounts.lines().any(|line| {
                     line.split_whitespace()
@@ -181,11 +181,13 @@ pub(super) fn is_mounted(worktree: &Path) -> bool {
                         .is_some_and(|path| path == wanted)
                 })
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
 
     #[cfg(not(target_os = "linux"))]
-    worktree.join(".git").is_file()
+    {
+        worktree.join(".git").is_file()
+    }
 }
 
 #[cfg(target_os = "linux")]

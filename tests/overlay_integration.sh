@@ -16,6 +16,15 @@ if ! command -v fuse-overlayfs >/dev/null; then
 fi
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
+unmount_and_wait() {
+    local path="$1"
+    fusermount3 -u "$path" 2>/dev/null || fusermount -u "$path"
+    for _ in $(seq 1 50); do
+        if ! test -e "$path/.git"; then return 0; fi
+        sleep 0.1
+    done
+    fail "overlay remained accessible after unmount: $path"
+}
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -57,7 +66,7 @@ grep -qx root root.txt || fail "baseline root.txt was mutated through the overla
 echo "== repair remounts an interrupted overlay without losing its upperdir =="
 repair="$("$SG" worktree add repair-me --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
 echo preserved >"$repair/preserved.txt"
-fusermount3 -u "$repair" 2>/dev/null || fusermount -u "$repair"
+unmount_and_wait "$repair"
 if mount | grep -q "$repair"; then fail "repair fixture did not unmount"; fi
 "$SG" worktree repair
 if ! mount | grep -q "$repair"; then fail "repair did not remount overlay"; fi
@@ -66,7 +75,7 @@ grep -qx preserved "$repair/preserved.txt" || fail "repair lost upperdir data"
 
 echo "== stale unmounted overlays can be removed without remounting =="
 stale="$("$SG" worktree add stale-me --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
-fusermount3 -u "$stale" 2>/dev/null || fusermount -u "$stale"
+unmount_and_wait "$stale"
 "$SG" worktree remove stale-me --force --delete-branch
 if test -d "$stale"; then fail "stale overlay directory survived remove"; fi
 if git show-ref --verify --quiet refs/heads/stale-me; then fail "stale branch survived remove"; fi
