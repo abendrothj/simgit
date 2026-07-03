@@ -167,12 +167,36 @@ pub(super) fn admin_dir(repo: &RepoContext, worktree: &Path) -> Option<PathBuf> 
 }
 
 pub(super) fn is_mounted(worktree: &Path) -> bool {
-    Command::new("mountpoint")
-        .arg("-q")
-        .arg(worktree)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or_else(|_| worktree.join(".git").is_file())
+    #[cfg(target_os = "linux")]
+    {
+        let wanted = worktree
+            .canonicalize()
+            .unwrap_or_else(|_| worktree.to_path_buf());
+        return fs::read_to_string("/proc/self/mountinfo")
+            .map(|mounts| {
+                mounts.lines().any(|line| {
+                    line.split_whitespace()
+                        .nth(4)
+                        .map(decode_mount_path)
+                        .is_some_and(|path| path == wanted)
+                })
+            })
+            .unwrap_or(false);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    worktree.join(".git").is_file()
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mount_path(encoded: &str) -> PathBuf {
+    PathBuf::from(
+        encoded
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\"),
+    )
 }
 
 pub(super) fn repair(repo: &RepoContext, worktree: &Path) -> Result<bool> {
