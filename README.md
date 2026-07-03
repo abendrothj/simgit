@@ -114,18 +114,33 @@ Agent runner / CLI / SDK
 - Idempotent commit resolution under ambiguous transport outcomes
 - Explicit terminal states for all commit requests (pending → success | failed)
 
-### Platform support and backend tiers
+### Backends: native copy-on-write (default) vs. write-intercepting VFS
 
-simgit ships three VFS backends, all providing the same write-time
-borrow-checking guarantee through the shared `SessionVfsOps` trait:
+The **default** backend is a native copy-on-write working tree — no user-space
+filesystem in the hot path. Each session is a real working tree that is a CoW
+clone of a shared baseline (APFS `clonefile` on macOS; `cp --reflink=auto`
+elsewhere), so reads and writes are ordinary filesystem ops at **native
+latency**, while the disk-scaling benefit (one shared baseline + per-session
+deltas) is preserved. Conflict detection happens **at commit time**: the working
+tree is diffed into the delta store and the commit scheduler performs the same
+path-level overlap check. Same no-corruption guarantee, detected at commit
+rather than rejected at write.
 
-| Platform | Backend | Write-time enforcement | User friction |
-|---|---|---|---|
-| Linux | FUSE (`fuser`) | Yes — every read/write is intercepted by `SessionFs`, `BorrowRegistry` consulted on the write path | None (FUSE kernel module is standard) |
-| macOS (default) | Embedded NFSv3 server (`nfsserve`) | Yes — every NFSv3 `WRITE` RPC goes through `SessionVfsOps::write()` → `BorrowRegistry` | None (no install, no kernel extension, no macFUSE) |
-| macOS (opt-in) | FUSE via `SIMGIT_BACKEND=fuse` | Yes — identical to Linux FUSE path | One-time install: `brew install --cask macfuse` or `brew install fuse-t` |
-| macOS 15.4+ (future) | FSKit native provider | Yes — Apple's user-space FS framework, no kernel extension | One-time System Settings toggle; requires paid Apple Developer account to sign |
-| Windows | WinFSP (`winfsp_wrs`) | Yes — every WinFSP write callback goes through `SessionVfsOps::write()` → `BorrowRegistry` | One-time install of WinFSP runtime (MSI or `choco install winfsp`) |
+For workflows that need **synchronous write-time** borrow-checking (a write to a
+path another session holds fails immediately with `EBUSY`), the write-
+intercepting VFS backends remain available via `SIMGIT_BACKEND`:
+
+| `SIMGIT_BACKEND` | Backend | Enforcement | Latency | Friction |
+|---|---|---|---|---|
+| _(default)_ | Native CoW (`clonefile`/reflink) | Commit-time overlap check | **Native** (page cache) | None |
+| `fuse` | FUSE (`fuser`) | Write-time (`SessionFs` → `BorrowRegistry`) | User-space upcall per op | Linux built-in; macOS needs macFUSE/fuse-t |
+| `nfs` | Embedded NFSv3 (`nfsserve`) | Write-time (`WRITE` RPC → `BorrowRegistry`) | Loopback RPC per op (slowest) | None (macOS built-in client) |
+| `winfsp` | WinFSP (`winfsp_wrs`) | Write-time (write callback → `BorrowRegistry`) | User-space callback per op | WinFSP runtime install |
+
+Measured per-op cost of the VFS indirection (macOS, 400 small files, warm):
+native/CoW `stat` ≈ 1.6 µs, `read` ≈ 11 µs; NFS-loopback `stat` ≈ 790 µs,
+`read` ≈ 2 ms — the CoW default is ~2 orders of magnitude faster per operation.
+See [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
 
 Test coverage by platform:
 
@@ -135,8 +150,11 @@ Test coverage by platform:
 | Linux | FUSE | Mount integration tests — real create/rename/unlink through the FUSE mount (`.github/workflows/fuse-linux-integration.yml`) |
 | Windows | WinFSP | Compile + link against the WinFSP runtime and cross-platform unit tests (`.github/workflows/windows-winfsp.yml`). Mount-level integration on Windows is **not yet covered** — the backend is build-verified, not mount-verified. |
 
-All backends share the same borrow-checking and CoW delta logic through
-`SessionVfsOps`; the FUSE and WinFSP backends additionally share `SessionFs`.
+The write-intercepting backends share the same borrow-checking and delta logic
+through `SessionVfsOps` (FUSE and WinFSP additionally share `SessionFs`). The
+default CoW backend reuses the same delta store and commit scheduler, but
+populates deltas by diffing the working tree at commit (`capture_mount_delta`)
+instead of intercepting each write.
 
 ## Repository layout
 

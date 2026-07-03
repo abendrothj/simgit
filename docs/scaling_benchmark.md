@@ -57,6 +57,31 @@ whole tree) and stays roughly flat for simgit (no tree is written).
   individual file reads carry more per-op overhead than a plain checkout. The
   win is disk and setup-time scaling, not raw single-file read latency.
 
+## Per-operation latency: CoW default vs. write-intercepting VFS
+
+The disk win above is independent of backend. Where backends differ sharply is
+**per-file-operation latency**, because the VFS backends route every read/write
+through a user-space filesystem while the default CoW backend serves them from
+the kernel page cache.
+
+Measured on macOS, 400 small files, warm (per-op, averaged):
+
+| Path | `stat()` | `open()`+`read()` |
+|---|--:|--:|
+| Plain `git` checkout | 1.2 µs | 10.7 µs |
+| **CoW backend (default)** | **1.6 µs** | **11.4 µs** |
+| NFS-loopback VFS (`SIMGIT_BACKEND=nfs`) | 792 µs | 1961 µs |
+
+The CoW backend is within noise of a plain checkout and ~500×/170× faster per
+op than the NFS-loopback VFS. The NFS cost is dominated by `actimeo=0` (no
+client attribute caching → an RPC round trip per `stat`, and `LOOKUP`+`GETATTR`+
+`READ` per read) — the price of synchronous write-time borrow-checking.
+
+**When to use which:** the CoW default detects conflicts at commit (optimistic).
+Use a write-intercepting backend (`SIMGIT_BACKEND=fuse|nfs`) only if you need a
+write to a path another session holds to fail *immediately* rather than at
+commit — and accept the per-op latency that requires.
+
 ## Reproduce
 
 ```bash

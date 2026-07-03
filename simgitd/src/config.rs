@@ -116,6 +116,17 @@ pub struct Config {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VfsBackend {
+    /// Native copy-on-write working tree (default on all platforms).
+    ///
+    /// Each session is a real working tree that is a CoW clone of a shared
+    /// baseline (APFS `clonefile` on macOS; `cp --reflink=auto` elsewhere).
+    /// Reads/writes are ordinary filesystem ops at native latency; the
+    /// disk-scaling benefit (one shared baseline + per-session deltas) is
+    /// preserved. Conflict detection happens at commit time (via
+    /// `capture_mount_delta` → delta store → commit scheduler) rather than
+    /// synchronously at write. See [crate::vfs::cow_backend].
+    Cow,
+
     /// FUSE (Linux primary, also available on macOS when macFUSE or fuse-t is installed).
     ///
     /// Uses the `fuser` crate to handle filesystem requests.
@@ -208,6 +219,7 @@ impl Config {
         // Default by platform; override via SIMGIT_BACKEND env if set.
         let vfs_backend = if let Ok(val) = std::env::var("SIMGIT_BACKEND") {
             match val.to_lowercase().as_str() {
+                "cow" | "clonefile" | "reflink" => VfsBackend::Cow,
                 "fuse" => VfsBackend::Fuse,
                 "nfs" | "nfs-loopback" => VfsBackend::NfsLoopback,
                 #[cfg(windows)]
@@ -263,12 +275,19 @@ fn default_state_dir() -> PathBuf {
 }
 
 fn platform_default_backend() -> VfsBackend {
-    #[cfg(target_os = "macos")]
-    { VfsBackend::NfsLoopback }
-    #[cfg(target_os = "windows")]
-    { VfsBackend::WinFsp }
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    { VfsBackend::Fuse }
+    // Native copy-on-write is the default on Unix: native I/O latency with the
+    // same disk-scaling benefit. The write-intercepting VFS backends (fuse /
+    // nfs / winfsp) remain available via SIMGIT_BACKEND for workflows that need
+    // synchronous write-time borrow-checking. Windows keeps WinFSP for now
+    // (no `cp --reflink`/`clonefile` equivalent wired up yet).
+    #[cfg(windows)]
+    {
+        VfsBackend::WinFsp
+    }
+    #[cfg(not(windows))]
+    {
+        VfsBackend::Cow
+    }
 }
 
 fn dirs_home() -> PathBuf {

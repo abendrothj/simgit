@@ -107,6 +107,7 @@ use crate::borrow::BorrowRegistry;
 use crate::config::{Config, VfsBackend};
 use crate::delta::DeltaStore;
 
+mod cow_backend;
 mod fuse_backend;
 mod git_resolver;
 mod nfs_backend;
@@ -216,6 +217,7 @@ impl VfsManager {
         metrics: Arc<crate::metrics::Metrics>,
     ) -> Self {
         let backend: Box<dyn VfsBackendTrait> = match cfg.vfs_backend {
+            VfsBackend::Cow => Box::new(cow_backend::CowBackend::new(cfg, deltas, borrows, metrics)),
             VfsBackend::Fuse => Box::new(fuse_backend::FuseBackend::new(cfg, deltas, borrows)),
             VfsBackend::NfsLoopback => Box::new(nfs_backend::NfsLoopbackBackend::new(
                 cfg, deltas, borrows, metrics,
