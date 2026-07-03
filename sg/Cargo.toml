@@ -1,6 +1,6 @@
 [package]
 name        = "simgit-cli"
-description = "simgit CLI — session management and borrow status"
+description = "simgit CLI — native copy-on-write Git worktrees"
 version.workspace     = true
 edition.workspace     = true
 license.workspace     = true
@@ -11,12 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace        = true
-tokio.workspace       = true
-serde.workspace       = true
 serde_json.workspace  = true
 anyhow.workspace      = true
-tracing.workspace     = true
-tracing-subscriber.workspace = true
 uuid.workspace        = true
-chrono.workspace      = true
-simgit-sdk.workspace  = true

@@ -1,145 +1,42 @@
-//! # sg — simgit Command-Line Interface
+//! # sg — simgit CLI
 //!
-//! A command-line tool for native CoW-backed Git worktrees and daemon-managed
-//! simgit sessions. `sg worktree` creates real linked worktrees whose unchanged
-//! extents share an immutable baseline; it does not require the daemon.
+//! A command-line tool for native copy-on-write Git worktrees. `sg worktree`
+//! creates real linked worktrees whose unchanged extents share an immutable
+//! baseline via filesystem CoW (APFS `clonefile` / Linux reflink), falling back
+//! to an ordinary `git checkout` when the filesystem can't clone.
 //!
-//! ## Overview
+//! It has no daemon and no server: Git owns the refs, the filesystem owns the
+//! data. Agents work in isolated worktrees in parallel and integrate through
+//! normal Git merges.
 //!
-//! `sg` is the primary user-facing interface to simgitd. It provides clients
-//! (AI agents, human users) with commands to:
-//! - **Create sessions** with borrow-checked write semantics
-//! - **Commit/abort** changes (flatten delta to git branch or discard)
-//! - **Monitor locks** (which session locked which file?)
-//! - **Observe peers** (collaborate with other agents)
-//! - **Manage daemon** (start/stop simgitd)
+//! ## Commands
 //!
-//! ## Architecture
+//! - `sg worktree add <branch>` — create a CoW linked worktree
+//! - `sg worktree list` — list worktrees
+//! - `sg worktree remove` — remove a worktree (optionally committing first)
+//! - `sg worktree prune` — prune stale worktree administrative entries
 //!
-//! ```text
-//! Agent/User
-//!    ↑↓
-//! sg CLI ← invokes subcommands (init, new, commit, abort, status, lock, peer, gc, daemon)
-//!    ↓
-//! RPC Client ← connects to simgitd via TCP loopback (port from control.port)
-//!    ↓
-//! simgitd ← processes requests, manages sessions/locks/VFS
-//! ```
-//!
-//! ## Port File Discovery (daemon commands only)
-//!
-//! Session, lock, peer, and status commands read the TCP port from discovery
-//! file at these platform defaults:
-//! - Linux: `$XDG_RUNTIME_DIR/simgit/control.port`
-//! - macOS: `$HOME/.local/state/simgit/control.port`
-//! - Windows: `%LOCALAPPDATA%\simgit\control.port`
-//!
-//! Override with:
-//! ```bash
-//! sg --socket /custom/path/control.port <command>
-//! export SIMGIT_SOCKET=/custom/path/control.port  # env var
-//! ```
-//!
-//! ## Output Formats
-//!
-//! By default, output is human-readable (tables, lists).
-//! For machine-readable output:
-//! ```bash
-//! sg --json status  # JSON output
-//! ```
-//!
-//! ## Command Reference
-//!
-//! - **worktree add/remove/list/prune** — Real Git linked worktrees populated
-//!   with APFS clones/Linux reflinks, with ordinary checkout fallback.
-//! - **init** — Initialize simgit + start daemon (one-time setup)
-//! - **new** — Create new session (`--branch <name>` for target branch)
-//! - **commit** — Flatten delta to git branch + close session
-//! - **abort** — Discard delta + close session
-//! - **status** — Show all sessions, locks, peer visibility
-//! - **diff** — Show unified diff of session changes (read-only)
-//! - **lock status** — List all write locks (by session/path/TTL)
-//! - **lock release** — Forcefully release a lock (admin only)
-//! - **peer ls** — List active peer sessions
-//! - **peer diff** — Show in-flight diff for a peer session
-//! - **peer events** — Poll recent peer/global events (`--stream` for long-poll stream)
-//! - **gc** — Delete STALE sessions older than 24h
-//! - **daemon start/stop/status** — Manage simgitd lifecycle
-//!
-//! ## Example Workflow
-//!
-//! ### Quick: `sg worktree` (recommended)
+//! ## Example
 //!
 //! ```bash
-//! # One command: create a linked worktree and cd into it
+//! # Create a linked worktree and cd into it
 //! cd $(sg worktree add feature-1)
 //!
-//! # All standard git commands use native linked-worktree behavior
 //! git add <files>
 //! git commit -m "feature work"
 //!
-//! # Inspect or clean up
-//! git diff                            # Preview changes
-//! sg worktree remove --commit         # Commit and remove
+//! sg worktree remove --commit   # commit and remove
 //! ```
-//!
-//! ### Manual: `sg new` / `sg commit`
-//!
-//! ```bash
-//! sg init
-//! sg new --task "demo" --label "agent-1"
-//! # write files under the printed mount path
-//! sg commit --branch feature-1 --message "demo"
-//! sg lock status
-//! ```
-//!
-//! ## Error Codes
-//!
-//! - 0: Success
-//! - 1: Daemon connection failed (simgitd not running)
-//! - 2: RPC error (session not found, borrow conflict, etc.)
-//! - 3: File I/O error (disk, permissions)
-//! - 4: Git error (invalid branch, merge conflict, etc.)
-//!
-//! ## Design Notes
-//!
-//! - All commands are stateless: connection made per invocation
-//! - No local session state: all state queried from simgitd
-//! - Subcommands map 1:1 to RPC methods
-//! - JSON output is exact RPC response (for integration)
-//!
-//! ## Future Enhancements (Phase 2+)
-//!
-//! - Interactive REPL mode (persistent connection)
-//! - Streaming output (large diffs)
-//! - Authentication/authorization (Entra ID)
-//! - Custom output formats (CSV, YAML)
 
 mod commands;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-/// Command-line arguments for the sg CLI.
-///
-/// # Global Options
-///
-/// - `--socket <PATH>`: Override the port-file path (defaults to platform-specific `control.port` location)
-/// - `--json`: Output in JSON format (for machine parsing)
-///
-/// # Subcommands
-///
-/// See [`Commands`] enum for available subcommands.
+/// simgit — native copy-on-write Git worktrees.
 #[derive(Parser)]
-#[command(
-    name = "sg",
-    about = "simgit — borrow-checked filesystem sessions for AI agents"
-)]
+#[command(name = "sg", about = "simgit — native copy-on-write Git worktrees")]
 struct Cli {
-    /// Override the daemon port-file path (reads TCP port from this file).
-    #[arg(long, env = "SIMGIT_SOCKET", global = true)]
-    socket: Option<String>,
-
     /// Output machine-readable JSON.
     #[arg(long, global = true)]
     json: bool,
@@ -148,109 +45,16 @@ struct Cli {
     command: Commands,
 }
 
-/// All available sg subcommands.
-///
-/// Each subcommand corresponds to an RPC method in simgitd:
-///
-/// - **Init** (`session.create` future; startup handshake)
-/// - **New** (`session.create`)
-/// - **Commit** (`session.commit` with `flatten=true`)
-/// - **Abort** (`session.abort`)
-/// - **Diff** (`session.diff`)
-/// - **Status** (`session.list` + `lock.list`)
-/// - **Lock** (nested: `lock.list`, `lock.release`)
-/// - **Peer** (nested: `session.list` with `peer_filter`)
-/// - **Gc** (custom: delete stale sessions)
-/// - **Daemon** (nested: `daemon.start`, `daemon.stop`, `daemon.status`)
-///
-/// # Example
-///
-/// ```bash
-/// sg new --branch feature-x         # Dispatch to Commands::New
-/// sg lock release <lock_id>         # Dispatch to Commands::Lock(Release)
-/// sg daemon start                   # Dispatch to Commands::Daemon(Start)
-/// ```
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize simgit for a repository and start the daemon.
-    Init(commands::init::Init),
-    /// Create a new agent session.
-    New(commands::new::New),
-    /// Flatten the session's delta to a git branch.
-    Commit(commands::commit::Commit),
-    /// Discard the session's delta layer.
-    Abort(commands::abort::Abort),
-    /// Show the unified diff of an in-flight session.
-    Diff(commands::diff::Diff),
-    /// Show all active sessions and lock table.
-    Status(commands::status::Status),
-    /// Lock table operations.
-    #[command(subcommand)]
-    Lock(commands::lock::Lock),
-    /// Peer session operations.
-    #[command(subcommand)]
-    Peer(commands::peer::Peer),
-    /// Garbage-collect STALE sessions older than 24h.
-    Gc(commands::gc::Gc),
-    /// Daemon management.
-    #[command(subcommand)]
-    Daemon(commands::daemon::Daemon),
     /// Native CoW-backed linked worktrees.
     #[command(subcommand)]
     Worktree(commands::worktree::Worktree),
-    /// Update a session's base commit (called by git hooks).
-    SessionSetBase(commands::session_set_base::SessionSetBase),
 }
 
-/// Entry point for the sg CLI.
-///
-/// # Execution Flow
-///
-/// 1. Parse command-line arguments via clap
-/// 2. Resolve daemon socket path (flag > env var > default)
-/// 3. Connect RPC client to socket
-/// 4. Dispatch to subcommand handler
-/// 5. Return exit code (0 = success, non-zero = error)
-///
-/// # Error Propagation
-///
-/// All errors (connection, RPC, I/O) are returned as [`anyhow::Result`].
-/// The Rust runtime automatically converts Result to exit codes.
-///
-/// # Async Runtime
-///
-/// Uses tokio for async/await (required for RPC client).
-/// No background tasks; all execution is in main() context.
-///
-/// # Example
-///
-/// ```bash
-/// sg --socket /tmp/simgit-dev/control.port new --branch feature-x
-/// # Returns exit code 0 if successful, non-zero if failed
-/// ```
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    let socket = cli.socket.clone().unwrap_or_else(|| {
-        simgit_sdk::client::default_socket_path()
-            .to_string_lossy()
-            .into_owned()
-    });
-    let client = simgit_sdk::Client::new(&socket);
-
     match cli.command {
-        Commands::Init(cmd) => commands::init::run(cmd).await,
-        Commands::New(cmd) => commands::new::run(cmd, &client, cli.json).await,
-        Commands::Commit(cmd) => commands::commit::run(cmd, &client, cli.json).await,
-        Commands::Abort(cmd) => commands::abort::run(cmd, &client).await,
-        Commands::Diff(cmd) => commands::diff::run(cmd, &client, cli.json).await,
-        Commands::Status(cmd) => commands::status::run(cmd, &client, cli.json).await,
-        Commands::Lock(cmd) => commands::lock::run(cmd, &client, cli.json).await,
-        Commands::Peer(cmd) => commands::peer::run(cmd, &client, cli.json).await,
-        Commands::Gc(cmd) => commands::gc::run(cmd, &client).await,
-        Commands::Daemon(cmd) => commands::daemon::run(cmd).await,
         Commands::Worktree(cmd) => commands::worktree::run(cmd, cli.json),
-        Commands::SessionSetBase(cmd) => commands::session_set_base::run(cmd, &client).await,
     }
 }

@@ -19,13 +19,10 @@ You'll need:
 
 ```
 simgit/
-├── simgitd/          daemon — session manager, borrow checker, delta store, CoW VFS
-├── simgit-sdk/       Rust SDK — async JSON-RPC client + shared types
-├── simgit-py/        Python bindings — PyO3, maturin wheel
-├── sg/               CLI tool — `sg new`, `sg commit`, `sg status`…
-├── tests/            Rust integration tests + Python stress harnesses
-├── docs/             agent integration, chaos validation
-└── deploy/           Docker dev stack (daemon + Prometheus)
+├── sg/               the CLI — `sg worktree add/list/remove/prune`
+│   └── src/commands/worktree.rs   the whole implementation
+├── tests/            CoW scaling benchmarks (bench_scaling.sh, bench_worktree_io.py)
+└── docs/             scaling benchmark methodology
 ```
 
 ## Finding something to work on
@@ -34,31 +31,29 @@ Issues labeled [good first issue](https://github.com/abendrothj/simgit/labels/go
 
 ## Architecture overview
 
-simgit is a daemon that provides isolated copy-on-write filesystem overlays for AI coding agents. The core concepts:
+simgit is a small CLI that creates real Git linked worktrees populated via
+filesystem copy-on-write. It has no daemon and no runtime services — each
+invocation shells out to `git` and, where supported, clones the working tree
+with `clonefile`/reflink from a cached baseline. The logic lives in a single
+file, `sg/src/commands/worktree.rs`.
 
-| Component | What it does |
-|-----------|-------------|
-| **SessionManager** | Lifecycle: create, commit, abort, recovery |
-| **BorrowRegistry** | Per-path write lock enforcement (Rust-style borrow semantics) |
-| **DeltaStore** | Content-addressed CoW blob storage |
-| **CommitScheduler** | Per-path serialization for conflict-safe commits |
-| **CoW VFS** | Native copy-on-write working tree per session (Linux `overlayfs`, macOS `clonefile`); changes captured into the delta store at commit |
-| **RPC Server** | JSON-RPC 2.0 over TCP loopback |
+(An earlier daemon-based architecture — session manager, borrow registry, delta
+store, RPC server, VFS backends — was retired; see the README "History"
+section and Git history.)
 
 ## Before submitting a PR
 
-1. Run tests: `cargo test --workspace`
-2. Lint (if available): `cargo clippy --workspace`
+1. Run tests: `cargo test`
+2. Lint (if available): `cargo clippy`
 3. Check formatting: `cargo fmt -- --check`
 4. Keep commits focused — one concept per commit
-5. Update docs if your change affects public API or user-facing behavior
+5. Update docs if your change affects user-facing behavior
 
 ## Code style
 
 - Follow existing patterns — look at neighboring files for conventions
 - No comments unless explaining *why*, not *what*
-- Error handling: use `anyhow` for application errors, `thiserror` for library types
-- Async: tokio multi-thread runtime, `async-trait` for trait objects
+- Error handling: use `anyhow`
 
 ## Communication
 
