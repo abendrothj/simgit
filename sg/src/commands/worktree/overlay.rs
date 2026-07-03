@@ -151,8 +151,15 @@ pub(super) fn admin_dir(repo: &RepoContext, worktree: &Path) -> Option<PathBuf> 
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|path| PathBuf::from(path.trim()));
-    if live.is_some() {
-        return live;
+    // When `worktree` is an empty, unmounted mountpoint nested inside the
+    // common git dir (e.g. `.git/simgit/worktrees/<name>`), git's directory
+    // discovery walks past it and finds the outer repository instead. Reject
+    // that escape rather than mistaking the whole repo for this worktree's
+    // admin dir.
+    if let Some(live) = &live {
+        if live != &repo.common_git_dir {
+            return Some(live.clone());
+        }
     }
 
     let registrations = repo.common_git_dir.join("worktrees");

@@ -185,6 +185,25 @@ fn overlay_marker_round_trips_through_common_admin_dir() -> Result<()> {
 }
 
 #[test]
+fn admin_dir_does_not_escape_to_the_common_git_dir_when_unmounted() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+    // Mirrors production overlay worktrees, whose mountpoint lives inside the
+    // common git dir itself (e.g. `.git/simgit/worktrees/<name>`).
+    let worktree = repo.common_git_dir.join("simgit/worktrees/nested");
+    add_git_worktree(&repo, "nested", &worktree, &base)?;
+    let admin = overlay::admin_dir(&repo, &worktree).expect("admin dir while mounted");
+    assert_ne!(admin, repo.common_git_dir);
+
+    // An unmounted overlay exposes an empty mountpoint. Git's directory
+    // discovery would otherwise climb past it and find the outer repo.
+    fs::remove_file(worktree.join(".git"))?;
+    assert_eq!(overlay::admin_dir(&repo, &worktree), Some(admin));
+    Ok(())
+}
+
+#[test]
 fn overlay_health_requires_the_view_to_reflect_upperdir_data() -> Result<()> {
     let root = std::env::temp_dir().join(format!("simgit-overlay-health-{}", Uuid::new_v4()));
     let upper = root.join("upper");
