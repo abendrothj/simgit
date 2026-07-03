@@ -26,6 +26,7 @@
 //! at commit rather than rejected at write.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -46,7 +47,10 @@ use crate::metrics::Metrics;
 enum Materialization {
     /// Linux overlayfs mount; capture scans `upper`.
     #[cfg(target_os = "linux")]
-    Overlay { session_root: PathBuf, upper: PathBuf },
+    Overlay {
+        session_root: PathBuf,
+        upper: PathBuf,
+    },
     /// CoW clone (clonefile / reflink) or plain copy; capture uses `git status`.
     Clone,
 }
@@ -55,6 +59,7 @@ struct MountState {
     mount: PathBuf,
     base_commit: String,
     materialization: Materialization,
+    last_capture_fingerprint: Option<u64>,
 }
 
 /// A materialized baseline is evicted once no active session references it and
@@ -152,6 +157,46 @@ impl CowBackend {
         mount.join(".git")
     }
 
+    /// Cheaply summarize the files that can affect a captured manifest. This
+    /// avoids spawning `git status` once per active peer on every concurrent
+    /// commit when that peer has not changed since its last capture.
+    fn capture_fingerprint(root: &Path) -> Result<u64> {
+        let mut entries = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                if rel.starts_with(".git") {
+                    continue;
+                }
+                let metadata = std::fs::symlink_metadata(&path)?;
+                if metadata.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let modified_nanos = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0);
+                entries.push((
+                    rel.to_path_buf(),
+                    metadata.len(),
+                    modified_nanos,
+                    metadata.file_type().is_symlink(),
+                ));
+            }
+        }
+
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        entries.hash(&mut hasher);
+        Ok(hasher.finish())
+    }
+
     /// Evict materialized baselines that no active session references and that
     /// have been idle longer than [`BASELINE_IDLE_TTL_SECS`]. Keeps
     /// `state_dir/baselines` bounded without losing warm reuse.
@@ -196,7 +241,12 @@ impl CowBackend {
     }
 
     /// Try to materialize the working tree, returning how it was done.
-    fn materialize(&self, baseline: &Path, mount: &Path, session_id: Uuid) -> Result<Materialization> {
+    fn materialize(
+        &self,
+        baseline: &Path,
+        mount: &Path,
+        session_id: Uuid,
+    ) -> Result<Materialization> {
         #[cfg(target_os = "linux")]
         {
             match self.overlay_mount(baseline, mount, session_id) {
@@ -430,6 +480,7 @@ impl super::VfsBackendTrait for CowBackend {
                 mount: mount.clone(),
                 base_commit: session.base_commit.clone(),
                 materialization,
+                last_capture_fingerprint: None,
             },
         );
 
@@ -475,9 +526,35 @@ impl super::VfsBackendTrait for CowBackend {
         if !session.mount_path.exists() {
             return Ok(());
         }
-        // Pick the capture strategy that matches how this session was mounted.
+
+        // Pick the smallest tree that fully represents changes for this
+        // materialization: overlay upperdir on Linux, otherwise the clone.
+        let capture_root = {
+            let guard = self.mounts.lock().unwrap();
+            let Some(state) = guard.get(&session.session_id) else {
+                return self.capture_git_status(session);
+            };
+            match &state.materialization {
+                #[cfg(target_os = "linux")]
+                Materialization::Overlay { upper, .. } => upper.clone(),
+                Materialization::Clone => state.mount.clone(),
+            }
+        };
+        let fingerprint = Self::capture_fingerprint(&capture_root)?;
+        let unchanged = self
+            .mounts
+            .lock()
+            .unwrap()
+            .get(&session.session_id)
+            .and_then(|state| state.last_capture_fingerprint)
+            == Some(fingerprint);
+        if unchanged {
+            self.metrics.record_peer_capture_skip("hit");
+            return Ok(());
+        }
+
         #[cfg(target_os = "linux")]
-        {
+        let captured = {
             let upper = {
                 let guard = self.mounts.lock().unwrap();
                 match guard.get(&session.session_id).map(|s| &s.materialization) {
@@ -485,11 +562,20 @@ impl super::VfsBackendTrait for CowBackend {
                     _ => None,
                 }
             };
-            if let Some(upper) = upper {
-                return self.capture_upperdir(session, &upper);
+            match upper {
+                Some(upper) => self.capture_upperdir(session, &upper),
+                None => self.capture_git_status(session),
             }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let captured = self.capture_git_status(session);
+
+        captured?;
+        if let Some(state) = self.mounts.lock().unwrap().get_mut(&session.session_id) {
+            state.last_capture_fingerprint = Some(fingerprint);
         }
-        self.capture_git_status(session)
+        self.metrics.record_peer_capture_skip("miss");
+        Ok(())
     }
 }
 
@@ -499,4 +585,25 @@ fn sg_binary_path() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("sg")))
         .unwrap_or_else(|| PathBuf::from("sg"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CowBackend;
+
+    #[test]
+    fn capture_fingerprint_tracks_worktree_changes_but_ignores_git_metadata() {
+        let root =
+            std::env::temp_dir().join(format!("simgit-cow-fingerprint-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join("tracked.txt"), b"one").unwrap();
+        let initial = CowBackend::capture_fingerprint(&root).unwrap();
+
+        std::fs::write(root.join(".git/index"), b"internal churn").unwrap();
+        assert_eq!(initial, CowBackend::capture_fingerprint(&root).unwrap());
+
+        std::fs::write(root.join("added.txt"), b"two").unwrap();
+        assert_ne!(initial, CowBackend::capture_fingerprint(&root).unwrap());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

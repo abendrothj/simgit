@@ -120,7 +120,7 @@ echo
 # Step 4: Run disjoint-range stress
 echo "[step 4a] Running disjoint-range stress (60 agents, 24 workers)..."
 set +e
-SIMGIT_SOCKET="$STATE_DIR/control.sock" \
+SIMGIT_SOCKET="$STATE_DIR/control.port" \
 python3 "$SCRIPT_DIR/stress/agent_harness.py" \
     --agents 60 --workers 24 --execution-mode phased \
     --stress-mode disjoint-range --commit-workers 24 \
@@ -138,7 +138,7 @@ echo
 # Step 5: Run hotspot stress
 echo "[step 4b] Running hotspot stress (60 agents, 24 workers)..."
 set +e
-SIMGIT_SOCKET="$STATE_DIR/control.sock" \
+SIMGIT_SOCKET="$STATE_DIR/control.port" \
 python3 "$SCRIPT_DIR/stress/agent_harness.py" \
     --agents 60 --workers 24 --execution-mode phased \
     --stress-mode hotspot --commit-workers 24 \
