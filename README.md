@@ -141,7 +141,7 @@ intercepting VFS backends remain available via `SIMGIT_BACKEND`:
 | `SIMGIT_BACKEND` | Backend | Enforcement | Latency | Friction |
 |---|---|---|---|---|
 | _(default)_ | Native CoW (`clonefile`/reflink) | Commit-time overlap check | **Native** (page cache) | None |
-| `fuse` | FUSE (`fuser`) | Write-time (`SessionFs` → `BorrowRegistry`) | User-space upcall per op | Linux built-in; macOS needs macFUSE/fuse-t |
+| `fuse` | FUSE (`fuser`) | Write-time (`SessionFs` → `BorrowRegistry`) | User-space upcall per op | Linux built-in; macOS requires `--features macos-fuse` plus macFUSE/fuse-t |
 | `nfs` | Embedded NFSv3 (`nfsserve`) | Write-time (`WRITE` RPC → `BorrowRegistry`) | Loopback RPC per op (slowest) | None (macOS built-in client) |
 | `winfsp` | WinFSP (`winfsp_wrs`) | Write-time (write callback → `BorrowRegistry`) | User-space callback per op | WinFSP runtime install |
 

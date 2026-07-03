@@ -5,13 +5,18 @@ version.workspace     = true
 edition.workspace     = true
 license.workspace     = true
 
+[features]
+default = []
+# macOS fuser support links the host's macFUSE compatibility library. Keep it
+# opt-in so CoW/NFS builds do not load third-party global constructors.
+macos-fuse = ["dep:fuser"]
+
 [[bin]]
 name = "simgitd"
 path = "src/main.rs"
 
 [dependencies]
 tokio.workspace       = true
-fuser.workspace       = true
 gix.workspace         = true
 rusqlite.workspace    = true
 serde.workspace       = true
@@ -34,6 +39,12 @@ opentelemetry_sdk     = { version = "0.27", features = ["rt-tokio"] }
 opentelemetry-otlp    = { version = "0.27", features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.28"
 nfsserve              = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+fuser = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winfsp_wrs = "0.4"

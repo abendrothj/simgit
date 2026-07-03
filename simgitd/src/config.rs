@@ -127,11 +127,11 @@ pub enum VfsBackend {
     /// synchronously at write. See [crate::vfs::cow_backend].
     Cow,
 
-    /// FUSE (Linux primary, also available on macOS when macFUSE or fuse-t is installed).
+    /// FUSE (Linux primary; opt-in on macOS).
     ///
     /// Uses the `fuser` crate to handle filesystem requests.
     /// Requires FUSE kernel module loaded (present on all Linux distros).
-    /// On macOS, requires either:
+    /// On macOS, build with `--features macos-fuse` and install either:
     ///   - macFUSE 5.2+ (FSKit backend, no kernel extension on macOS 26+),
     ///     installed via `brew install --cask macfuse` and enabled in System Settings.
     ///   - fuse-t (kext-less, uses local NFSv4/SMB/FSKit), installed via
@@ -142,6 +142,7 @@ pub enum VfsBackend {
     /// `NfsLoopback`.
     ///
     /// See [crate::vfs::fuse_backend].
+    #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macos-fuse")))]
     Fuse,
 
     /// Embedded NFSv3 server (macOS default, also available on Linux).
@@ -220,7 +221,24 @@ impl Config {
         let vfs_backend = if let Ok(val) = std::env::var("SIMGIT_BACKEND") {
             match val.to_lowercase().as_str() {
                 "cow" | "clonefile" | "reflink" => VfsBackend::Cow,
+                #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macos-fuse")))]
                 "fuse" => VfsBackend::Fuse,
+                #[cfg(all(target_os = "macos", not(feature = "macos-fuse")))]
+                "fuse" => {
+                    eprintln!(
+                        "simgitd: SIMGIT_BACKEND=fuse requires a build with \
+                         --features macos-fuse; falling back to native CoW"
+                    );
+                    platform_default_backend()
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                "fuse" => {
+                    eprintln!(
+                        "simgitd: SIMGIT_BACKEND=fuse is unsupported on this platform; \
+                         falling back to the platform default"
+                    );
+                    platform_default_backend()
+                }
                 "nfs" | "nfs-loopback" => VfsBackend::NfsLoopback,
                 #[cfg(windows)]
                 "winfsp" => VfsBackend::WinFsp,

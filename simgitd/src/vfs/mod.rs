@@ -108,12 +108,13 @@ use crate::config::{Config, VfsBackend};
 use crate::delta::DeltaStore;
 
 mod cow_backend;
+#[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macos-fuse")))]
 mod fuse_backend;
 mod git_resolver;
 mod nfs_backend;
+pub mod session_ops;
 #[cfg(windows)]
 mod winfsp_backend;
-pub mod session_ops;
 
 /// Trait implemented by both the FUSE and NFS-loopback backends.
 ///
@@ -217,7 +218,10 @@ impl VfsManager {
         metrics: Arc<crate::metrics::Metrics>,
     ) -> Self {
         let backend: Box<dyn VfsBackendTrait> = match cfg.vfs_backend {
-            VfsBackend::Cow => Box::new(cow_backend::CowBackend::new(cfg, deltas, borrows, metrics)),
+            VfsBackend::Cow => {
+                Box::new(cow_backend::CowBackend::new(cfg, deltas, borrows, metrics))
+            }
+            #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "macos-fuse")))]
             VfsBackend::Fuse => Box::new(fuse_backend::FuseBackend::new(cfg, deltas, borrows)),
             VfsBackend::NfsLoopback => Box::new(nfs_backend::NfsLoopbackBackend::new(
                 cfg, deltas, borrows, metrics,
