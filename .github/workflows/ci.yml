@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+
+  overlay-linux:
+    # Validates the fuse-overlayfs populate mode, which cannot run on macOS.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install fuse-overlayfs
+        run: sudo apt-get update && sudo apt-get install -y fuse-overlayfs
+      - run: cargo build --release
+      - name: Overlay integration test
+        run: SG="$PWD/target/release/sg" bash tests/overlay_integration.sh

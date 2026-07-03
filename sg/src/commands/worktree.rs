@@ -128,7 +128,11 @@ struct RepoContext {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PopulateMode {
+    /// Per-file reflink clone (APFS `clonefile`, Linux reflink).
     CowClone,
+    /// `fuse-overlayfs` mount — CoW on any Linux filesystem (incl. ext4).
+    Overlay,
+    /// Ordinary `git checkout` — a full copy, no CoW benefit.
     GitCheckout,
 }
 
@@ -136,6 +140,7 @@ impl PopulateMode {
     fn label(self) -> &'static str {
         match self {
             Self::CowClone => "cow-clone",
+            Self::Overlay => "overlay",
             Self::GitCheckout => "git-checkout",
         }
     }
@@ -178,18 +183,11 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
     }
 
     let target_parent = target.parent().context("worktree path has no parent")?;
-    let mode = if cow_clone_supported(&repo.common_git_dir, target_parent)? {
-        PopulateMode::CowClone
-    } else if args.require_cow {
-        bail!(
-            "filesystem CoW cloning is unavailable; omit --require-cow to use a normal Git checkout"
-        );
-    } else {
-        PopulateMode::GitCheckout
-    };
+    let mode = select_populate_mode(&repo, target_parent, args.require_cow)?;
 
     match mode {
         PopulateMode::CowClone => add_cow_worktree(&repo, &args.branch, &target, &base)?,
+        PopulateMode::Overlay => add_overlay_worktree(&repo, &args.branch, &target, &base)?,
         PopulateMode::GitCheckout => add_git_worktree(&repo, &args.branch, &target, &base)?,
     }
 
@@ -210,6 +208,50 @@ fn add(args: WorktreeAdd, json: bool) -> Result<()> {
         println!("{}", target.display());
     }
     Ok(())
+}
+
+/// Choose how to populate the worktree. Prefers per-file reflink, then
+/// fuse-overlayfs, then a plain checkout. `SIMGIT_POPULATE` (reflink | overlay |
+/// checkout) forces a specific mode and errors if it is unavailable.
+fn select_populate_mode(
+    repo: &RepoContext,
+    target_parent: &Path,
+    require_cow: bool,
+) -> Result<PopulateMode> {
+    if let Ok(forced) = std::env::var("SIMGIT_POPULATE") {
+        return match forced.to_lowercase().as_str() {
+            "reflink" | "cow" | "cow-clone" => {
+                if cow_clone_supported(&repo.common_git_dir, target_parent)? {
+                    Ok(PopulateMode::CowClone)
+                } else {
+                    bail!("SIMGIT_POPULATE=reflink but reflink cloning is unsupported here")
+                }
+            }
+            "overlay" => {
+                if overlay_supported() {
+                    Ok(PopulateMode::Overlay)
+                } else {
+                    bail!("SIMGIT_POPULATE=overlay but fuse-overlayfs is not installed")
+                }
+            }
+            "checkout" | "git-checkout" => Ok(PopulateMode::GitCheckout),
+            other => bail!("unknown SIMGIT_POPULATE={other} (use reflink, overlay, or checkout)"),
+        };
+    }
+
+    if cow_clone_supported(&repo.common_git_dir, target_parent)? {
+        Ok(PopulateMode::CowClone)
+    } else if overlay_supported() {
+        Ok(PopulateMode::Overlay)
+    } else if require_cow {
+        bail!(
+            "no CoW method available: reflink cloning is unsupported here and \
+             fuse-overlayfs is not installed. Omit --require-cow to use a normal \
+             Git checkout, or install fuse-overlayfs."
+        )
+    } else {
+        Ok(PopulateMode::GitCheckout)
+    }
 }
 
 fn validate_new_branch(repo: &RepoContext, branch: &str) -> Result<()> {
@@ -273,10 +315,147 @@ fn add_git_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str)
     ensure_clean(target)
 }
 
+/// Marker file (in the worktree's Git admin dir) recording that a worktree is
+/// backed by a fuse-overlayfs mount, and where its upper/work dirs live.
+const OVERLAY_MARKER: &str = "simgit-overlay";
+
+/// Whether the unprivileged `fuse-overlayfs` mount helper is available. This is
+/// the CoW path for Linux filesystems without reflink support (e.g. ext4).
+fn overlay_supported() -> bool {
+    binary_on_path("fuse-overlayfs")
+}
+
+fn binary_on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+fn overlay_root(common_git_dir: &Path) -> PathBuf {
+    state_dir(common_git_dir).join("overlays")
+}
+
+/// Create a linked worktree whose files are served by a fuse-overlayfs mount:
+/// `lowerdir` is the shared read-only baseline, and a per-worktree `upperdir`
+/// captures writes. Unchanged files cost no disk, on any Linux filesystem.
+fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
+    let baseline = ensure_baseline(repo, base)?;
+
+    let overlay_dir = overlay_root(&repo.common_git_dir).join(Uuid::new_v4().to_string());
+    let upper = overlay_dir.join("upper");
+    let work = overlay_dir.join("work");
+    fs::create_dir_all(&upper).context("create overlay upperdir")?;
+    fs::create_dir_all(&work).context("create overlay workdir")?;
+
+    run_git_common(
+        repo,
+        [
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--no-checkout"),
+            OsStr::new("-b"),
+            OsStr::new(branch),
+            target.as_os_str(),
+            OsStr::new(base),
+        ],
+    )
+    .context("create linked worktree")?;
+
+    let populate = (|| -> Result<()> {
+        // The `.git` gitlink file must survive the overlay mount (which replaces
+        // the directory view), so stage it into the upperdir before mounting.
+        fs::rename(target.join(".git"), upper.join(".git"))
+            .context("stage worktree gitlink into overlay upperdir")?;
+        mount_overlay(&baseline, &upper, &work, target)?;
+        run_git_at(target, ["read-tree", "HEAD"]).context("initialize overlay worktree index")?;
+        ensure_clean(target).context("verify overlay worktree")?;
+        write_overlay_marker(target, &overlay_dir)?;
+        Ok(())
+    })();
+
+    if let Err(error) = populate {
+        unmount_overlay(target);
+        let _ = fs::remove_dir_all(target);
+        let _ = fs::remove_dir_all(&overlay_dir);
+        let _ = run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")]);
+        let _ = Command::new("git")
+            .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+            .args(["branch", "-D", branch])
+            .status();
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn mount_overlay(lower: &Path, upper: &Path, work: &Path, mountpoint: &Path) -> Result<()> {
+    let opts = format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    );
+    let mut command = Command::new("fuse-overlayfs");
+    command.arg("-o").arg(opts).arg(mountpoint);
+    run_command(&mut command, "mount fuse-overlayfs overlay")
+}
+
+/// Best-effort unmount of a fuse-overlayfs mount. Tolerates an already-unmounted
+/// path so teardown is idempotent.
+fn unmount_overlay(mountpoint: &Path) {
+    for tool in ["fusermount3", "fusermount"] {
+        let status = Command::new(tool)
+            .arg("-u")
+            .arg(mountpoint)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if matches!(status, Ok(status) if status.success()) {
+            return;
+        }
+    }
+    let _ = Command::new("umount").arg(mountpoint).status();
+}
+
+fn write_overlay_marker(worktree: &Path, overlay_dir: &Path) -> Result<()> {
+    let admin = worktree_admin_dir(worktree)?;
+    fs::write(
+        admin.join(OVERLAY_MARKER),
+        overlay_dir.display().to_string(),
+    )
+    .context("write overlay marker")?;
+    Ok(())
+}
+
+/// If `worktree` is overlay-backed, return its overlay dir (holding upper/work).
+/// Reads the marker via Git's admin dir, so call it while the worktree is still
+/// mounted and registered.
+fn overlay_state(worktree: &Path) -> Option<PathBuf> {
+    let admin = worktree_admin_dir(worktree).ok()?;
+    let content = fs::read_to_string(admin.join(OVERLAY_MARKER)).ok()?;
+    let trimmed = content.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// Tear down a worktree unconditionally, handling the overlay case (unmount +
+/// remove mount dir + drop upper/work + prune the registry) or delegating to
+/// `git worktree remove --force` for plain worktrees.
+fn force_teardown(repo: &RepoContext, target: &Path) -> Result<()> {
+    if let Some(overlay_dir) = overlay_state(target) {
+        unmount_overlay(target);
+        let _ = fs::remove_dir_all(target);
+        let _ = fs::remove_dir_all(&overlay_dir);
+        run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")])
+    } else {
+        remove_worktree_force(repo, target)
+    }
+}
+
 fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = discover_repo(&cwd)?;
     let target = resolve_worktree_target(&repo, args.target.as_deref())?;
+    // Detect overlay backing while the worktree is still mounted/registered.
+    let overlay = overlay_state(&target);
 
     let mut committed = false;
     if args.commit {
@@ -297,15 +476,25 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         }
     }
 
-    let mut command = Command::new("git");
-    command
-        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-        .args(["worktree", "remove"]);
-    if args.force {
-        command.arg("--force");
+    if let Some(overlay_dir) = overlay {
+        if !args.force && !committed && worktree_dirty(&target).unwrap_or(false) {
+            bail!("worktree has uncommitted changes; pass --commit or --force");
+        }
+        unmount_overlay(&target);
+        let _ = fs::remove_dir_all(&target);
+        let _ = fs::remove_dir_all(&overlay_dir);
+        run_git_common(&repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
+    } else {
+        let mut command = Command::new("git");
+        command
+            .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+            .args(["worktree", "remove"]);
+        if args.force {
+            command.arg("--force");
+        }
+        command.arg(&target);
+        run_command(&mut command, "git worktree remove")?;
     }
-    command.arg(&target);
-    run_command(&mut command, "git worktree remove")?;
 
     if json {
         emit(&json!({
@@ -454,7 +643,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             reaped.push(entry.path);
             continue;
         }
-        match remove_worktree_force(repo, &entry.path) {
+        match force_teardown(repo, &entry.path) {
             Ok(()) => reaped.push(entry.path),
             Err(_) => skipped.push((entry.path, "remove-failed")),
         }
@@ -970,6 +1159,22 @@ mod tests {
         assert!(branches.iter().any(|b| b == "refs/heads/exp/keep"));
         assert!(branches.iter().any(|b| b == "refs/heads/feat/other"));
         assert!(!branches.iter().any(|b| b == "refs/heads/exp/eph"));
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_marker_round_trips_through_admin_dir() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let wt = fixture.root.join("wt");
+        add_git_worktree(&repo, "wt", &wt, &base)?;
+
+        assert!(overlay_state(&wt).is_none());
+        let overlay_dir = fixture.root.join("overlays").join("abc");
+        fs::create_dir_all(&overlay_dir)?;
+        write_overlay_marker(&wt, &overlay_dir)?;
+        assert_eq!(overlay_state(&wt), Some(overlay_dir));
         Ok(())
     }
 
