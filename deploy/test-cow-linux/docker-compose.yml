@@ -1,0 +1,17 @@
+services:
+  cow-overlay-test:
+    build:
+      context: ../..
+      dockerfile: deploy/test-cow-linux/Dockerfile
+    # overlayfs mount() needs CAP_SYS_ADMIN; apparmor unconfined so the mount
+    # syscall isn't blocked.
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
+    # /work is a real (tmpfs) filesystem, not the container's overlay2 rootfs,
+    # so it can host the overlay lower/upper/work dirs.
+    tmpfs:
+      - /work
+    stdin_open: true
+    tty: true

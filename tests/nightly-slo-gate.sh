@@ -24,9 +24,15 @@ DISJOINT_P95_MAX_MS="${DISJOINT_P95_MAX_MS:-8000}"
 DISJOINT_P99_MAX_MS="${DISJOINT_P99_MAX_MS:-8500}"
 HOTSPOT_P95_MAX_MS="${HOTSPOT_P95_MAX_MS:-6500}"
 HOTSPOT_P99_MAX_MS="${HOTSPOT_P99_MAX_MS:-7000}"
+# Backend under test. Defaults to the product default (native CoW), where
+# hotspot contention surfaces as commit-time `merge_conflict`. Override with
+# SIMGIT_BACKEND=nfs|fuse to gate the write-intercepting path, where contention
+# surfaces as write-time `lock_conflict`. Both are allowed below.
+SIMGIT_BACKEND="${SIMGIT_BACKEND:-cow}"
 HOTSPOT_ALLOWED_FAILURE_TYPES="lock_conflict,merge_conflict"
 
 echo "===== NIGHTLY SLO GATE ====="
+echo "Backend under test: $SIMGIT_BACKEND"
 echo "State directory: $STATE_DIR"
 echo "Timestamp: $(date)"
 echo
@@ -79,6 +85,7 @@ echo
 echo "[step 3] Starting simgitd daemon..."
 mkdir -p "$STATE_DIR"
 if ! SIMGIT_STATE_DIR="$STATE_DIR" \
+     SIMGIT_BACKEND="$SIMGIT_BACKEND" \
      SIMGIT_COMMIT_PEER_CAPTURE_CONCURRENCY=8 \
      SIMGIT_METRICS_ADDR="127.0.0.1:$METRICS_PORT" \
      "$DAEMON_BIN" --repo . &> "$STATE_DIR/daemon.log" &

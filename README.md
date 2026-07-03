@@ -117,14 +117,22 @@ Agent runner / CLI / SDK
 ### Backends: native copy-on-write (default) vs. write-intercepting VFS
 
 The **default** backend is a native copy-on-write working tree — no user-space
-filesystem in the hot path. Each session is a real working tree that is a CoW
-clone of a shared baseline (APFS `clonefile` on macOS; `cp --reflink=auto`
-elsewhere), so reads and writes are ordinary filesystem ops at **native
-latency**, while the disk-scaling benefit (one shared baseline + per-session
-deltas) is preserved. Conflict detection happens **at commit time**: the working
-tree is diffed into the delta store and the commit scheduler performs the same
-path-level overlap check. Same no-corruption guarantee, detected at commit
-rather than rejected at write.
+filesystem in the hot path. Each session is a real working tree over a shared
+baseline, materialized per platform:
+
+- **Linux**: `overlayfs` — `lowerdir` = shared baseline, per-session `upperdir`
+  for writes. Only changed files land in the upper, so commit-time capture scans
+  the upper (`O(changes)`); deletions are overlay whiteouts. Falls back to a
+  reflink clone if the overlay mount isn't permitted.
+- **macOS**: APFS `clonefile` (`cp -c`) — blocks shared until written.
+- **Windows** (opt-in; default stays WinFSP): recursive copy for now.
+
+Reads and writes are ordinary filesystem ops at **native latency**, while the
+disk-scaling benefit (one shared baseline per `base_commit` + per-session
+deltas) is preserved; idle baselines are garbage-collected. Conflict detection
+happens **at commit time**: the working tree is diffed into the delta store and
+the commit scheduler performs the same path-level overlap check. Same
+no-corruption guarantee, detected at commit rather than rejected at write.
 
 For workflows that need **synchronous write-time** borrow-checking (a write to a
 path another session holds fails immediately with `EBUSY`), the write-
