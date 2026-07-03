@@ -43,8 +43,9 @@ each one a full copy of the working tree.  That gets expensive fast —
 N agents × repo size sitting on disk.
 
 **simgit avoids duplicating the working tree.**  Every agent reads from
-a shared baseline and writes to a private copy-on-write overlay.  The
-working tree never touches disk.
+a shared materialized baseline and writes to a private copy-on-write clone.
+The baseline occupies disk once; unchanged file extents remain physically
+shared across sessions.
 
 | Property | How simgit achieves it |
 |---|---|
@@ -55,21 +56,18 @@ working tree never touches disk.
 
 ### Measured
 
-Standing up N isolated working trees over a 67 MB repo, real host disk consumed
-(`git worktree` full checkouts vs `sg worktree` sessions):
+Standing up eight isolated views of a 300 MiB tree on APFS:
 
-| N sessions | `git worktree` | `sg worktree` |
-|---:|---:|---:|
-| 1  | 67.2 MB   | 0.11 MB |
-| 8  | 537.5 MB  | 0.25 MB |
-| 16 | 1075.1 MB | 0.41 MB |
+| Path | Physical disk added | Cold setup |
+|---|---:|---:|
+| 8 × `git worktree` | 2401.5 MiB | 1.38 s |
+| 8 × `sg worktree` | 327.3 MiB | 2.34 s |
 
-Disk grows linearly with `git worktree` and stays flat with simgit — ~2,600×
-less at N=16, and the gap widens with tree size. **At N=1–2, plain `git worktree`
-is simpler and the right call; the win only shows up at high fan-out.** simgit
-also trades local page-cache reads for a loopback FS layer, so it buys disk and
-setup-time scaling, not raw single-file read latency. Full method, caveats, and a
-reproduction script: [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
+simgit used **7.3× less physical disk**. Its fixed daemon/baseline cost makes
+Git faster at low fan-out; setup crossed over around 8–16 sessions on a smaller
+67 MiB test tree. CoW uses ordinary filesystem I/O, with measured hot-operation
+overhead of roughly 15–46% and a higher first-write cost when shared extents
+split. Full method and caveats: [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
 
 ## Features
 
@@ -81,9 +79,8 @@ reproduction script: [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
 - **OTLP tracing** — optional distributed trace export for orchestrator-level visibility
 - **Python bindings** — PyO3-backed, works with asyncio orchestrators
 - **Rust SDK** — async JSON-RPC client with typed request/response models
-- **`sg` CLI** — `sg worktree` creates per-agent sessions with zero-disk
-  copy-on-write working trees.  Use it any time you'd otherwise duplicate
-  the repo N times with `git worktree`.
+- **`sg` CLI** — `sg worktree` creates per-agent CoW sessions backed by one
+  physical baseline instead of N independent full-tree copies.
 - **`sg worktree`** — boots a minimal `.git/` so every git command works
   inside the session mount.  Auto-starts the daemon; no manual env var setup.
 - **Chaos-validated** — SLO gate suite covering disjoint commits, hotspot contention, transport faults, and abandon storms

@@ -107,6 +107,75 @@ the strongest win is many mostly-read sessions with sparse edits.
 - Use `SIMGIT_BACKEND=nfs` or Linux FUSE only when synchronous write-time
   conflict rejection is worth much higher per-operation latency.
 
+## Architecture tradeoffs
+
+| Approach | Read/metadata I/O | First-write I/O | Physical disk | Conflict timing | Main cost |
+|---|---|---|---|---|---|
+| Plain Git worktrees | Baseline | Baseline | `N × tree` | Git/ref conflicts | Full checkout per session |
+| Current native CoW | Near baseline | CoW extent split | `1 × baseline + changed extents + captured files` | Commit time | Baseline creation and duplicate capture |
+| Linux overlayfs | Small lookup/overlay tax | Whole-file copy-up can dominate | One lower + upper changes | Commit time | [Overlay semantics and copy-up](https://docs.kernel.org/filesystems/overlayfs.html) |
+| NFS/FUSE/WinFSP VFS | Highest per-op tax | Intercepted RPC/upcall | Git objects + deltas | Write time | Every filesystem operation crosses userspace |
+| Hardlink farm | Baseline | Unsafe without interception | Near one tree | None by itself | One writer can mutate every session |
+| Sparse/partial checkout | Baseline for present files | Baseline | Selected paths only | Git semantics | Requires knowing the working set; absent paths break general agents |
+
+The current CoW data path is already close to the useful lower bound for a
+general, fully materialized tree: files are ordinary local filesystem objects.
+The remaining first-write penalty is fundamental to block sharing—Apple
+[documents that clone modifications are written elsewhere while unchanged
+blocks remain shared](https://developer.apple.com/documentation/foundation/about-apple-file-system).
+Removing that penalty for every file requires allocating every file privately,
+which is the disk behavior simgit is intended to avoid.
+
+### Strongest next design: CoW-backed native Git worktrees
+
+A better commit/control plane can retain the same disk model while removing
+most simgit-specific commit I/O:
+
+1. Create a real Git linked worktree with `git worktree add --no-checkout`.
+2. Initialize its private index with `git read-tree HEAD`.
+3. Populate it from an immutable cached baseline with APFS clones/reflinks,
+   rather than asking Git to inflate every blob again.
+4. Keep Git's normal per-worktree `HEAD` and index, and share the object database
+   using Git's native common-dir mechanism (or alternates for standalone trees).
+5. In a pre-commit reservation, compute changed paths from the index/worktree,
+   fingerprint peers, and acquire simgit's path leases.
+6. Let native Git write blobs, trees, commits, and the unique branch ref. Avoid
+   copying changed files into the delta store and avoid the second flattening
+   worktree.
+7. Verify the pre/post fingerprint and release the lease; retain the existing
+   request-id recovery record for ambiguous outcomes.
+
+[Git documents linked worktrees](https://git-scm.com/docs/git-worktree.html) as
+sharing repository data while keeping per-worktree `HEAD` and index state, and
+[documents object alternates](https://git-scm.com/docs/gitrepository-layout) for
+borrowing immutable objects. This makes native Git the commit engine while
+simgit remains the isolation, conflict-reservation, lifecycle, and observability
+layer.
+
+Expected effects:
+
+- **Reads/stats:** should approach ordinary Git-worktree performance because the
+  paths are still normal local files. Matching Git is a realistic goal; beating
+  it consistently is not.
+- **Writes:** unmodified cloned files still pay the unavoidable first-write CoW
+  split. An optional `sg prepare-write <paths...>` can proactively make likely
+  write targets private in the background. That moves latency off the agent's
+  hot path while spending disk only on the predicted write set.
+- **Commits:** should improve materially by eliminating full-file delta copies,
+  duplicate local/daemon commits, and flatten worktrees.
+- **Disk:** remains approximately one baseline plus changed private extents and
+  Git's compressed objects, rather than N complete trees.
+
+The critical prototype gates are: native Git-command parity, safe lease cleanup
+when a hook fails, protection against writes racing the pre/post fingerprint,
+atomic unique-branch publication, and physical-disk measurements after sparse
+and dense edits.
+
+The basic filesystem/Git sequence has been smoke-tested locally: a no-checkout
+linked worktree plus `read-tree`, cloned baseline population, ordinary `git
+status`, native commit, and shared branch visibility all complete with a clean
+index before and after the commit.
+
 ## Reproduce
 
 ```bash

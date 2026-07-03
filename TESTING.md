@@ -146,9 +146,23 @@ python3 tests/stress/swarm_runner.py \
 - Exit code 0: all configured SLO gates passed
 - Non-zero exit code: at least one gate failed or execution error occurred
 
-### Final validated gate outcomes
+### Current default-CoW gate outcome (2026-07-02)
 
-Latest clean run achieved 5/5 passing:
+`tests/nightly-slo-gate.sh` ran 60 disjoint-range and 60 hotspot sessions with
+24 commit workers on macOS/APFS using the native CoW default:
+
+- disjoint success: 60/60
+- disjoint p95/p99: 3989/4621 ms (limits 8000/8500 ms)
+- hotspot success: 60/60
+- hotspot p95/p99: 4338/4577 ms (limits 6500/7000 ms)
+- unchanged peer-capture fingerprint hit rate: 96.7%
+
+These are phased harness end-to-end timings, including session-side commit
+jitter and client overhead. They are not per-file I/O measurements.
+
+### Historical VFS-era Track 2 gate outcome (2026-04-16)
+
+The original Track 2 run achieved 5/5 passing:
 
 - disjoint_success_rate_pct: 100.0 (threshold 100.0)
 - disjoint_commit_p95_ms: 7356 (threshold 12000.0)
@@ -156,7 +170,9 @@ Latest clean run achieved 5/5 passing:
 - fault_pass_rate_pct: 100.0 (threshold 66.7)
 - abandon_follow_up_success_rate_pct: 100.0 (threshold 100.0)
 
-See docs/track2_chaos_validation.md for interpretation and constraints.
+These numbers exercised the former VFS-first architecture and remain useful as
+fault/correctness evidence. Do not use them as a performance baseline for the
+current CoW default. See docs/track2_chaos_validation.md.
 
 ## Fault scenario contract
 
@@ -202,7 +218,7 @@ Minimum CI gate set:
 1. cargo test --workspace
 2. Linux FUSE integration suite (`.github/workflows/fuse-linux-integration.yml`) on every PR/push touching `simgitd/src/vfs`, `simgitd/src/borrow`, or `simgitd/src/delta` — this is the only suite that exercises write-time borrow-checking (see README “Platform support and guarantee scope”). It fails the run instead of skipping if `/dev/fuse` is unavailable on PR/push events.
 3. smoke run of tests/real_agent_harness.py with reduced agents
-4. nightly Track 2 swarm_runner execution with artifact upload (macOS backend; validates commit-time reconciliation, not write-time exclusivity)
+4. nightly CoW SLO gate plus periodic Track 2 fault battery with artifact upload
 5. threshold regression check against prior p95 baselines
 
 ## Failure triage checklist

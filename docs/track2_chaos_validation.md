@@ -2,6 +2,12 @@
 
 Date: 2026-04-16
 
+> Historical backend note: this report predates the native CoW default and
+> exercised the VFS-first implementation. Its fault, idempotency, and terminal-
+> state conclusions remain relevant; its latency values are not the current CoW
+> performance baseline. Current CoW measurements are in
+> `docs/scaling_benchmark.md` and `TESTING.md`.
+
 ## Objective
 
 Validate that simgitd remains correct and recoverable under production-like multi-agent timing jitter and transport faults, with explicit SLO gates.
@@ -67,7 +73,7 @@ Each scenario validates terminal-state correctness and daemon survivability, not
 - fault_pass_rate_pct: threshold 66.7
 - abandon_follow_up_success_rate_pct: threshold 100.0
 
-## Final clean-run outcomes
+## Historical clean-run outcomes
 
 All gates passed (5/5):
 
@@ -94,6 +100,8 @@ All gates passed (5/5):
 ## Known measurement nuance
 
 Harness p95 values represent end-to-end transaction windows, including simulated client think time (TTFT and stalls), not only daemon-internal processing latency.
+They also include the VFS backend characteristics that were current on
+2026-04-16 and should not be compared directly with the native CoW gate.
 
 ## Operational recommendations
 

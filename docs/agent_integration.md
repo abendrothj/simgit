@@ -5,8 +5,9 @@ This guide is for building production-grade agent runners on top of simgit using
 ## Drop-in worktree replacement — using simgit sessions like `git worktree add`
 
 `git worktree` duplicates the full working tree for each session.  simgit
-sessions share a single baseline and store only the files each agent
-actually changes — the working tree never touches disk.
+sessions materialize one baseline and create native copy-on-write trees from
+it. Unchanged file extents remain physically shared; each session allocates
+private blocks only as it writes.
 
 simgit sessions bootstrap a minimal `.git` directory at the mount root so that
 existing LLM coding agents that shell out to `git` work **without
@@ -38,7 +39,7 @@ root:
 | `.git/HEAD` → `base_commit` | Git knows what commit the session is on. |
 | `.git/objects/info/alternates` → real repo's object store | All blobs, trees, and commits are reachable without copying data. |
 | `.git/config` | Inherits `user.name`, `user.email`, `remote.origin.url`, and key `core.*`/`pull.*`/`push.*` values from the real repo. |
-| `.git/index` → one-time init via `git read-tree HEAD` | `git status` and `git diff` compare the working tree (served by the VFS overlay) against this baseline snapshot. No per-write updates needed — the VFS automatically serves delta versions for modified files, so git naturally sees them as "modified." |
+| `.git/index` → one-time init via `git read-tree HEAD` | `git status` and `git diff` compare the native CoW working tree against this baseline snapshot. Optional NFS/FUSE backends instead serve delta versions through a VFS overlay. |
 
 Six hooks handle the remaining integration. **Each hook embeds the daemon's
 socket path** so they work without any environment variables — `sg worktree
@@ -57,54 +58,53 @@ add` handles this automatically at session creation.
 
 | Command | Status | Notes |
 |---|---|---|
-| `git status` | ✓ | Working tree (VFS) vs index (baseline snapshot). Delta files appear as modified. |
+| `git status` | ✓ | Native CoW working tree vs index (baseline snapshot). Modified files appear normally. |
 | `git diff` | ✓ | Same comparison. |
 | `git diff --cached` | ✓ | Staging area vs HEAD. |
 | `git log` / `git blame` | ✓ | Objects via alternates, refs via symlink. |
 | `git show` | ✓ | Any commit reachable from the real repo. |
 | `git add` | ✓ | Idempotent — the VFS serves the written version, git sees the change. |
 | `git commit` | ✓ | Forwarded by pre-commit hook → `sg commit`. Hook returns 0 so the agent sees success. |
-| `git checkout <branch>` | ✓ | Resolves the branch via refs. Writes new working tree through VFS. Post-checkout hook updates the session's base commit and refreshes refs. Verified with full hash parity (working tree matches target tree exactly). |
-| `git checkout <file>` | ✓ | Restores file from index. VFS handles unlink/overwrite correctly. |
+| `git checkout <branch>` | ✓ | Resolves the branch via refs and updates the private working tree. Post-checkout updates the daemon's base commit. Verified with full hash parity. |
+| `git checkout <file>` | ✓ | Restores the file from the index in the private working tree. |
 | `git cherry-pick` | ✓ | Applies commits via checkout + write path. |
 | `git push` / `git fetch` | ✓ | Remote URL in `.git/config`. Refs update through the local refs copy. |
 | `git merge` / `git rebase` | ✓ | Git resolves refs, performs operation, writes through VFS. Post-merge / post-rewrite hooks notify the daemon. |
 | `git commit --amend` | ✓ | Post-rewrite hook notifies the daemon of the new HEAD. |
 | `git stash` | ✓ | Stash refs are stored under the local `refs/stash`. Create/overwrite semantics support stash pop. |
 | `git bisect` | ✓ | Git checks out commits, each firing the post-checkout hook. |
-| `git clean` | ✓ | Removes untracked files. VFS replaces with zero-byte blob (NFS negative-cache workaround). |
+| `git clean` | ✓ | Removes untracked files normally. The optional NFS backend has a documented negative-cache workaround. |
 
 ### Session isolation
 
-The `.git/refs` is a copy of the shared real repo's refs, but **all writes go
-through the per-session VFS handler**.  Two agents doing `git checkout` in
-parallel don't touch each other's files — the VFS intercepts every write and
-routes it to the per-session `DeltaStore` after consulting `BorrowRegistry`.
-The refs copy is read-only metadata; it can't modify another session's working
-tree.
+The `.git/refs` is a copy of the shared real repo's refs. With the default CoW
+backend, agents write directly through the kernel into distinct private trees;
+overlaps are reconciled at commit. The optional NFS/FUSE/WinFSP backends route
+writes through `BorrowRegistry` for synchronous rejection instead. In either
+mode, one session cannot mutate another session's working tree.
 
 ### When to use simgit vs git worktree
 
 - **Using `git worktree` directly** → simpler, no daemon.  Fine for one or two
   sessions.
 - **Using `sg worktree`** → any time you'd otherwise have N copies of the
-  working tree on disk.  The more agents, the more simgit's zero-disk CoW
-  model pays off.
+  working tree on disk. The more mostly-read, sparsely edited sessions, the
+  more one-baseline CoW pays off.
 
 ### Why sessions aren't git worktrees
 
 simgit sessions are **not** registered as `git worktree` entries in the real
 repo's `.git/worktrees/`.  This is intentional:
 
-- **`git worktree list` won't show simgit sessions**.  Each session is a
-  standalone VFS mount with its own synthetic `.git/` directory.  The real
-  repo is unaware of sessions.
-- **No disk overhead**.  Real worktrees duplicate the full working tree on
-  disk (N worktrees × repo size).  simgit sessions consume zero baseline disk
-  and store only the files the agent actually writes (copy-on-write deltas).
-- **No checkout penalty**.  Sessions are created in microseconds.  There is
-  no `git checkout` — the VFS serves files on-demand from the git object
-  store.
+- **`git worktree list` won't show simgit sessions**. Each session has an
+  independent working tree and synthetic `.git/`; the real repo is unaware of
+  its lifecycle.
+- **Shared physical baseline**. Real worktrees allocate approximately N full
+  trees. simgit allocates one baseline, shared session extents, private changed
+  blocks, and captured changed-file data.
+- **Amortized setup**. The first session pays for daemon startup and baseline
+  materialization; later sessions use native clone/reflink creation. Git is
+  generally faster at low fan-out, while simgit can cross over at higher N.
 
 The tradeoff is that tooling expecting `git worktree list` or `.git/worktrees/`
 entries won't discover simgit sessions.  Use `sg session list` instead.
@@ -257,7 +257,11 @@ source .venv/bin/activate
 python3 tests/real_agent_harness.py --agents 20 --task-profile disjoint-files
 ```
 
-Track 2 chaos validation ran 20 concurrent disjoint agents and 20 concurrent hotspot agents with 100% commit success rate and p95 commit latency well within SLO thresholds. See `docs/track2_chaos_validation.md` for full results.
+The original Track 2 chaos validation ran against the VFS-era backend and is
+retained as historical correctness/fault evidence, not a CoW latency baseline.
+The current default-CoW nightly gate ran 60 disjoint and 60 hotspot agents with
+100% success; p95 was 3989 ms and 4338 ms respectively. See
+`docs/track2_chaos_validation.md` and `docs/scaling_benchmark.md`.
 
 ## Integration model
 
