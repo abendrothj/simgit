@@ -126,10 +126,17 @@ impl GitProxy {
         }
 
         // Write the current branch ref so the session has a local HEAD ref.
+        // Branch names may contain slashes (e.g. `feat/foo`), which map to
+        // nested directories under refs/heads — create the ref file's parent,
+        // not just refs/heads, or the write ENOENTs for any slashed branch.
         if let Some(branch) = initial_branch {
-            let branch_ref_dir = session_refs.join("heads");
-            fs::create_dir_all(&branch_ref_dir)?;
-            fs::write(branch_ref_dir.join(branch), format!("{base_commit}\n"))?;
+            let branch_ref = session_refs.join("heads").join(branch);
+            if let Some(parent) = branch_ref.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create branch ref dir {}", parent.display()))?;
+            }
+            fs::write(&branch_ref, format!("{base_commit}\n"))
+                .with_context(|| format!("write branch ref {}", branch_ref.display()))?;
         }
 
         // ── alternates ────────────────────────────────────────────────────
@@ -525,6 +532,38 @@ mod tests {
         // refs should exist as a directory (copied from real repo)
         let refs = mount.join(".git").join("refs");
         assert!(refs.exists() && refs.is_dir(), "refs should be a directory");
+    }
+
+    #[test]
+    fn bootstrap_handles_slashed_branch_name() {
+        // Branch names with slashes (e.g. `feat/foo`) map to nested dirs under
+        // refs/heads; bootstrap must create the ref file's parent, not just
+        // refs/heads, or the write ENOENTs and session creation fails.
+        let repo = temp_dir();
+        init_git_repo(&repo);
+        let base = create_and_commit(&repo, "hello.txt", "hello\n");
+
+        let mount = temp_dir();
+        GitProxy::bootstrap(
+            &mount,
+            &mount,
+            &std::path::PathBuf::from("/tmp/simgit-test.port"),
+            &std::path::PathBuf::from("/tmp/sg"),
+            &base,
+            &repo,
+            Some("feat/deep/branch"),
+            Uuid::now_v7(),
+        )
+        .expect("bootstrap should succeed for a slashed branch name");
+
+        let ref_file = mount
+            .join(".git")
+            .join("refs")
+            .join("heads")
+            .join("feat")
+            .join("deep")
+            .join("branch");
+        assert!(ref_file.exists(), "nested branch ref file should be written");
     }
 
     #[test]
