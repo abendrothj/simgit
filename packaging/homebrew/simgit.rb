@@ -9,7 +9,7 @@ class Simgit < Formula
   desc "Cheap, isolated copy-on-write Git worktrees for running many agents at once"
   homepage "https://github.com/abendrothj/simgit"
   url "https://github.com/abendrothj/simgit/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "REPLACE_WITH_RELEASE_TARBALL_SHA256"
+  sha256 "789a540160fbb3b318b5c6f6b116d296116fcfc3c3f5714de9a4c9cb974827c8"
   license "MIT"
   head "https://github.com/abendrothj/simgit.git", branch: "main"
 
