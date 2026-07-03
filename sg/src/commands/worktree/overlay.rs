@@ -4,6 +4,8 @@ use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 const OVERLAY_MARKER: &str = "simgit-overlay";
 
@@ -205,8 +207,26 @@ pub(super) fn repair(repo: &RepoContext, worktree: &Path) -> Result<bool> {
     let Some(state) = state(repo, worktree) else {
         return Ok(false);
     };
-    if is_mounted(worktree) {
+    if is_mounted(worktree) && worktree.join(".git").is_file() {
         return Ok(false);
+    }
+    if is_mounted(worktree) {
+        // FUSE can leave a disconnected mount-table entry after an interrupted
+        // or lazy unmount. Detach that stale entry before mounting the saved
+        // upperdir again.
+        unmount(worktree);
+        for _ in 0..40 {
+            if !is_mounted(worktree) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if is_mounted(worktree) {
+            bail!(
+                "stale overlay mount could not be detached: {}",
+                worktree.display()
+            );
+        }
     }
     let lower = state.lower.context(
         "overlay was created by v0.1.2 and lacks recovery metadata; remove and recreate it",
