@@ -45,6 +45,14 @@ pub struct DeltaManifest {
     /// directories explicitly created via mkdir (synthetic, no git tree entry).
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub dirs: HashSet<PathBuf>,
+    /// Paths that were deleted but are still served as a zero-length blob at
+    /// the mount (the NFS backend does this to avoid macOS negative-name-cache
+    /// interference with create-after-delete). Unlike `deletes`, the path stays
+    /// in `writes` (empty) so LOOKUP keeps succeeding; `flatten` treats a
+    /// tombstoned path as a deletion so the committed tree is correct. Cleared
+    /// by `write_blob` when the path is written again (recreated).
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub tombstones: HashSet<PathBuf>,
 }
 
 pub struct DeltaStore {
@@ -232,6 +240,7 @@ impl DeltaStore {
 
             let mut manifest = self.load_manifest_unlocked(session_id)?;
             manifest.deletes.remove(path);
+            manifest.tombstones.remove(path);
             manifest.writes.insert(path.to_owned(), hash.clone());
             match range {
                 Some(r) => manifest.ranges.entry(path.to_owned()).or_default().push(r),
@@ -286,7 +295,21 @@ impl DeltaStore {
         self.with_session_lock(session_id, || {
             let mut manifest = self.load_manifest_unlocked(session_id)?;
             manifest.writes.remove(path);
+            manifest.tombstones.remove(path);
             manifest.deletes.insert(path.to_owned());
+            self.write_manifest(session_id, &manifest)
+        })
+    }
+
+    /// Mark `path` as a tombstone: deleted for commit purposes, but still
+    /// served as a zero-length blob at the mount so LOOKUP keeps succeeding.
+    /// The caller is expected to have already written an empty blob for `path`
+    /// via [`write_blob`]. Used by the NFS backend to get correct delete
+    /// semantics at commit without tripping the macOS negative-name cache.
+    pub fn mark_tombstone(&self, session_id: Uuid, path: &Path) -> Result<()> {
+        self.with_session_lock(session_id, || {
+            let mut manifest = self.load_manifest_unlocked(session_id)?;
+            manifest.tombstones.insert(path.to_owned());
             self.write_manifest(session_id, &manifest)
         })
     }

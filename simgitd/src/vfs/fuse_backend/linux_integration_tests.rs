@@ -106,6 +106,9 @@ async fn fuse_mount_roundtrip_create_unlink_rename() {
         mount_path: mount_path.clone(),
         branch_name: None,
         peers_enabled: false,
+        git_proxy_enabled: false,
+        initial_branch: None,
+        socket_path: std::path::PathBuf::new(),
     };
 
     backend.mount(&session).await.expect("mount");
@@ -172,6 +175,9 @@ async fn fuse_mount_can_remount_same_session_path() {
         mount_path: mount_path.clone(),
         branch_name: None,
         peers_enabled: false,
+        git_proxy_enabled: false,
+        initial_branch: None,
+        socket_path: std::path::PathBuf::new(),
     };
 
     backend.mount(&session).await.expect("first mount");

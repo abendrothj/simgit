@@ -712,11 +712,19 @@ impl SessionVfsOps for SessionFs {
             .acquire_write(self.session_id, &path, Some(self.cfg.lock_ttl_seconds))
             .map_err(VfsOpError::from)?;
 
-        // Write a zero-length blob instead of mark_deleted to avoid
-        // negative-cache interference with subsequent CREATE operations
-        // (same fix as NFS backend).
+        // Record a real deletion (whiteout) so the file disappears instead of
+        // lingering as an empty file — correct POSIX/git semantics (`rm x`
+        // followed by commit produces a deletion, not an empty blob).
+        //
+        // This is safe on FUSE: a NotFound lookup is returned via
+        // `reply.error(ENOENT)`, and the Linux kernel does not negatively cache
+        // FUSE lookups unless the mount sets `negative_timeout` (we don't). So a
+        // subsequent CREATE at the same path still reaches us, and `create()`
+        // clears the delete marker via `write_blob`. (The NFS backend keeps the
+        // empty-blob approach because the macOS NFS client *does* negatively
+        // cache — see the comment in `nfs_backend::unlink`.)
         self.deltas
-            .write_blob(self.session_id, &path, &[], None)
+            .mark_deleted(self.session_id, &path)
             .map_err(|_| VfsOpError::Io)?;
         Ok(())
     }
@@ -804,12 +812,20 @@ impl SessionVfsOps for SessionFs {
         self.deltas
             .write_blob(self.session_id, &new_path, &source_data, None)
             .map_err(|_| VfsOpError::Io)?;
+        // Remove the source with a real deletion marker (not an empty blob) so
+        // the old name disappears rather than lingering as an empty file. Safe
+        // on FUSE for the same reason as `unlink` (no negative lookup caching).
         self.deltas
-            .write_blob(self.session_id, &old_path, &[], None)
+            .mark_deleted(self.session_id, &old_path)
             .map_err(|_| VfsOpError::Io)?;
         let _ = self
             .deltas
             .record_rename(self.session_id, &old_path, &new_path);
+        // The kernel reuses the source inode for the destination name, so
+        // repoint it at the moved content (now delta-backed) or reads through
+        // that inode would hit the deleted source path.
+        self.inode_map
+            .remap_after_rename(&old_path, &new_path, source_data.len() as u64, 0o100644);
         Ok(())
     }
 
@@ -1071,25 +1087,44 @@ mod tests {
     }
 
     #[test]
-    fn unlink_truncates_file_to_empty() {
+    fn unlink_removes_file() {
         let repo = init_repo_with_file();
         let fs = new_session_fs(&repo);
 
         SessionVfsOps::unlink(&fs, 1, "hello.txt").expect("unlink should succeed");
 
-        // After unlink, the file still resolves (zero-length blob to avoid
-        // NFS negative-cache interference with subsequent CREATE).
-        let ino = SessionVfsOps::lookup(&fs, 1, "hello.txt")
-            .expect("unlinked file should still resolve (zero-length blob)");
-        let data = SessionVfsOps::read(&fs, ino, 0, 1024)
-            .expect("unlinked file should be readable");
-        assert!(data.is_empty(), "unlinked file should be empty");
+        // After unlink the baseline file is whited out — it must no longer
+        // resolve (correct POSIX/git semantics: the file is gone, not empty).
+        let err = SessionVfsOps::lookup(&fs, 1, "hello.txt")
+            .expect_err("unlinked file should no longer resolve");
+        assert!(matches!(err, VfsOpError::NotFound));
 
         let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
-    fn rename_moves_delta_content_and_truncates_old_name() {
+    fn create_after_unlink_recreates_file() {
+        // Guards against negative-cache-style regressions at the delta-store
+        // level: after a real deletion, CREATE + WRITE at the same path must
+        // resurrect the file with fresh content (the delete marker is cleared).
+        let repo = init_repo_with_file();
+        let fs = new_session_fs(&repo);
+
+        SessionVfsOps::unlink(&fs, 1, "hello.txt").expect("unlink should succeed");
+        let id =
+            SessionVfsOps::create(&fs, 1, "hello.txt", 0o100644).expect("recreate should succeed");
+        SessionVfsOps::write(&fs, id, 0, b"reborn").expect("write should succeed");
+
+        let ino = SessionVfsOps::lookup(&fs, 1, "hello.txt")
+            .expect("recreated file should resolve again");
+        let data = SessionVfsOps::read(&fs, ino, 0, 100).expect("read should succeed");
+        assert_eq!(data, b"reborn");
+
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rename_moves_delta_content_and_removes_old_name() {
         let repo = init_repo_with_file();
         let fs = new_session_fs(&repo);
 
@@ -1098,12 +1133,10 @@ mod tests {
 
         SessionVfsOps::rename(&fs, 1, "new.txt", 1, "renamed.txt").expect("rename should succeed");
 
-        // Old name still resolves (zero-length blob to avoid NFS negative
-        // cache), but its content is empty.
-        let old_id = SessionVfsOps::lookup(&fs, 1, "new.txt")
-            .expect("old name should still resolve (zero-length blob)");
-        let old_data = SessionVfsOps::read(&fs, old_id, 0, 100).expect("read should succeed");
-        assert!(old_data.is_empty(), "old file should be empty after rename");
+        // The old name is gone after the rename.
+        let err = SessionVfsOps::lookup(&fs, 1, "new.txt")
+            .expect_err("old name should no longer resolve after rename");
+        assert!(matches!(err, VfsOpError::NotFound));
 
         let renamed_id =
             SessionVfsOps::lookup(&fs, 1, "renamed.txt").expect("new name should resolve");

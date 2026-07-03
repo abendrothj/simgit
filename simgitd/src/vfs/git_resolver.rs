@@ -483,6 +483,49 @@ impl InodeMap {
         }
     }
 
+    /// Repoint any inode currently mapped to `from` so that it refers to `to`,
+    /// backed by the delta store.
+    ///
+    /// FUSE `rename` reuses the *source* inode number for the destination name,
+    /// so after a rename the kernel keeps issuing `getattr`/`read` against the
+    /// original inode while expecting it to serve the moved file. Without this
+    /// remap that inode still points at the (now-deleted) source path and reads
+    /// fail. A tree-backed source inode becomes delta-backed because the moved
+    /// content lives in the session's delta store.
+    pub fn remap_after_rename(&self, from: &Path, to: &Path, size: u64, perm: u16) {
+        let tree_inos: Vec<u64> = {
+            let map = self.map.lock().unwrap();
+            map.iter()
+                .filter(|(_, e)| e.path == from)
+                .map(|(i, _)| *i)
+                .collect()
+        };
+        for ino in tree_inos {
+            self.map.lock().unwrap().remove(&ino);
+            self.delta_files.lock().unwrap().insert(ino, DeltaInodeFile {
+                path: to.to_path_buf(),
+                size,
+                perm,
+            });
+        }
+
+        let delta_inos: Vec<u64> = {
+            let deltas = self.delta_files.lock().unwrap();
+            deltas
+                .iter()
+                .filter(|(_, e)| e.path == from)
+                .map(|(i, _)| *i)
+                .collect()
+        };
+        for ino in delta_inos {
+            if let Some(meta) = self.delta_files.lock().unwrap().get_mut(&ino) {
+                meta.path = to.to_path_buf();
+                meta.size = size;
+                meta.perm = perm;
+            }
+        }
+    }
+
     pub fn path_of(&self, ino: u64) -> Option<PathBuf> {
         if let Some(p) = self.map.lock().unwrap().get(&ino).map(|e| e.path.clone()) {
             return Some(p);

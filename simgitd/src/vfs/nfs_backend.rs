@@ -678,15 +678,20 @@ impl SessionVfsOps for NfsSession {
             .acquire_write(self.session_id, &path, Some(self.cfg.lock_ttl_seconds))
             .map_err(VfsOpError::from)?;
 
-        // Write a zero-length blob instead of marking deleted.  If we add
-        // the path to manifest.deletes, the next LOOKUP returns NFS3ERR_NOENT
-        // and macOS's NFS client caches that negative result — causing
-        // subsequent CREATE (O_CREAT after O_TRUNC) to fail because the
-        // client never sends the CREATE RPC.  By keeping the path in
-        // manifest.writes with empty content, LOOKUP succeeds and CREATE
-        // can overwrite without negative-cache interference.
+        // On macOS NFS a real deletion (removing the path so LOOKUP returns
+        // NFS3ERR_NOENT) is negatively cached by the client even under
+        // `actimeo=0` — a subsequent CREATE (O_CREAT after O_TRUNC, as `git
+        // checkout` does) then never reaches the server. So keep the path
+        // LOOKUP-able as a zero-length blob, but record a tombstone so the
+        // commit still applies a real git deletion. (The FUSE/WinFSP backends
+        // can use `mark_deleted` directly because FUSE doesn't negatively cache
+        // lookups.) Verified through a live mount: `rm x` commits as a deletion
+        // *and* create-after-delete still works.
         self.deltas
             .write_blob(self.session_id, &path, &[], None)
+            .map_err(|_| VfsOpError::Io)?;
+        self.deltas
+            .mark_tombstone(self.session_id, &path)
             .map_err(|_| VfsOpError::Io)?;
         Ok(())
     }
@@ -776,8 +781,14 @@ impl SessionVfsOps for NfsSession {
         self.deltas
             .write_blob(self.session_id, &new_path, &source_data, None)
             .map_err(|_| VfsOpError::Io)?;
+        // Tombstone the source (empty blob + tombstone) rather than a real
+        // delete — same macOS NFS negative-cache constraint as `unlink`. The
+        // commit still drops the old name via the tombstone.
         self.deltas
             .write_blob(self.session_id, &old_path, &[], None)
+            .map_err(|_| VfsOpError::Io)?;
+        self.deltas
+            .mark_tombstone(self.session_id, &old_path)
             .map_err(|_| VfsOpError::Io)?;
         let _ = self
             .deltas

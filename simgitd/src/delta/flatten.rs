@@ -152,8 +152,9 @@ fn flatten_gix_tree_construction(
     let step_started = std::time::Instant::now();
     let objects_dir = delta_store_root.join(session_id.to_string()).join("objects");
 
-    // Deletes.
-    for del in &manifest.deletes {
+    // Deletes — includes tombstones (paths kept as empty blobs at the mount for
+    // NFS negative-cache reasons but semantically deleted for the commit).
+    for del in manifest.deletes.iter().chain(manifest.tombstones.iter()) {
         validate_manifest_path(del)?;
         let del_path = del.to_string_lossy().to_string();
         editor.remove(&del_path).map_err(|err| FlattenError::GitCommand {
@@ -196,6 +197,11 @@ fn flatten_gix_tree_construction(
 
     // Writes.
     for (rel_path, hash) in &manifest.writes {
+        // Tombstoned paths are kept in `writes` as empty blobs for the live
+        // mount, but were removed above — don't resurrect them in the tree.
+        if manifest.tombstones.contains(rel_path) {
+            continue;
+        }
         validate_manifest_path(rel_path)?;
         let bucket = &hash[..2];
         let blob_path = objects_dir.join(bucket).join(&hash[2..]);
@@ -426,6 +432,7 @@ mod tests {
             renames: vec![(Path::new("move.txt").to_path_buf(), Path::new("moved.txt").to_path_buf())],
             ranges: HashMap::new(),
             dirs: HashSet::new(),
+            tombstones: HashSet::new(),
         };
 
         let result = flatten(
@@ -451,6 +458,72 @@ mod tests {
             .status()
             .expect("git cat-file should execute");
         assert!(!deleted.success(), "delete.txt should not exist in flattened branch");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gix_flatten_treats_tombstone_as_deletion() {
+        // A tombstoned path is kept in `writes` as an empty blob (so the NFS
+        // mount's LOOKUP keeps succeeding) but must commit as a deletion. A
+        // path that was tombstoned then recreated is not in `tombstones` and
+        // must commit with its new content.
+        let root = std::env::temp_dir().join(format!("simgit-flatten-tomb-{}", uuid::Uuid::now_v7()));
+        let repo = root.join("repo");
+        let delta_root = root.join("deltas");
+        fs::create_dir_all(&repo).expect("create repo");
+        fs::create_dir_all(&delta_root).expect("create deltas");
+
+        run_git_ok(&repo, &["init"]);
+        run_git_ok(&repo, &["config", "user.email", "tests@simgit.local"]);
+        run_git_ok(&repo, &["config", "user.name", "simgit-tests"]);
+        fs::write(repo.join("tomb.txt"), b"delete-me\n").expect("write tomb");
+        fs::write(repo.join("reborn.txt"), b"old\n").expect("write reborn");
+        run_git_ok(&repo, &["add", "."]);
+        run_git_ok(&repo, &["commit", "-m", "base"]);
+
+        let base = run_git_stdout(&repo, &["rev-parse", "HEAD"]);
+        let sid = uuid::Uuid::now_v7();
+
+        // Both paths are in `writes` as empty blobs (mount state after delete);
+        // reborn.txt then gets real content written (recreate clears tombstone).
+        let mut writes = HashMap::new();
+        writes.insert(
+            Path::new("tomb.txt").to_path_buf(),
+            write_delta_blob(&delta_root, sid, b""),
+        );
+        writes.insert(
+            Path::new("reborn.txt").to_path_buf(),
+            write_delta_blob(&delta_root, sid, b"new-content\n"),
+        );
+
+        let mut tombstones = HashSet::new();
+        tombstones.insert(Path::new("tomb.txt").to_path_buf());
+
+        let manifest = DeltaManifest {
+            base_commit: base.clone(),
+            writes,
+            deletes: HashSet::new(),
+            renames: Vec::new(),
+            ranges: HashMap::new(),
+            dirs: HashSet::new(),
+            tombstones,
+        };
+
+        flatten(&repo, &base, &manifest, &delta_root, sid, "simgit/tomb", "tombstone test")
+            .expect("gix flatten should succeed");
+
+        // tomb.txt removed; reborn.txt present with new content (not empty).
+        let tomb_exists = std::process::Command::new("git")
+            .current_dir(&repo)
+            .args(["cat-file", "-e", "refs/heads/simgit/tomb:tomb.txt"])
+            .status()
+            .expect("git cat-file should execute");
+        assert!(!tomb_exists.success(), "tombstoned path should be deleted in commit");
+        assert_eq!(
+            run_git_stdout(&repo, &["show", "refs/heads/simgit/tomb:reborn.txt"]),
+            "new-content"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -487,6 +560,7 @@ mod tests {
             renames: Vec::new(),
             ranges: HashMap::new(),
             dirs: HashSet::new(),
+            tombstones: HashSet::new(),
         };
 
         let _ = flatten(

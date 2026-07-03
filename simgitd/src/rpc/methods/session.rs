@@ -279,6 +279,7 @@ fn changed_paths_set(manifest: &crate::delta::store::DeltaManifest) -> BTreeSet<
     let mut out = BTreeSet::new();
     out.extend(manifest.writes.keys().cloned());
     out.extend(manifest.deletes.iter().cloned());
+    out.extend(manifest.tombstones.iter().cloned());
     for (from, to) in &manifest.renames {
         out.insert(from.clone());
         out.insert(to.clone());
@@ -292,9 +293,14 @@ pub(super) fn changed_path_ops(
     let mut out: std::collections::BTreeMap<PathBuf, BTreeSet<&'static str>> =
         std::collections::BTreeMap::new();
     for path in manifest.writes.keys() {
+        // Tombstoned paths sit in `writes` as empty blobs but are semantically
+        // deletions — report them only as such, below.
+        if manifest.tombstones.contains(path) {
+            continue;
+        }
         out.entry(path.clone()).or_default().insert("write");
     }
-    for path in &manifest.deletes {
+    for path in manifest.deletes.iter().chain(manifest.tombstones.iter()) {
         out.entry(path.clone()).or_default().insert("delete");
     }
     for (from, to) in &manifest.renames {
