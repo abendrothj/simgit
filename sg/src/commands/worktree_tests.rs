@@ -185,6 +185,22 @@ fn overlay_marker_round_trips_through_common_admin_dir() -> Result<()> {
 }
 
 #[test]
+fn overlay_health_requires_the_view_to_reflect_upperdir_data() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("simgit-overlay-health-{}", Uuid::new_v4()));
+    let upper = root.join("upper");
+    let view = root.join("view");
+    fs::create_dir_all(upper.join("nested"))?;
+    fs::create_dir_all(view.join("nested"))?;
+    fs::write(upper.join("nested/result.txt"), "agent result")?;
+    fs::write(view.join("nested/result.txt"), "agent result")?;
+    assert!(overlay::upper_visible(&upper, &view));
+    fs::write(view.join("nested/result.txt"), "stale result")?;
+    assert!(!overlay::upper_visible(&upper, &view));
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
 fn native_worktree_fallback_is_clean_and_registered() -> Result<()> {
     let fixture = Fixture::new()?;
     let repo = discover_repo(&fixture.repo)?;

@@ -207,7 +207,8 @@ pub(super) fn repair(repo: &RepoContext, worktree: &Path) -> Result<bool> {
     let Some(state) = state(repo, worktree) else {
         return Ok(false);
     };
-    if is_mounted(worktree) && worktree.join(".git").is_file() {
+    let upper = state.overlay_dir.join("upper");
+    if is_mounted(worktree) && upper_visible(&upper, worktree) {
         return Ok(false);
     }
     if is_mounted(worktree) {
@@ -234,7 +235,6 @@ pub(super) fn repair(repo: &RepoContext, worktree: &Path) -> Result<bool> {
     if !lower.is_dir() {
         bail!("overlay baseline is missing: {}", lower.display());
     }
-    let upper = state.overlay_dir.join("upper");
     let work = state.overlay_dir.join("work");
     if !upper.is_dir() || !work.is_dir() {
         bail!(
@@ -249,4 +249,40 @@ pub(super) fn repair(repo: &RepoContext, worktree: &Path) -> Result<bool> {
         bail!("repaired overlay does not expose its Git worktree metadata");
     }
     Ok(true)
+}
+
+/// A FUSE mount can remain listed after its userspace connection is gone. A
+/// healthy overlay must expose every normal upperdir entry through the merged
+/// view. Overlay whiteout/special entries are intentionally ignored here.
+pub(super) fn upper_visible(upper: &Path, view: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(upper) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let upper_path = entry.path();
+        let view_path = view.join(entry.file_name());
+        let Ok(kind) = entry.file_type() else {
+            return false;
+        };
+        if kind.is_dir() {
+            if !view_path.is_dir() || !upper_visible(&upper_path, &view_path) {
+                return false;
+            }
+        } else if kind.is_file() {
+            let matches = fs::read(&upper_path)
+                .and_then(|expected| fs::read(&view_path).map(|actual| actual == expected))
+                .unwrap_or(false);
+            if !matches {
+                return false;
+            }
+        } else if kind.is_symlink() {
+            let matches = fs::read_link(&upper_path)
+                .and_then(|expected| fs::read_link(&view_path).map(|actual| actual == expected))
+                .unwrap_or(false);
+            if !matches {
+                return false;
+            }
+        }
+    }
+    true
 }
