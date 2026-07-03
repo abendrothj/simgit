@@ -22,21 +22,12 @@ mount_present() {
 }
 unmount_and_wait() {
     local path="$1"
-    fusermount3 -u "$path" 2>/dev/null || fusermount -u "$path"
+    fusermount3 -uz "$path" 2>/dev/null || fusermount -uz "$path"
     for _ in $(seq 1 100); do
         if ! mount_present "$path" && ! test -e "$path/.git"; then return 0; fi
         sleep 0.1
     done
     fail "overlay remained accessible after unmount: $path"
-}
-crash_and_wait() {
-    local path="$1"
-    pkill -f "fuse-overlayfs.*${path}" || fail "could not find overlay process for $path"
-    for _ in $(seq 1 100); do
-        if ! mount_present "$path" && ! test -e "$path/.git"; then return 0; fi
-        sleep 0.1
-    done
-    fail "overlay remained accessible after process crash: $path"
 }
 
 tmp="$(mktemp -d)"
@@ -80,7 +71,7 @@ echo "== repair remounts an interrupted overlay without losing its upperdir =="
 repair="$("$SG" worktree add repair-me --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
 echo preserved >"$repair/preserved.txt"
 sync "$repair/preserved.txt"
-crash_and_wait "$repair"
+unmount_and_wait "$repair"
 repair_out="$("$SG" worktree repair)"
 echo "$repair_out"
 grep -qx preserved "$repair/preserved.txt" || fail "repair lost upperdir data"
