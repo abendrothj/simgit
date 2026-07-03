@@ -60,13 +60,15 @@ add` handles this automatically at session creation.
 | `git show` | ✓ | Any commit reachable from the real repo. |
 | `git add` | ✓ | Idempotent — the VFS serves the written version, git sees the change. |
 | `git commit` | ✓ | Forwarded by pre-commit hook → `sg commit`. Hook returns 0 so the agent sees success. |
-| `git checkout <branch>` | ✓ | Resolves the branch via refs. Writes new working tree through VFS. Post-checkout hook updates the session's base commit. |
+| `git checkout <branch>` | ✓ | Resolves the branch via refs. Writes new working tree through VFS. Post-checkout hook updates the session's base commit and refreshes refs. Verified with full hash parity (working tree matches target tree exactly). |
+| `git checkout <file>` | ✓ | Restores file from index. VFS handles unlink/overwrite correctly. |
+| `git cherry-pick` | ✓ | Applies commits via checkout + write path. |
 | `git push` / `git fetch` | ✓ | Remote URL in `.git/config`. Refs update through the local refs copy. |
 | `git merge` / `git rebase` | ✓ | Git resolves refs, performs operation, writes through VFS. Post-merge / post-rewrite hooks notify the daemon. |
 | `git commit --amend` | ✓ | Post-rewrite hook notifies the daemon of the new HEAD. |
-| `git stash` | ✓ | Stash refs are stored under the symlinked `refs/stash`. |
+| `git stash` | ✓ | Stash refs are stored under the local `refs/stash`. Create/overwrite semantics support stash pop. |
 | `git bisect` | ✓ | Git checks out commits, each firing the post-checkout hook. |
-| `git clean` | ✓ | Works against the VFS-served working tree. |
+| `git clean` | ✓ | Removes untracked files. VFS replaces with zero-byte blob (NFS negative-cache workaround). |
 
 ### Session isolation
 
