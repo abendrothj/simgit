@@ -116,13 +116,14 @@ platform and latency costs.
 |---|---|---|
 | macOS on APFS | `cp -c` clonefile | CoW disk sharing |
 | Linux on reflink-capable Btrfs/XFS | `cp --reflink=always` | CoW disk sharing |
-| Linux without reflinks | capability probe fails | normal Git checkout fallback |
-| Windows | no clone implementation yet | normal Git checkout fallback |
+| Linux without reflinks + `fuse-overlayfs` | shared lowerdir + per-worktree upperdir | CoW disk sharing |
+| Linux without reflinks or `fuse-overlayfs` | capability probes fail | normal Git checkout fallback |
+| Windows | intentionally unsupported (ordinary NTFS lacks the required general reflink primitive) | use Git worktrees or WSL |
 
 Use `sg worktree add --require-cow ...` in automation when falling back to N
 full checkouts would violate a disk budget. Baselines unused for seven days are
-pruned opportunistically; `sg worktree prune --all` removes them immediately
-without invalidating existing worktrees.
+removed by `sg worktree prune`; active overlay lowerdirs remain protected even
+with `--all`.
 
 ## Historical benchmark note
 

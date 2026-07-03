@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+name="${1:?agent name required}"
+printf 'agent %s: working in %s\n' "$name" "$(basename "$PWD")"
+sleep 0.4
+printf 'result from %s\n' "$name" >"$name.txt"
+git add "$name.txt"
+git commit -qm "agent: $name"
+printf 'agent %s: committed\n' "$name"

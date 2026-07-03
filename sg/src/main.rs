@@ -6,7 +6,7 @@
 //! to an ordinary `git checkout` when the filesystem can't clone.
 //!
 //! It has no daemon and no server: Git owns the refs, the filesystem owns the
-//! data. Agents work in isolated worktrees in parallel and integrate through
+//! data. Agents work in separate Git worktrees in parallel and integrate through
 //! normal Git merges.
 //!
 //! ## Commands
@@ -16,14 +16,17 @@
 //! - `sg worktree list` — list worktrees
 //! - `sg worktree remove <branch|path>` — remove a worktree (optionally
 //!   committing first)
-//! - `sg worktree gc` — reap idle/ephemeral worktrees (abandoned agent sandboxes)
+//! - `sg worktree run <branch> -- <command>` — create an ephemeral worktree and
+//!   launch a command inside it
+//! - `sg worktree gc` — reap idle/ephemeral worktrees and optionally branches
+//! - `sg worktree repair` — remount interrupted Linux overlay worktrees
 //! - `sg worktree prune` — prune stale worktree administrative entries
 //!
 //! ## Example
 //!
 //! ```bash
 //! # Create a linked worktree and cd into it
-//! cd $(sg worktree add feature-1)
+//! cd "$(sg worktree add feature-1)"
 //!
 //! git add <files>
 //! git commit -m "feature work"

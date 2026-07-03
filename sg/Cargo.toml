@@ -1,6 +1,6 @@
 [package]
 name        = "simgit-cli"
-description = "sg — cheap, isolated copy-on-write Git worktrees for running many agents at once"
+description = "sg — disk-efficient copy-on-write Git worktrees for running many agents at once"
 version.workspace     = true
 edition.workspace     = true
 license.workspace     = true

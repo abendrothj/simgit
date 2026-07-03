@@ -4,9 +4,9 @@
 [![CI](https://github.com/abendrothj/simgit/actions/workflows/ci.yml/badge.svg)](https://github.com/abendrothj/simgit/actions/workflows/ci.yml)
 [![license](https://img.shields.io/crates/l/simgit-cli.svg)](LICENSE)
 
-**Cheap, isolated Git worktrees for running many agents on one repository at once.**
+**Disk-efficient, separate Git worktrees for running many agents on one repository at once.**
 
-<p align="center"><img src="assets/demo.gif" alt="sg worktree: add two agent worktrees, list them, gc the ephemeral ones" width="820"></p>
+<p align="center"><img src="assets/demo.gif" alt="sg worktree run: launch agents in copy-on-write worktrees, merge their branches, and clean up" width="820"></p>
 
 `sg worktree` creates real Git linked worktrees populated from a shared,
 immutable baseline using copy-on-write:
@@ -18,13 +18,20 @@ immutable baseline using copy-on-write:
   root, no kernel module), so the disk win also lands on stock ext4 and CI.
 - **No CoW available** — transparent fallback to a plain `git checkout` (pass
   `--require-cow` to fail instead).
+- **Windows** — intentionally unsupported: ordinary NTFS does not provide the
+  general reflink primitive that makes simgit useful. Use Git worktrees
+  directly, or run simgit under WSL on a supported Linux filesystem.
 
 No FUSE or kernel extension is ever used on macOS; `fuse-overlayfs` is a
 Linux-only fallback.
 
-Each agent gets its own fully isolated working tree, but unchanged files share
+Each agent gets its own separate working tree, but unchanged files share
 physical disk instead of being duplicated. There is no daemon and no server:
 **Git owns the refs, the filesystem owns the data.**
+
+> **Scope of isolation:** simgit separates Git branches, indexes, and working
+> trees. It is not a security sandbox and does not isolate processes, network,
+> credentials, environment variables, or files outside the worktree.
 
 ## Why
 
@@ -64,6 +71,9 @@ is slower while the filesystem splits shared extents. Full method:
 # From crates.io (installs the `sg` binary)
 cargo install simgit-cli
 
+# Prebuilt binary on supported macOS/Linux targets
+cargo binstall simgit-cli
+
 # Homebrew
 brew install abendrothj/tap/simgit
 
@@ -86,7 +96,7 @@ git wt add feat/x
 
 ```bash
 # Create a CoW linked worktree on a new branch and cd into it
-cd $(sg worktree add feat/my-feature)
+cd "$(sg worktree add feat/my-feature)"
 
 # It's a standard linked checkout — every git command and hook just works
 echo "hello" > README.md
@@ -96,14 +106,20 @@ git commit -m "work"
 # List worktrees (add --json for machine-readable output)
 sg worktree list
 
-# Commit any leftover changes and remove the worktree
+# Commit any leftover changes and remove the worktree (the branch is retained)
 sg worktree remove --commit --message "clean up"
+
+# Or, once a branch is merged while its worktree still exists, remove both
+sg worktree remove feat/my-feature --delete-branch
 
 # Or discard uncommitted changes explicitly
 sg worktree remove --force
 
 # Reap idle/abandoned worktrees (see "Running agents in parallel")
 sg worktree gc --older-than 24h
+
+# Remount overlay-backed Linux worktrees after a reboot/interrupted mount
+sg worktree repair
 
 # Prune stale registrations and old cached baselines
 sg worktree prune
@@ -114,25 +130,29 @@ Git's normal `.git/worktrees/` registry; the cached baseline lives under
 `.git/simgit/baselines/`. Plain `remove` refuses a dirty worktree unless you
 pass `--force`.
 
-### Running agents in parallel
+### Running agents
 
-Give each agent its own ephemeral worktree, then reap abandoned ones in bulk:
+Create an ephemeral worktree and launch an agent inside it with one command:
 
 ```bash
-# Spawn N isolated agent sandboxes (each on its own branch)
-for i in 1 2 3; do
-  dir=$(sg worktree add "agent/$i" --ephemeral --json | jq -r .worktree)
-  run_my_agent --cwd "$dir" &   # your orchestrator; agent commits to agent/$i
-done
-wait
+sg worktree run agent/auth -- claude -p "implement authentication"
+sg worktree run agent/api  -- codex exec "implement the API"
 
-# Integrate whichever branches you want with normal git, then bulk-clean:
-sg worktree gc --ephemeral --older-than 1h     # reap idle agent sandboxes
+# Integrate selected branches normally, then remove worktrees and merged branches:
+git merge agent/auth
+sg worktree gc --ephemeral --older-than 1h --delete-branches
+
+# Explicitly discard abandoned work and its unmerged branch:
+sg worktree gc --ephemeral --older-than 24h --delete-branches --force
 ```
 
-`--json` on `add` / `remove` / `gc` gives orchestrators structured output.
-`gc` skips worktrees with uncommitted changes unless `--force`, and takes
-`--prefix <branch-prefix>`, `--older-than <90s|30m|24h|7d>`, and `--dry-run`.
+`worktree run` retains the worktree after the command exits and marks it
+ephemeral unless `--persistent` is passed. `--json` on `add` / `remove` / `gc`
+gives orchestrators structured output. `gc` skips worktrees with uncommitted
+changes unless `--force`, and takes `--prefix <branch-prefix>`,
+`--older-than <90s|30m|24h|7d>`, `--delete-branches`, and `--dry-run`. Safe
+branch deletion retains unmerged work; combining it with `--force` explicitly
+discards unmerged branches.
 
 Each agent commits to its own branch; you integrate with `git merge`/`rebase`
 as usual — there is no shared state to coordinate.
@@ -142,6 +162,7 @@ as usual — there is no shared state to coordinate.
 ```text
 simgit/
 ├── sg/                 the CLI (`sg worktree`)
+│   └── src/commands/worktree/   CoW and overlay backends
 ├── tests/              CoW scaling benchmarks + overlay integration test
 ├── packaging/          Homebrew formula
 └── docs/               scaling benchmark methodology

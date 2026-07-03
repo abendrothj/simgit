@@ -22,7 +22,7 @@ git init -q && git commit -q --allow-empty -m init
 cd "$("$sg" worktree add feature-x)"   # creates + enters a CoW worktree
 "$sg" worktree list                     # shows main + feature-x
 "$sg" worktree list --json              # machine-readable
-"$sg" worktree remove "$PWD" --force    # tears it down
+"$sg" worktree remove "$PWD" --force --delete-branch # tears it down
 ```
 
 ## Overlay mode (Linux)
@@ -36,8 +36,9 @@ cargo build --release
 SG="$PWD/target/release/sg" bash tests/overlay_integration.sh
 ```
 
-`SIMGIT_POPULATE=reflink|overlay|checkout` forces a populate mode, which the
-script uses to assert the overlay path regardless of the host filesystem.
+`SIMGIT_POPULATE=reflink|overlay|checkout` forces a populate mode. The script
+also unmounts live overlays to verify `repair`, stale-state cleanup, upperdir
+preservation, branch cleanup, and normal remove/GC teardown.
 
 ## CoW scaling benchmarks
 

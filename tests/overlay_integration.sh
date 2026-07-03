@@ -4,7 +4,7 @@
 # Requires Linux with fuse-overlayfs installed and /dev/fuse available. Exercises
 # the mount lifecycle that cannot be tested on macOS: overlay create (baseline as
 # lowerdir), clean status, in-worktree commit, baseline immutability, and unmount
-# on remove/gc.
+# on remove/gc, reboot-style remount recovery, and stale-state cleanup.
 #
 #   SG=./target/release/sg bash tests/overlay_integration.sh
 set -euo pipefail
@@ -54,8 +54,25 @@ git -C "$wt" rev-parse HEAD >/dev/null
 echo "== baseline (main worktree) is untouched =="
 grep -qx root root.txt || fail "baseline root.txt was mutated through the overlay"
 
+echo "== repair remounts an interrupted overlay without losing its upperdir =="
+repair="$("$SG" worktree add repair-me --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
+echo preserved >"$repair/preserved.txt"
+fusermount3 -u "$repair" 2>/dev/null || fusermount -u "$repair"
+if mount | grep -q "$repair"; then fail "repair fixture did not unmount"; fi
+"$SG" worktree repair
+if ! mount | grep -q "$repair"; then fail "repair did not remount overlay"; fi
+grep -qx preserved "$repair/preserved.txt" || fail "repair lost upperdir data"
+"$SG" worktree remove repair-me --force --delete-branch
+
+echo "== stale unmounted overlays can be removed without remounting =="
+stale="$("$SG" worktree add stale-me --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
+fusermount3 -u "$stale" 2>/dev/null || fusermount -u "$stale"
+"$SG" worktree remove stale-me --force --delete-branch
+if test -d "$stale"; then fail "stale overlay directory survived remove"; fi
+if git show-ref --verify --quiet refs/heads/stale-me; then fail "stale branch survived remove"; fi
+
 echo "== remove unmounts and deregisters =="
-"$SG" worktree remove agent-1 --force
+"$SG" worktree remove agent-1 --force --delete-branch
 if test -d "$wt"; then fail "worktree dir still present after remove"; fi
 if mount | grep -q "$wt"; then fail "overlay still mounted after remove"; fi
 if "$SG" worktree list --json | grep -q agent-1; then fail "agent-1 still registered"; fi
@@ -63,10 +80,12 @@ if "$SG" worktree list --json | grep -q agent-1; then fail "agent-1 still regist
 echo "== gc reaps ephemeral overlay worktrees and unmounts them =="
 a="$("$SG" worktree add gc-a --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
 b="$("$SG" worktree add gc-b --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
-"$SG" worktree gc --ephemeral --older-than 0s
+"$SG" worktree gc --ephemeral --older-than 0s --delete-branches --force
 for d in "$a" "$b"; do
     if test -d "$d"; then fail "gc left $d on disk"; fi
     if mount | grep -q "$d"; then fail "gc left $d mounted"; fi
 done
+if git show-ref --verify --quiet refs/heads/gc-a; then fail "gc-a branch survived gc"; fi
+if git show-ref --verify --quiet refs/heads/gc-b; then fail "gc-b branch survived gc"; fi
 
 echo "OK: overlay integration passed"

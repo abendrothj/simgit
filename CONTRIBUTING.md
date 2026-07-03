@@ -19,8 +19,9 @@ You'll need:
 
 ```
 simgit/
-├── sg/               the CLI — `sg worktree add/list/remove/prune/gc`
-│   └── src/commands/worktree.rs   the whole implementation
+├── sg/               the CLI — `sg worktree add/run/list/remove/prune/gc/repair`
+│   ├── src/commands/worktree.rs   command and lifecycle orchestration
+│   └── src/commands/worktree/     CoW baseline and overlay backends
 ├── tests/            CoW scaling benchmarks + overlay_integration.sh (Linux)
 ├── packaging/        Homebrew formula
 └── docs/             scaling benchmark methodology
@@ -36,7 +37,8 @@ simgit is a small CLI that creates real Git linked worktrees populated via
 filesystem copy-on-write. It has no daemon and no runtime services — each
 invocation shells out to `git` and, where supported, populates the working tree
 via `clonefile`/reflink or a `fuse-overlayfs` mount from a cached baseline. The
-logic lives in a single file, `sg/src/commands/worktree.rs`.
+command lifecycle lives in `sg/src/commands/worktree.rs`; filesystem-specific
+CoW baseline and overlay recovery logic lives in the adjacent backend modules.
 
 The overlay path only activates on Linux with `fuse-overlayfs`; it can't run on
 macOS, so it's covered by `tests/overlay_integration.sh` in the `overlay-linux`
