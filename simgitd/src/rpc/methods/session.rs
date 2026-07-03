@@ -84,15 +84,17 @@ pub(super) async fn session_set_base(
             data: None,
         })?;
 
+    // Notify the VFS backend that the base commit changed so it serves
+    // files from the new tree.  Must happen *before* reset_session so
+    // NFS reads from the new tree when deltas are cleared below.
+    state.vfs.update_base_commit(session_id, &new_base);
+
     // Clear the delta manifest — the working tree now reflects the new base.
-    // Subsequent writes create fresh deltas relative to the new commit.
+    // Deltas written by git checkout to carry over file differences are
+    // now stale because the VFS reads from the new tree directly.
     if let Err(e) = state.deltas.reset_session(session_id, &new_base) {
         tracing::warn!(session = %session_id, err = %e, "failed to reset delta for new base");
     }
-
-    // Notify the VFS backend that the base commit changed so it serves
-    // files from the new tree.
-    state.vfs.update_base_commit(session_id, &new_base);
 
     // Refresh the session's git refs from the real repo so new branches,
     // tags, and remote refs are visible after checkout / merge / rebase.

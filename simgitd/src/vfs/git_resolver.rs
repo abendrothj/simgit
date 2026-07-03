@@ -489,6 +489,13 @@ impl InodeMap {
         }
         self.delta_files.lock().unwrap().get(&ino).map(|e| e.path.clone())
     }
+
+    /// Clear all cached inode mappings.  Call after the base commit changes
+    /// so subsequent lookups resolve tree entries from the new tree.
+    pub fn clear(&self) {
+        self.map.lock().unwrap().clear();
+        self.delta_files.lock().unwrap().clear();
+    }
 }
 
 #[cfg(test)]
