@@ -21,12 +21,14 @@ const BASELINE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub enum Worktree {
     /// Create a real Git linked worktree, using CoW clones when supported.
     Add(WorktreeAdd),
-    /// Remove a linked worktree.
+    /// Remove a linked worktree, by path or by branch name.
     Remove(WorktreeRemove),
     /// List linked worktrees using Git's native registry.
     List(WorktreeList),
     /// Prune stale Git registrations and old cached baselines.
     Prune(WorktreePrune),
+    /// Reap idle/ephemeral worktrees (e.g. abandoned agent sandboxes).
+    Gc(WorktreeGc),
 }
 
 #[derive(Args)]
@@ -44,12 +46,21 @@ pub struct WorktreeAdd {
     /// Fail instead of using a normal Git checkout when CoW is unavailable.
     #[arg(long)]
     pub require_cow: bool,
+
+    /// Mark the worktree as ephemeral so `gc` can reap it automatically.
+    #[arg(long)]
+    pub ephemeral: bool,
+
+    /// JSON output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
 pub struct WorktreeRemove {
-    /// Worktree path. Defaults to the worktree containing the current directory.
-    pub target: Option<PathBuf>,
+    /// Worktree path or branch name. Defaults to the worktree containing the
+    /// current directory.
+    pub target: Option<String>,
 
     /// Commit all changes before removing the worktree.
     #[arg(long)]
@@ -62,6 +73,10 @@ pub struct WorktreeRemove {
     /// Discard uncommitted changes. Without this flag, Git refuses dirty removal.
     #[arg(long, conflicts_with = "commit")]
     pub force: bool,
+
+    /// JSON output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -76,6 +91,33 @@ pub struct WorktreePrune {
     /// Also delete every cached baseline, including recently used entries.
     #[arg(long)]
     pub all: bool,
+}
+
+#[derive(Args, Default)]
+pub struct WorktreeGc {
+    /// Only reap worktrees created with `--ephemeral`.
+    #[arg(long)]
+    pub ephemeral: bool,
+
+    /// Only reap worktrees whose branch starts with this prefix.
+    #[arg(long)]
+    pub prefix: Option<String>,
+
+    /// Reap worktrees idle at least this long (e.g. 90s, 30m, 24h, 7d).
+    #[arg(long, default_value = "24h")]
+    pub older_than: String,
+
+    /// Reap even if the worktree has uncommitted changes (discards them).
+    #[arg(long)]
+    pub force: bool,
+
+    /// Report what would be reaped without removing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// JSON output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug)]
@@ -101,14 +143,24 @@ impl PopulateMode {
 
 pub fn run(cmd: Worktree, global_json: bool) -> Result<()> {
     match cmd {
-        Worktree::Add(args) => add(args),
-        Worktree::Remove(args) => remove(args),
+        Worktree::Add(args) => {
+            let json = args.json || global_json;
+            add(args, json)
+        }
+        Worktree::Remove(args) => {
+            let json = args.json || global_json;
+            remove(args, json)
+        }
         Worktree::List(args) => list(args.json || global_json),
         Worktree::Prune(args) => prune(args),
+        Worktree::Gc(args) => {
+            let json = args.json || global_json;
+            gc(args, json)
+        }
     }
 }
 
-fn add(args: WorktreeAdd) -> Result<()> {
+fn add(args: WorktreeAdd, json: bool) -> Result<()> {
     let repo = discover_repo(&std::env::current_dir()?)?;
     validate_new_branch(&repo, &args.branch)?;
     let base = resolve_commit(&repo, args.base.as_deref().unwrap_or("HEAD"))?;
@@ -141,8 +193,22 @@ fn add(args: WorktreeAdd) -> Result<()> {
         PopulateMode::GitCheckout => add_git_worktree(&repo, &args.branch, &target, &base)?,
     }
 
-    eprintln!("mode: {}", mode.label());
-    println!("{}", target.display());
+    if args.ephemeral {
+        mark_ephemeral(&target)?;
+    }
+
+    if json {
+        emit(&json!({
+            "worktree": target.display().to_string(),
+            "branch": args.branch,
+            "base": base,
+            "mode": mode.label(),
+            "ephemeral": args.ephemeral,
+        }));
+    } else {
+        eprintln!("mode: {}", mode.label());
+        println!("{}", target.display());
+    }
     Ok(())
 }
 
@@ -207,22 +273,25 @@ fn add_git_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str)
     ensure_clean(target)
 }
 
-fn remove(args: WorktreeRemove) -> Result<()> {
+fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = discover_repo(&cwd)?;
-    let target = match args.target {
-        Some(path) => absolute_path(path)?,
-        None => repo.top_level.clone(),
-    };
+    let target = resolve_worktree_target(&repo, args.target.as_deref())?;
 
+    let mut committed = false;
     if args.commit {
         run_git_at(&target, ["add", "-A"]).context("stage worktree changes")?;
         let diff = git_output_at(&target, ["diff", "--cached", "--quiet"])?;
         match diff.status.code() {
-            Some(0) => eprintln!("no changes to commit"),
+            Some(0) => {
+                if !json {
+                    eprintln!("no changes to commit");
+                }
+            }
             Some(1) => {
                 run_git_at(&target, ["commit", "-m", &args.message])
                     .context("commit worktree changes")?;
+                committed = true;
             }
             _ => return Err(git_failure("git diff --cached --quiet", &diff)),
         }
@@ -237,8 +306,42 @@ fn remove(args: WorktreeRemove) -> Result<()> {
     }
     command.arg(&target);
     run_command(&mut command, "git worktree remove")?;
-    println!("{}", target.display());
+
+    if json {
+        emit(&json!({
+            "removed": target.display().to_string(),
+            "committed": committed,
+        }));
+    } else {
+        println!("{}", target.display());
+    }
     Ok(())
+}
+
+/// Resolve a user-supplied worktree reference — an explicit path, a branch
+/// name, or (when omitted) the worktree containing the current directory — to
+/// an absolute worktree path.
+fn resolve_worktree_target(repo: &RepoContext, target: Option<&str>) -> Result<PathBuf> {
+    let Some(spec) = target else {
+        return Ok(repo.top_level.clone());
+    };
+    let as_path = absolute_path(PathBuf::from(spec))?;
+    if as_path.exists() {
+        return Ok(as_path);
+    }
+    if let Some(path) = worktree_path_for_branch(repo, spec)? {
+        return Ok(path);
+    }
+    bail!("no worktree found for '{spec}' (not an existing path or a checked-out branch)");
+}
+
+/// Find the worktree checked out on `branch`, if any, via Git's registry.
+fn worktree_path_for_branch(repo: &RepoContext, branch: &str) -> Result<Option<PathBuf>> {
+    let wanted = format!("refs/heads/{branch}");
+    Ok(list_worktrees(repo)?
+        .into_iter()
+        .find(|entry| entry.branch.as_deref() == Some(wanted.as_str()))
+        .map(|entry| entry.path))
 }
 
 fn list(json_output: bool) -> Result<()> {
@@ -286,6 +389,195 @@ fn prune(args: WorktreePrune) -> Result<()> {
     let removed = prune_baselines(&repo.common_git_dir, args.all)?;
     println!("pruned {removed} cached baseline(s)");
     Ok(())
+}
+
+fn gc(args: WorktreeGc, json: bool) -> Result<()> {
+    let repo = discover_repo(&std::env::current_dir()?)?;
+    let (reaped, skipped) = run_gc(&repo, &args)?;
+
+    if json {
+        emit(&json!({
+            "dry_run": args.dry_run,
+            "reaped": reaped
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+            "skipped": skipped
+                .iter()
+                .map(|(p, why)| json!({ "worktree": p.display().to_string(), "reason": why }))
+                .collect::<Vec<_>>(),
+        }));
+    } else {
+        let verb = if args.dry_run { "would reap" } else { "reaped" };
+        for path in &reaped {
+            println!("{verb}: {}", path.display());
+        }
+        for (path, why) in &skipped {
+            eprintln!("skipped ({why}): {}", path.display());
+        }
+        println!("{verb} {} worktree(s)", reaped.len());
+    }
+    Ok(())
+}
+
+type GcOutcome = (Vec<PathBuf>, Vec<(PathBuf, &'static str)>);
+
+/// Core reaping logic, separated from output for testability. Returns the
+/// worktrees reaped (or that would be, under `--dry-run`) and those skipped.
+fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
+    let older_than = parse_duration(&args.older_than)?;
+    let mut reaped: Vec<PathBuf> = Vec::new();
+    let mut skipped: Vec<(PathBuf, &'static str)> = Vec::new();
+
+    for entry in list_worktrees(repo)? {
+        if entry.is_main {
+            continue;
+        }
+        let branch = entry.branch.as_deref().unwrap_or("");
+        let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+        if let Some(prefix) = &args.prefix {
+            if !short.starts_with(prefix) {
+                continue;
+            }
+        }
+        if args.ephemeral && !is_ephemeral(&entry.path) {
+            continue;
+        }
+        if worktree_idle(&entry.path) < older_than {
+            continue;
+        }
+        if !args.force && worktree_dirty(&entry.path).unwrap_or(false) {
+            skipped.push((entry.path.clone(), "dirty"));
+            continue;
+        }
+        if args.dry_run {
+            reaped.push(entry.path);
+            continue;
+        }
+        match remove_worktree_force(repo, &entry.path) {
+            Ok(()) => reaped.push(entry.path),
+            Err(_) => skipped.push((entry.path, "remove-failed")),
+        }
+    }
+
+    if !args.dry_run {
+        run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
+    }
+    Ok((reaped, skipped))
+}
+
+/// A linked worktree as reported by `git worktree list --porcelain`.
+struct WorktreeEntry {
+    path: PathBuf,
+    branch: Option<String>,
+    is_main: bool,
+}
+
+fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
+    let output = git_output_common(repo, ["worktree", "list", "--porcelain"])?;
+    if !output.status.success() {
+        return Err(git_failure("git worktree list --porcelain", &output));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut entries = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    for line in text.lines() {
+        if line.is_empty() {
+            if let Some(path) = path.take() {
+                let is_main = entries.is_empty();
+                entries.push(WorktreeEntry {
+                    path,
+                    branch: branch.take(),
+                    is_main,
+                });
+            }
+            branch = None;
+        } else if let Some(rest) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(rest));
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            branch = Some(rest.to_owned());
+        }
+    }
+    if let Some(path) = path.take() {
+        let is_main = entries.is_empty();
+        entries.push(WorktreeEntry {
+            path,
+            branch,
+            is_main,
+        });
+    }
+    Ok(entries)
+}
+
+fn worktree_admin_dir(worktree: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(git_path_output(
+        worktree,
+        ["rev-parse", "--absolute-git-dir"],
+    )?))
+}
+
+fn mark_ephemeral(worktree: &Path) -> Result<()> {
+    let admin = worktree_admin_dir(worktree)?;
+    fs::write(admin.join("simgit-ephemeral"), b"").context("write ephemeral marker")?;
+    Ok(())
+}
+
+fn is_ephemeral(worktree: &Path) -> bool {
+    worktree_admin_dir(worktree)
+        .map(|admin| admin.join("simgit-ephemeral").is_file())
+        .unwrap_or(false)
+}
+
+/// Time since the worktree was last touched, approximated by the mtime of its
+/// index (updated on add/commit/checkout), falling back to the directory mtime.
+fn worktree_idle(worktree: &Path) -> Duration {
+    let index = worktree_admin_dir(worktree).ok().map(|a| a.join("index"));
+    let probe = match index {
+        Some(index) if index.is_file() => index,
+        _ => worktree.to_path_buf(),
+    };
+    fs::metadata(&probe)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .unwrap_or(Duration::ZERO)
+}
+
+fn worktree_dirty(worktree: &Path) -> Result<bool> {
+    let output = git_output_at(worktree, ["status", "--porcelain"])?;
+    if !output.status.success() {
+        return Err(git_failure("git status --porcelain", &output));
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+/// Parse a compact duration like `90s`, `30m`, `24h`, `7d`. A bare number is
+/// seconds.
+fn parse_duration(text: &str) -> Result<Duration> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(text.len());
+    let (value, unit) = text.split_at(split);
+    let count: u64 = value
+        .parse()
+        .with_context(|| format!("invalid duration '{text}'"))?;
+    let seconds = match unit {
+        "s" | "" => count,
+        "m" => count * 60,
+        "h" => count * 3600,
+        "d" => count * 86400,
+        other => bail!("invalid duration unit '{other}' (use s, m, h, or d)"),
+    };
+    Ok(Duration::from_secs(seconds))
+}
+
+fn emit(value: &serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    );
 }
 
 fn discover_repo(path: &Path) -> Result<RepoContext> {
@@ -636,6 +928,81 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_accepts_common_units() {
+        assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86_400));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
+        assert!(parse_duration("5w").is_err());
+        assert!(parse_duration("abc").is_err());
+    }
+
+    #[test]
+    fn gc_reaps_ephemeral_and_by_prefix_but_spares_others() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+
+        let eph = fixture.root.join("eph");
+        add_git_worktree(&repo, "exp/eph", &eph, &base)?;
+        mark_ephemeral(&eph)?;
+        let keep = fixture.root.join("keep");
+        add_git_worktree(&repo, "exp/keep", &keep, &base)?;
+        let other = fixture.root.join("other");
+        add_git_worktree(&repo, "feat/other", &other, &base)?;
+        mark_ephemeral(&other)?;
+
+        // ephemeral + prefix `exp`: only exp/eph qualifies (keep is not
+        // ephemeral; other is ephemeral but wrong prefix).
+        let args = WorktreeGc {
+            ephemeral: true,
+            prefix: Some("exp".to_owned()),
+            older_than: "0s".to_owned(),
+            ..Default::default()
+        };
+        let (reaped, skipped) = run_gc(&repo, &args)?;
+        assert_eq!(reaped, vec![eph.clone()]);
+        assert!(skipped.is_empty());
+
+        let remaining = list_worktrees(&repo)?;
+        let branches: Vec<_> = remaining.iter().filter_map(|w| w.branch.clone()).collect();
+        assert!(branches.iter().any(|b| b == "refs/heads/exp/keep"));
+        assert!(branches.iter().any(|b| b == "refs/heads/feat/other"));
+        assert!(!branches.iter().any(|b| b == "refs/heads/exp/eph"));
+        Ok(())
+    }
+
+    #[test]
+    fn gc_skips_dirty_worktrees_without_force() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+
+        let dirty = fixture.root.join("dirty");
+        add_git_worktree(&repo, "dirty", &dirty, &base)?;
+        fs::write(dirty.join("scratch.txt"), "uncommitted")?;
+
+        let args = WorktreeGc {
+            older_than: "0s".to_owned(),
+            ..Default::default()
+        };
+        let (reaped, skipped) = run_gc(&repo, &args)?;
+        assert!(reaped.is_empty());
+        assert_eq!(skipped, vec![(dirty.clone(), "dirty")]);
+
+        // With --force it is reaped despite the dirty state.
+        let forced = WorktreeGc {
+            older_than: "0s".to_owned(),
+            force: true,
+            ..Default::default()
+        };
+        let (reaped, _) = run_gc(&repo, &forced)?;
+        assert_eq!(reaped, vec![dirty]);
+        Ok(())
+    }
+
+    #[test]
     fn native_worktree_fallback_is_clean_and_registered() -> Result<()> {
         let fixture = Fixture::new()?;
         let repo = discover_repo(&fixture.repo)?;
@@ -676,6 +1043,10 @@ mod tests {
         fn new() -> Result<Self> {
             let root =
                 std::env::temp_dir().join(format!("simgit-worktree-test-{}", Uuid::new_v4()));
+            fs::create_dir_all(&root)?;
+            // Canonicalize so paths match what `git worktree list` reports
+            // (macOS resolves the `/var` -> `/private/var` symlink).
+            let root = root.canonicalize()?;
             let repo = root.join("repo");
             fs::create_dir_all(&repo)?;
             git(&repo, ["init", "-q"])?;

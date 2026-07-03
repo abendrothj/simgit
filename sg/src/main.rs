@@ -11,9 +11,12 @@
 //!
 //! ## Commands
 //!
-//! - `sg worktree add <branch>` — create a CoW linked worktree
+//! - `sg worktree add <branch>` — create a CoW linked worktree (`--ephemeral`
+//!   marks it for automatic `gc`, `--json` for machine-readable output)
 //! - `sg worktree list` — list worktrees
-//! - `sg worktree remove` — remove a worktree (optionally committing first)
+//! - `sg worktree remove <branch|path>` — remove a worktree (optionally
+//!   committing first)
+//! - `sg worktree gc` — reap idle/ephemeral worktrees (abandoned agent sandboxes)
 //! - `sg worktree prune` — prune stale worktree administrative entries
 //!
 //! ## Example
