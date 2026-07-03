@@ -38,10 +38,16 @@ Works with Claude Code agents, custom orchestrators, or any tool that can write 
 
 ## Why simgit exists
 
-Classic multi-agent pipelines usually choose one of two expensive options:
+**If your repo is under ~500 MB and you have fewer than 5 concurrent agents,
+use `git worktree`.** It's simpler, ships with git, and works everywhere.
 
-- **One full git worktree per agent** — high disk and I/O overhead that scales poorly
-- **Shared checkout without write isolation** — race-prone, produces corrupted or lost changes
+simgit is for the other case: **large monorepos with many concurrent agents.**
+Classic approaches hit hard limits:
+
+- **One full git worktree per agent** — 50 GB repo × 20 agents = terabytes of disk,
+  plus I/O-bound checkout storms
+- **Shared checkout without write isolation** — race-prone, produces corrupted
+  or lost changes
 
 simgit targets a third design point:
 
@@ -62,13 +68,15 @@ simgit targets a third design point:
 - **OTLP tracing** — optional distributed trace export for orchestrator-level visibility
 - **Python bindings** — PyO3-backed, works with asyncio orchestrators
 - **Rust SDK** — async JSON-RPC client with typed request/response models
-- **`sg` CLI** — drop-in `git worktree` replacement (`sg worktree`) plus
-  session management and inspection
-- **`sg worktree` — drop-in `git worktree` replacement** — minimal `.git`
-  bootstrap (copied `refs/`, `HEAD`, `objects/info/alternates`, `config`,
-  one-time `index` init) makes every git command work inside session mounts,
-  so existing LLM agents that shell out to `git` work without modification.
-  Auto-starts the daemon; no manual env var setup.
+- **`sg` CLI** — `sg worktree` for concurrent-agent workflows at scale,
+  plus session management and inspection
+- **`sg worktree`** — per-agent sessions with copy-on-write working trees.
+  Minimal `.git` bootstrap (copied `refs/`, `HEAD`, `objects/info/alternates`,
+  `config`, one-time `index` init) makes every git command work inside session
+  mounts, so existing LLM agents that shell out to `git` work without
+  modification. Auto-starts the daemon; no manual env var setup.
+  **For normal repos under ~500 MB, use `git worktree` instead — simgit
+  is purpose-built for large monorepos with many concurrent agents.**
 - **Chaos-validated** — SLO gate suite covering disjoint commits, hotspot contention, transport faults, and abandon storms
 
 ## Architecture

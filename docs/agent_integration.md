@@ -4,6 +4,10 @@ This guide is for building production-grade agent runners on top of simgit using
 
 ## Drop-in worktree replacement — using simgit sessions like `git worktree add`
 
+**For normal repos, use `git worktree`.** simgit sessions are purpose-built
+for large monorepos with many concurrent agents, where full working-tree
+checkouts are prohibitive in disk and I/O.
+
 simgit sessions bootstrap a minimal `.git` directory at the mount root so that
 existing LLM coding agents that shell out to `git` work **without
 modification** inside a session mount.  This means you can replace:
@@ -78,6 +82,14 @@ parallel don't touch each other's files — the VFS intercepts every write and
 routes it to the per-session `DeltaStore` after consulting `BorrowRegistry`.
 The refs copy is read-only metadata; it can't modify another session's working
 tree.
+
+### When to use simgit vs git worktree
+
+- **Repo < 500 MB, < 5 concurrent agents** → use `git worktree`. Simple, fast,
+  no daemon, works everywhere.
+- **Repo > 10 GB, 20+ concurrent agents** → use `sg worktree`. Zero-disk CoW
+  working trees, write isolation, commit-time borrow checking, observable at
+  scale.
 
 ### Why sessions aren't git worktrees
 
