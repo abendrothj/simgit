@@ -5,12 +5,16 @@
 `sg worktree` creates real Git linked worktrees populated from a shared,
 immutable baseline using copy-on-write:
 
-- **macOS**: APFS `clonefile`.
-- **Linux with reflink** (btrfs, xfs): reflink clone.
-- **Linux without reflink** (ext4, …): `fuse-overlayfs` — unprivileged, no
-  root, no kernel mount — so the disk win also lands on stock ext4 and CI.
-- **Anywhere else / no CoW available**: transparent fallback to an ordinary
-  `git checkout` (pass `--require-cow` to fail instead).
+- **macOS (APFS)** — native `clonefile`, **zero dependencies**. This is the
+  primary, best-supported path (APFS is the default on every Mac since 2017).
+- **Linux with reflink** (btrfs, xfs) — native reflink, zero dependencies.
+- **Linux without reflink** (ext4, …) — `fuse-overlayfs` (unprivileged, no
+  root, no kernel module), so the disk win also lands on stock ext4 and CI.
+- **No CoW available** — transparent fallback to a plain `git checkout` (pass
+  `--require-cow` to fail instead).
+
+No FUSE or kernel extension is ever used on macOS; `fuse-overlayfs` is a
+Linux-only fallback.
 
 Each agent gets its own fully isolated working tree, but unchanged files share
 physical disk instead of being duplicated. There is no daemon and no server:
@@ -41,6 +45,12 @@ At least **8.0× less physical disk** at **2.1–2.2× the cold setup time**. Ho
 read and metadata cost overlaps ordinary worktree I/O; the first durable write
 is slower while the filesystem splits shared extents. Full method:
 [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
+
+> **Measure with `df`, not `du`.** `du` reports *logical* size and cannot see
+> clonefile/reflink block-sharing, so a CoW worktree looks like a full copy to
+> it. Only `df` (physical blocks consumed) shows the real saving — e.g. 4 × `sg
+> worktree` of a 100 MB tree consumes ~97 MB physical vs ~403 MB for 4 × plain
+> `git worktree`.
 
 ## Install
 
