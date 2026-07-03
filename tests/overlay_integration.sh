@@ -25,6 +25,15 @@ unmount_and_wait() {
     done
     fail "overlay remained accessible after unmount: $path"
 }
+crash_and_wait() {
+    local path="$1"
+    pkill -f "fuse-overlayfs.*${path}" || fail "could not find overlay process for $path"
+    for _ in $(seq 1 50); do
+        if ! test -e "$path/.git"; then return 0; fi
+        sleep 0.1
+    done
+    fail "overlay remained accessible after process crash: $path"
+}
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -66,11 +75,12 @@ grep -qx root root.txt || fail "baseline root.txt was mutated through the overla
 echo "== repair remounts an interrupted overlay without losing its upperdir =="
 repair="$("$SG" worktree add repair-me --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
 echo preserved >"$repair/preserved.txt"
-unmount_and_wait "$repair"
-if mount | grep -q "$repair"; then fail "repair fixture did not unmount"; fi
-"$SG" worktree repair
-if ! mount | grep -q "$repair"; then fail "repair did not remount overlay"; fi
+crash_and_wait "$repair"
+repair_out="$("$SG" worktree repair)"
+echo "$repair_out"
+echo "$repair_out" | grep -Fq "repaired: $repair" || fail "repair did not report remounting crashed overlay"
 grep -qx preserved "$repair/preserved.txt" || fail "repair lost upperdir data"
+git -C "$repair" status --porcelain >/dev/null || fail "repaired overlay is not a usable Git worktree"
 "$SG" worktree remove repair-me --force --delete-branch
 
 echo "== stale unmounted overlays can be removed without remounting =="
