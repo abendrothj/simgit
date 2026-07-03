@@ -1,93 +1,118 @@
 # Scaling benchmark — `sg worktree` vs `git worktree`
 
-simgit's central claim is that it **avoids duplicating the working tree** when
-you run many agents against one repo. `git worktree` materializes a full
-checkout per session (tree size × N on disk); simgit serves reads from a shared
-baseline and stores only per-session deltas, so real disk stays flat.
+simgit's default CoW backend avoids **physical** N-way duplication of the
+working tree. On macOS it keeps one materialized baseline and creates APFS
+`clonefile` sessions whose file extents remain shared until written. Git
+worktrees independently materialize every checkout.
 
-This page records a reproducible measurement of that claim.
+Physical allocation, path-level disk accounting, setup latency, and file-I/O
+latency are different measurements. This page reports them separately.
 
 ## Method
 
-`tests/bench_scaling.sh` builds a synthetic repo with a fixed working-tree size,
-then for each session count N creates N `git worktree` checkouts and, separately,
-N `sg worktree` sessions. It measures:
+`tests/bench_scaling.sh` creates a synthetic repository, then creates N Git
+worktrees and N simgit CoW sessions in separate runs. It records:
 
-- **Real host disk consumed** via `du -sxk`. The `-x` flag stays on one
-  filesystem, so it counts the on-disk backing store and *excludes* the virtual
-  NFS mount points simgit serves — i.e. it measures bytes actually written to
-  disk, not the files an agent can see.
-- **Time-to-ready** — wall-clock to create all N isolated working trees.
+- **`du`-accounted disk** using `du -sxk`. `-x` excludes NFS/FUSE mounts, but
+  APFS and reflink clones are ordinary directories on the same filesystem.
+  `du` charges their shared extents to every path, so this is not unique
+  physical space for CoW sessions.
+- **Physical allocation delta** using the filesystem's used-block count before
+  and after setup (`df -Pk`), with `sync` and a short settling interval. This
+  observes clone sharing, but can be noisy if unrelated processes write to the
+  same volume during a run.
+- **Cold batch setup time**, including simgit's first daemon startup and shared
+  baseline materialization.
 
-Both numbers are the baseline cost *before any agent writes*: what it costs just
-to stand up N isolated views of the repo.
+Both disk figures exclude the source repository, which exists before each
+measurement.
 
-## Results
+## Setup and `du` accounting
 
-Working tree: 400 files × 128 KB = **67.2 MB per checkout**. macOS, NFSv3 backend.
+macOS/APFS, 200 files × 256 KiB after generation = **67.2 MiB per tree**:
 
-| N (sessions) | git worktree disk | simgit disk | git worktree time | simgit time |
+| Sessions | Git `du` | simgit `du` | Git setup | simgit setup |
 |---:|---:|---:|---:|---:|
-| 1  | 67.2 MB   | 0.11 MB | 0.21 s | 0.25 s |
-| 2  | 134.4 MB  | 0.13 MB | 0.42 s | 0.25 s |
-| 4  | 268.8 MB  | 0.17 MB | 0.94 s | 0.32 s |
-| 8  | 537.5 MB  | 0.25 MB | 1.77 s | 0.34 s |
-| 16 | 1075.1 MB | 0.41 MB | 3.36 s | 0.50 s |
+| 1  | 67.2 MiB | 134.5 MiB | 0.20 s | 0.91 s |
+| 4  | 268.8 MiB | 336.3 MiB | 0.87 s | 1.01 s |
+| 8  | 537.5 MiB | 605.4 MiB | 1.55 s | 1.60 s |
+| 16 | 1075.1 MiB | 1143.4 MiB | 3.13 s | 2.70 s |
 
-**Disk** grows linearly for `git worktree` (~67 MB per session) and stays
-effectively flat for simgit (~0.1–0.4 MB of metadata). At N=16 that is **1075 MB
-vs 0.41 MB — roughly 2,600× less disk.** The gap scales with working-tree size:
-a larger repo widens it, a tiny repo shrinks it.
+The simgit `du` result is almost exactly `(N + 1) × tree size`: N session
+directories plus one shared baseline. That does **not** mean APFS allocated N+1
+physical copies; it demonstrates why `du` alone cannot measure clone savings.
 
-**Time-to-ready** grows linearly for `git worktree` (each checkout writes the
-whole tree) and stays roughly flat for simgit (no tree is written).
+Setup has a fixed simgit cost for daemon startup and baseline extraction. Git is
+faster at low fan-out. Once that fixed cost is amortized, clone creation is
+cheaper than repeated checkout and simgit crosses over around 8–16 sessions for
+this tree shape.
 
-## Honest reading of the result
+## Physical allocation
 
-- **The claim holds, and the effect is large at scale.** The more agents and the
-  bigger the tree, the more decisively simgit wins on disk and setup time.
-- **At N=1–2, `git worktree` is the simpler choice.** simgit's per-session disk
-  is smaller even at N=1, but a daemon + loopback filesystem is a lot of
-  machinery to justify for one or two checkouts. The operational win only shows
-  up at high fan-out.
-- **This is the pre-write baseline.** Once agents edit files, simgit's delta
-  store grows — but only by what actually changed, still far below a full copy.
-- **simgit trades disk for read indirection.** Reads are served over a loopback
-  NFSv3 (macOS) / FUSE (Linux) layer rather than the local page cache, so
-  individual file reads carry more per-op overhead than a plain checkout. The
-  win is disk and setup-time scaling, not raw single-file read latency.
+A dedicated larger run reduces `df` noise: **300 MiB tree, 8 sessions**, APFS.
 
-## Per-operation latency: CoW default vs. write-intercepting VFS
+| Path | `du`-accounted | Physical allocation delta | Setup |
+|---|---:|---:|---:|
+| Git worktrees | 2400.0 MiB | 2401.5 MiB | 1.38 s |
+| simgit CoW | 2700.7 MiB | 327.3 MiB | 2.34 s |
 
-The disk win above is independent of backend. Where backends differ sharply is
-**per-file-operation latency**, because the VFS backends route every read/write
-through a user-space filesystem while the default CoW backend serves them from
-the kernel page cache.
+For eight untouched sessions, simgit used **7.3× less physical disk** while
+`du` misleadingly reported more. The physical result is approximately one
+300 MiB baseline plus metadata; the eight session trees share its extents.
 
-Measured on macOS, 400 small files, warm (per-op, averaged):
+## File-I/O latency
 
-| Path | `stat()` | `open()`+`read()` |
-|---|--:|--:|
-| Plain `git` checkout | 1.2 µs | 10.7 µs |
-| **CoW backend (default)** | **1.6 µs** | **11.4 µs** |
-| NFS-loopback VFS (`SIMGIT_BACKEND=nfs`) | 792 µs | 1961 µs |
+Hot-cache microbenchmark, 1,000 files × 16 KiB, repeated in both execution
+orders to control for cache warming:
 
-The CoW backend is within noise of a plain checkout and ~500×/170× faster per
-op than the NFS-loopback VFS. The NFS cost is dominated by `actimeo=0` (no
-client attribute caching → an RPC round trip per `stat`, and `LOOKUP`+`GETATTR`+
-`READ` per read) — the price of synchronous write-time borrow-checking.
+| Operation | Git worktree | simgit CoW | simgit overhead |
+|---|---:|---:|---:|
+| `stat()` | 0.83–0.96 µs/file | 1.21–1.36 µs/file | 42–46% |
+| open + read 4 KiB | 7.84–8.10 µs/file | 9.32–9.51 µs/file | 15–21% |
+| cached full reads | 1.63–1.73 GiB/s | 1.41–1.45 GiB/s | 11–18% lower |
+| overwrite 4 KiB + `fsync` | 0.050–0.051 ms/file | 0.083–0.117 ms/file | 1.6–2.3× |
 
-**When to use which:** the CoW default detects conflicts at commit (optimistic).
-Use a write-intercepting backend (`SIMGIT_BACKEND=fuse|nfs`) only if you need a
-write to a path another session holds to fail *immediately* rather than at
-commit — and accept the per-op latency that requires.
+CoW stays in the native filesystem hot path—these costs are microseconds, not
+the millisecond-scale overhead of NFS-loopback. It is nevertheless not free:
+clone metadata is slightly slower to traverse, and the first durable write to a
+shared extent must split that extent.
+
+## Effect of edits
+
+The untouched-session result is the best case. A useful steady-state model is:
+
+```text
+Git physical disk    ≈ N × full tree
+simgit physical disk ≈ one baseline
+                       + private blocks changed in each session
+                       + captured full-file delta blobs
+                       + metadata
+```
+
+CoW allocates only blocks dirtied in each session, but commit capture currently
+stores the full contents of every changed file. Committed sessions remain
+mounted for inspection and retain their captured delta until abort/cleanup.
+Workloads that rewrite most of every tree therefore erode the disk advantage;
+the strongest win is many mostly-read sessions with sparse edits.
+
+## Practical conclusion
+
+- At low fan-out, use Git worktrees unless isolation disk or automation
+  semantics justify the daemon.
+- At high fan-out with sparse edits, simgit trades modest native-I/O overhead
+  and a cold baseline cost for close to N-fold physical disk savings.
+- `du -x` remains correct for excluding NFS/FUSE mounts, but cannot measure
+  shared extents for the default CoW backend. Use the physical allocation delta
+  as the primary disk result.
+- Use `SIMGIT_BACKEND=nfs` or Linux FUSE only when synchronous write-time
+  conflict rejection is worth much higher per-operation latency.
 
 ## Reproduce
 
 ```bash
-# Build first: cargo build --workspace
+cargo build -p simgitd -p simgit-cli
 NFILES=400 FSIZE_KB=128 NS="1 2 4 8 16" bash tests/bench_scaling.sh
 ```
 
-Tune `NFILES`/`FSIZE_KB` to model your repo's working-tree size and `NS` to the
-session counts you care about.
+Use a tree of several hundred MiB for meaningful physical allocation deltas,
+and minimize unrelated writes to the measured filesystem during the run.

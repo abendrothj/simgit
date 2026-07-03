@@ -145,16 +145,17 @@ intercepting VFS backends remain available via `SIMGIT_BACKEND`:
 | `nfs` | Embedded NFSv3 (`nfsserve`) | Write-time (`WRITE` RPC → `BorrowRegistry`) | Loopback RPC per op (slowest) | None (macOS built-in client) |
 | `winfsp` | WinFSP (`winfsp_wrs`) | Write-time (write callback → `BorrowRegistry`) | User-space callback per op | WinFSP runtime install |
 
-Measured per-op cost of the VFS indirection (macOS, 400 small files, warm):
-native/CoW `stat` ≈ 1.6 µs, `read` ≈ 11 µs; NFS-loopback `stat` ≈ 790 µs,
-`read` ≈ 2 ms — the CoW default is ~2 orders of magnitude faster per operation.
+Measured hot-cache cost on macOS: CoW `stat` is ~42–46% slower than a Git
+worktree (about 1.3 vs 0.9 µs/file), 4 KiB reads are ~15–21% slower (about
+9.4 vs 8.0 µs/file), and durable first writes to shared extents cost ~1.6–2.3×
+more. CoW remains orders of magnitude faster than the NFS-loopback path.
 See [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
 
 Test coverage by platform:
 
 | Platform | Backend | CI coverage |
 |---|---|---|
-| macOS | NFSv3 | Nightly SLO/chaos suite (primary exercised path) |
+| macOS | Native CoW | Nightly SLO/chaos suite (default exercised path) |
 | Linux | FUSE | Mount integration tests — real create/rename/unlink through the FUSE mount (`.github/workflows/fuse-linux-integration.yml`) |
 | Windows | WinFSP | Compile + link against the WinFSP runtime and cross-platform unit tests (`.github/workflows/windows-winfsp.yml`). Mount-level integration on Windows is **not yet covered** — the backend is build-verified, not mount-verified. |
 
