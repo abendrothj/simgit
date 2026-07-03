@@ -1,5 +1,9 @@
 # simgit
 
+[![crates.io](https://img.shields.io/crates/v/simgit-cli.svg)](https://crates.io/crates/simgit-cli)
+[![CI](https://github.com/abendrothj/simgit/actions/workflows/ci.yml/badge.svg)](https://github.com/abendrothj/simgit/actions/workflows/ci.yml)
+[![license](https://img.shields.io/crates/l/simgit-cli.svg)](LICENSE)
+
 **Cheap, isolated Git worktrees for running many agents on one repository at once.**
 
 `sg worktree` creates real Git linked worktrees populated from a shared,
@@ -55,13 +59,10 @@ is slower while the filesystem splits shared extents. Full method:
 ## Install
 
 ```bash
-# From crates.io
+# From crates.io (installs the `sg` binary)
 cargo install simgit-cli
 
-# Prebuilt binary (no compile), once releases are published
-cargo binstall simgit-cli
-
-# Homebrew (tap)
+# Homebrew
 brew install abendrothj/tap/simgit
 
 # From source

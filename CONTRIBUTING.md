@@ -60,6 +60,18 @@ section and Git history.)
 - No comments unless explaining *why*, not *what*
 - Error handling: use `anyhow`
 
+## Releasing
+
+Published as `simgit-cli` on crates.io (binary `sg`).
+
+1. Bump `version` in the workspace `Cargo.toml`, `cargo build` to refresh the lockfile, commit.
+2. Tag and push: `git tag -a vX.Y.Z -m "…" && git push origin main vX.Y.Z`.
+3. `cargo publish -p simgit-cli`.
+4. GitHub release: `gh release create vX.Y.Z --title vX.Y.Z --notes "…"`.
+5. Homebrew: update `url`/`sha256` in `packaging/homebrew/simgit.rb`
+   (`curl -sL <tarball> | shasum -a 256`) and copy it into the
+   `abendrothj/homebrew-tap` repo's `Formula/simgit.rb`.
+
 ## Communication
 
 - Open an issue before starting on anything big
