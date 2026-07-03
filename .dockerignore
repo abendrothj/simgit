@@ -1,5 +1,0 @@
-target/
-.git/
-**/*.log
-deploy/dev/data/
-.venv/
