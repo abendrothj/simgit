@@ -68,7 +68,7 @@ use crate::vfs::session_ops::{SessionVfsOps, VfsAttr, VfsFileKind, VfsOpError};
 /// and CoW logic as the FUSE backend.
 pub struct NfsSession {
     session_id: Uuid,
-    base_commit: String,
+    base_commit: Arc<std::sync::Mutex<String>>,
     cfg: Arc<Config>,
     deltas: Arc<DeltaStore>,
     borrows: Arc<BorrowRegistry>,
@@ -86,7 +86,7 @@ impl NfsSession {
     pub fn new(
         session_id: Uuid,
         cfg: Arc<Config>,
-        base_commit: String,
+        base_commit: Arc<std::sync::Mutex<String>>,
         deltas: Arc<DeltaStore>,
         borrows: Arc<BorrowRegistry>,
         git_data_dir: Option<PathBuf>,
@@ -164,7 +164,7 @@ impl SessionVfsOps for NfsSession {
 
         let parent_tree_oid = match crate::vfs::session_ops::directory_tree_oid_for_ino(
             parent,
-            &self.base_commit,
+            &self.base_commit.lock().unwrap(),
             &self.cfg.repo_path,
             &self.tree_cache,
             &self.inode_map,
@@ -476,7 +476,7 @@ impl SessionVfsOps for NfsSession {
 
         let tree_oid = match crate::vfs::session_ops::directory_tree_oid_for_ino(
             id,
-            &self.base_commit,
+            &self.base_commit.lock().unwrap(),
             &self.cfg.repo_path,
             &self.tree_cache,
             &self.inode_map,
@@ -597,7 +597,7 @@ impl SessionVfsOps for NfsSession {
 
         match directory_tree_oid_for_ino(
             parent,
-            &self.base_commit,
+            &self.base_commit.lock().unwrap(),
             &self.cfg.repo_path,
             &self.tree_cache,
             &self.inode_map,
@@ -612,38 +612,16 @@ impl SessionVfsOps for NfsSession {
             return Err(VfsOpError::NotFound);
         };
 
-        let manifest = self
-            .deltas
-            .load_manifest(self.session_id)
-            .map_err(|_| VfsOpError::Io)?;
-
-        // NFS create is O_CREAT | O_TRUNC — overwrite is expected.
-        // Only reject creation when the entry already exists AND has
-        // NOT been previously deleted by this session.
-        if !manifest.deletes.contains(&path)
-            && (manifest.writes.contains_key(&path)
-                || git_entry_exists_in_parent(
-                    &self.cfg.repo_path,
-                    &self.tree_cache,
-                    &self.base_commit,
-                    &self.inode_map,
-                    parent,
-                    name,
-                )
-                .unwrap_or(false))
-        {
-            // Allow overwrite: treat as create-with-truncate.
-            // Fall through to write an empty blob.
-        }
-
         self.borrows
             .acquire_write(self.session_id, &path, Some(self.cfg.lock_ttl_seconds))
             .map_err(VfsOpError::from)?;
 
+        // Clear any existing delta for this path so the file starts empty.
+        // This handles the unlink(empty blob) → create → write(new content)
+        // sequence that git checkout uses.
         self.deltas
             .write_blob(self.session_id, &path, &[], None)
             .map_err(|_| VfsOpError::Io)?;
-
 
         let ino = self.inode_map.allocate();
         let perm = ((mode as u16) & 0o7777) | 0o100000;
@@ -668,7 +646,7 @@ impl SessionVfsOps for NfsSession {
 
         let parent_tree_oid = match directory_tree_oid_for_ino(
             parent,
-            &self.base_commit,
+            &self.base_commit.lock().unwrap(),
             &self.cfg.repo_path,
             &self.tree_cache,
             &self.inode_map,
@@ -731,7 +709,7 @@ impl SessionVfsOps for NfsSession {
 
         let old_parent_tree_oid = match directory_tree_oid_for_ino(
             from_parent,
-            &self.base_commit,
+            &self.base_commit.lock().unwrap(),
             &self.cfg.repo_path,
             &self.tree_cache,
             &self.inode_map,
@@ -765,7 +743,7 @@ impl SessionVfsOps for NfsSession {
 
         match directory_tree_oid_for_ino(
             to_parent,
-            &self.base_commit,
+            &self.base_commit.lock().unwrap(),
             &self.cfg.repo_path,
             &self.tree_cache,
             &self.inode_map,
@@ -848,7 +826,7 @@ impl SessionVfsOps for NfsSession {
     fn opendir(&self, id: u64) -> Result<(), VfsOpError> {
         match crate::vfs::session_ops::directory_tree_oid_for_ino(
             id,
-            &self.base_commit,
+            &self.base_commit.lock().unwrap(),
             &self.cfg.repo_path,
             &self.tree_cache,
             &self.inode_map,
@@ -1172,6 +1150,7 @@ impl NFSFileSystem for NfsSession {
 struct ActiveNfsMount {
     _handle: JoinHandle<()>,
     port: u16,
+    base_commit: Arc<std::sync::Mutex<String>>,
 }
 
 /// Embedded NFSv3 backend driver (macOS Phase 1+, also available on Linux).
@@ -1243,10 +1222,13 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
             None
         };
 
+        let base_ref: Arc<std::sync::Mutex<String>> =
+            Arc::new(std::sync::Mutex::new(session.base_commit.clone()));
+
         let fs = NfsSession::new(
             session.session_id,
             Arc::clone(&self.cfg),
-            session.base_commit.clone(),
+            Arc::clone(&base_ref),
             Arc::clone(&self.deltas),
             Arc::clone(&self.borrows),
             git_proxy.as_ref().map(|p| p.git_dir.clone()),
@@ -1299,6 +1281,7 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
             ActiveNfsMount {
                 _handle: handle,
                 port,
+                base_commit: base_ref,
             },
         );
 
@@ -1348,6 +1331,16 @@ impl super::VfsBackendTrait for NfsLoopbackBackend {
         // to "capture" at commit time.  This is the same no-op that
         // FuseBackend uses.
         Ok(())
+    }
+
+    fn update_base_commit(&self, session_id: Uuid, new_base: &str) {
+        if let Ok(mounts) = self.mounts.lock() {
+            if let Some(mount) = mounts.get(&session_id) {
+                if let Ok(mut base) = mount.base_commit.lock() {
+                    *base = new_base.to_owned();
+                }
+            }
+        }
     }
 }
 

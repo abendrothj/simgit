@@ -90,6 +90,10 @@ pub(super) async fn session_set_base(
         tracing::warn!(session = %session_id, err = %e, "failed to reset delta for new base");
     }
 
+    // Notify the VFS backend that the base commit changed so it serves
+    // files from the new tree.
+    state.vfs.update_base_commit(session_id, &new_base);
+
     // Refresh the session's git refs from the real repo so new branches,
     // tags, and remote refs are visible after checkout / merge / rebase.
     if let Some(info) = state.sessions.get(session_id) {

@@ -160,6 +160,10 @@ pub trait VfsBackendTrait: Send + Sync {
     fn capture_mount_delta(&self, _session: &SessionInfo) -> Result<()> {
         Ok(())
     }
+
+    /// Update the base commit for a mounted session so the VFS serves
+    /// files from the new tree (e.g. after `git checkout`).
+    fn update_base_commit(&self, _session_id: Uuid, _new_base: &str) {}
 }
 
 /// VFS manager — dispatches mount/unmount to the appropriate backend.
@@ -276,5 +280,10 @@ impl VfsManager {
     /// Ask the backend to synchronize mount-side writes into the session delta store.
     pub fn capture_mount_delta(&self, session: &SessionInfo) -> Result<()> {
         self.backend.capture_mount_delta(session)
+    }
+
+    /// Notify the backend that the session's base commit changed.
+    pub fn update_base_commit(&self, session_id: Uuid, new_base: &str) {
+        self.backend.update_base_commit(session_id, new_base);
     }
 }
