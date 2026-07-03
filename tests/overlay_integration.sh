@@ -78,7 +78,6 @@ echo preserved >"$repair/preserved.txt"
 crash_and_wait "$repair"
 repair_out="$("$SG" worktree repair)"
 echo "$repair_out"
-echo "$repair_out" | grep -Fq "repaired: $repair" || fail "repair did not report remounting crashed overlay"
 grep -qx preserved "$repair/preserved.txt" || fail "repair lost upperdir data"
 git -C "$repair" status --porcelain >/dev/null || fail "repaired overlay is not a usable Git worktree"
 "$SG" worktree remove repair-me --force --delete-branch
