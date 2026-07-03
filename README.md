@@ -6,6 +6,8 @@
 
 **Cheap, isolated Git worktrees for running many agents on one repository at once.**
 
+<p align="center"><img src="assets/demo.gif" alt="sg worktree: add two agent worktrees, list them, gc the ephemeral ones" width="820"></p>
+
 `sg worktree` creates real Git linked worktrees populated from a shared,
 immutable baseline using copy-on-write:
 
