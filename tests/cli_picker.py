@@ -19,7 +19,11 @@ SG = str(Path(os.environ.get("SG", "target/debug/sg")).resolve())
 
 
 def checked(cwd, *args):
-    return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True)
+    # Picker fixtures must not create mounts that TemporaryDirectory cannot remove.
+    return subprocess.run(
+        args, cwd=cwd, check=True, capture_output=True, text=True,
+        env={**os.environ, "SIMGIT_POPULATE": "checkout"},
+    )
 
 
 def interact(repo, args, answers):
