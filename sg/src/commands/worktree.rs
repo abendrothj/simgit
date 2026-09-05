@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::json;
 use std::collections::HashSet;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -17,7 +17,10 @@ use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 mod cow;
+mod launch;
 mod overlay;
+
+pub use launch::WorktreeRun;
 
 #[derive(Subcommand)]
 pub enum Worktree {
@@ -31,7 +34,7 @@ pub enum Worktree {
     Prune(WorktreePrune),
     /// Reap idle/ephemeral worktrees (e.g. abandoned agent sandboxes).
     Gc(WorktreeGc),
-    /// Create an ephemeral worktree and run a command inside it.
+    /// Create or reuse a persistent worktree and run a command inside it.
     Run(WorktreeRun),
     /// Remount overlay-backed worktrees after a reboot or interrupted mount.
     Repair(WorktreeRepair),
@@ -105,9 +108,13 @@ pub struct WorktreePrune {
 
 #[derive(Args, Default)]
 pub struct WorktreeGc {
-    /// Only reap worktrees created with `--ephemeral`.
+    /// Only reap ephemeral worktrees (the default).
     #[arg(long)]
     pub ephemeral: bool,
+
+    /// Also allow GC to remove persistent worktrees.
+    #[arg(long, conflicts_with = "ephemeral")]
+    pub include_persistent: bool,
 
     /// Only reap worktrees whose branch starts with this prefix.
     #[arg(long)]
@@ -132,33 +139,6 @@ pub struct WorktreeGc {
     /// JSON output.
     #[arg(long)]
     pub json: bool,
-}
-
-#[derive(Args)]
-#[command(trailing_var_arg = true)]
-pub struct WorktreeRun {
-    /// Branch to create for the command.
-    pub branch: String,
-
-    /// Worktree path. Defaults to `.git/simgit/worktrees/<branch>`.
-    #[arg(long)]
-    pub path: Option<PathBuf>,
-
-    /// Commit-ish to start from. Defaults to HEAD.
-    #[arg(long)]
-    pub base: Option<String>,
-
-    /// Fail instead of using a normal Git checkout when CoW is unavailable.
-    #[arg(long)]
-    pub require_cow: bool,
-
-    /// Keep this worktree out of `gc --ephemeral` selection.
-    #[arg(long)]
-    pub persistent: bool,
-
-    /// Command and arguments to execute in the new worktree.
-    #[arg(required = true)]
-    pub command: Vec<OsString>,
 }
 
 #[derive(Args, Default)]
@@ -210,13 +190,13 @@ pub fn run(cmd: Worktree, global_json: bool) -> Result<()> {
             let json = args.json || global_json;
             gc(args, json)
         }
-        Worktree::Run(args) => run_in_worktree(args, global_json),
+        Worktree::Run(args) => launch::run_in_worktree(args, global_json),
         Worktree::Repair(args) => repair(args.json || global_json),
     }
 }
 
 fn add(args: WorktreeAdd, json: bool) -> Result<()> {
-    let created = create_worktree(&args)?;
+    let created = create_worktree(&args, false)?;
 
     if json {
         emit(&json!({
@@ -239,10 +219,23 @@ struct CreatedWorktree {
     mode: PopulateMode,
 }
 
-fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
+fn create_worktree(args: &WorktreeAdd, attach: bool) -> Result<CreatedWorktree> {
     let repo = discover_repo(&std::env::current_dir()?)?;
-    validate_new_branch(&repo, &args.branch)?;
-    let base = resolve_commit(&repo, args.base.as_deref().unwrap_or("HEAD"))?;
+    let new_branch = !attach;
+    if new_branch {
+        validate_new_branch(&repo, &args.branch)?;
+    } else if args.base.is_some() {
+        bail!("--base cannot be used with an existing branch");
+    }
+    let reference = format!("refs/heads/{}", args.branch);
+    let base = resolve_commit(
+        &repo,
+        if attach {
+            &reference
+        } else {
+            args.base.as_deref().unwrap_or("HEAD")
+        },
+    )?;
     let target = absolute_path(
         args.path
             .clone()
@@ -261,53 +254,29 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     let mode = select_populate_mode(&repo, target_parent, args.require_cow)?;
 
     match mode {
-        PopulateMode::CowClone => add_cow_worktree(&repo, &args.branch, &target, &base)?,
-        PopulateMode::Overlay => add_overlay_worktree(&repo, &args.branch, &target, &base)?,
-        PopulateMode::GitCheckout => add_git_worktree(&repo, &args.branch, &target, &base)?,
+        PopulateMode::CowClone => {
+            add_cow_worktree(&repo, &args.branch, &target, &base, new_branch)?
+        }
+        PopulateMode::Overlay => {
+            add_overlay_worktree(&repo, &args.branch, &target, &base, new_branch)?
+        }
+        PopulateMode::GitCheckout => {
+            add_git_worktree(&repo, &args.branch, &target, &base, new_branch)?
+        }
     }
 
     if args.ephemeral {
         if let Err(error) = mark_ephemeral(&target) {
-            let _ = force_teardown(&repo, &target);
-            let _ = delete_local_branch(&repo, &format!("refs/heads/{}", args.branch), true);
+            teardown_worktree(&repo, &target, true)
+                .context("cleanup after ephemeral marker failure")?;
+            if new_branch {
+                delete_local_branch(&repo, &reference, true)?;
+            }
             return Err(error).context("mark worktree ephemeral");
         }
     }
 
     Ok(CreatedWorktree { target, base, mode })
-}
-
-fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
-    if json {
-        bail!("--json is not supported with `worktree run` because command output is streamed");
-    }
-    let created = create_worktree(&WorktreeAdd {
-        branch: args.branch.clone(),
-        path: args.path,
-        base: args.base,
-        require_cow: args.require_cow,
-        ephemeral: !args.persistent,
-        json: false,
-    })?;
-    eprintln!(
-        "worktree: {} (mode: {}, branch: {})",
-        created.target.display(),
-        created.mode.label(),
-        args.branch
-    );
-    let (program, command_args) = args.command.split_first().context("command is required")?;
-    let status = Command::new(program)
-        .args(command_args)
-        .current_dir(&created.target)
-        .status()
-        .with_context(|| format!("run command in {}", created.target.display()))?;
-    if !status.success() {
-        bail!(
-            "command exited with {status}; worktree retained at {}",
-            created.target.display()
-        );
-    }
-    Ok(())
 }
 
 /// Choose how to populate the worktree. Prefers per-file reflink, then
@@ -334,7 +303,12 @@ fn select_populate_mode(
                     bail!("SIMGIT_POPULATE=overlay but fuse-overlayfs is not installed")
                 }
             }
-            "checkout" | "git-checkout" => Ok(PopulateMode::GitCheckout),
+            "checkout" | "git-checkout" => {
+                if require_cow {
+                    bail!("SIMGIT_POPULATE=checkout conflicts with --require-cow");
+                }
+                Ok(PopulateMode::GitCheckout)
+            }
             other => bail!("unknown SIMGIT_POPULATE={other} (use reflink, overlay, or checkout)"),
         };
     }
@@ -368,23 +342,39 @@ fn validate_new_branch(repo: &RepoContext, branch: &str) -> Result<()> {
     }
 }
 
-fn add_cow_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
-    let baseline = cow::ensure_baseline(repo, base)?;
-    let add_result = run_git_common(
-        repo,
-        [
-            OsStr::new("worktree"),
-            OsStr::new("add"),
-            OsStr::new("--no-checkout"),
-            OsStr::new("-b"),
-            OsStr::new(branch),
-            target.as_os_str(),
-            OsStr::new(base),
-        ],
-    );
-    if let Err(error) = add_result {
-        return Err(error.context("create linked worktree"));
+fn register_worktree(
+    repo: &RepoContext,
+    branch: &str,
+    target: &Path,
+    base: &str,
+    checkout: bool,
+    new_branch: bool,
+) -> Result<()> {
+    let mut command = Command::new("git");
+    command
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .args(["worktree", "add"]);
+    if !checkout {
+        command.arg("--no-checkout");
     }
+    if new_branch {
+        command.args(["-b", branch]);
+    }
+    command
+        .arg(target)
+        .arg(if new_branch { base } else { branch });
+    run_command(&mut command, "create linked worktree")
+}
+
+fn add_cow_worktree(
+    repo: &RepoContext,
+    branch: &str,
+    target: &Path,
+    base: &str,
+    new_branch: bool,
+) -> Result<()> {
+    let baseline = cow::ensure_baseline(repo, base)?;
+    register_worktree(repo, branch, target, base, false, new_branch)?;
 
     let populate_result = (|| -> Result<()> {
         run_git_at(target, ["read-tree", "HEAD"]).context("initialize linked-worktree index")?;
@@ -393,32 +383,37 @@ fn add_cow_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str)
     })();
 
     if let Err(error) = populate_result {
-        rollback_created_worktree(repo, target, branch);
+        rollback_created_worktree(repo, target, branch, new_branch)?;
         return Err(error);
     }
     Ok(())
 }
 
-fn add_git_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
-    run_git_common(
-        repo,
-        [
-            OsStr::new("worktree"),
-            OsStr::new("add"),
-            OsStr::new("-b"),
-            OsStr::new(branch),
-            target.as_os_str(),
-            OsStr::new(base),
-        ],
-    )
-    .context("create linked worktree with normal Git checkout")?;
-    ensure_clean(target)
+fn add_git_worktree(
+    repo: &RepoContext,
+    branch: &str,
+    target: &Path,
+    base: &str,
+    new_branch: bool,
+) -> Result<()> {
+    register_worktree(repo, branch, target, base, true, new_branch)?;
+    if let Err(error) = ensure_clean(target) {
+        rollback_created_worktree(repo, target, branch, new_branch)?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Create a linked worktree whose files are served by a fuse-overlayfs mount:
 /// `lowerdir` is the shared read-only baseline, and a per-worktree `upperdir`
 /// captures writes. Unchanged files cost no disk, on any Linux filesystem.
-fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &str) -> Result<()> {
+fn add_overlay_worktree(
+    repo: &RepoContext,
+    branch: &str,
+    target: &Path,
+    base: &str,
+    new_branch: bool,
+) -> Result<()> {
     let baseline = cow::ensure_baseline(repo, base)?;
 
     let overlay_dir = overlay::root(&repo.common_git_dir).join(Uuid::new_v4().to_string());
@@ -427,19 +422,10 @@ fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &
     fs::create_dir_all(&upper).context("create overlay upperdir")?;
     fs::create_dir_all(&work).context("create overlay workdir")?;
 
-    run_git_common(
-        repo,
-        [
-            OsStr::new("worktree"),
-            OsStr::new("add"),
-            OsStr::new("--no-checkout"),
-            OsStr::new("-b"),
-            OsStr::new(branch),
-            target.as_os_str(),
-            OsStr::new(base),
-        ],
-    )
-    .context("create linked worktree")?;
+    if let Err(error) = register_worktree(repo, branch, target, base, false, new_branch) {
+        fs::remove_dir_all(&overlay_dir).context("cleanup unused overlay state")?;
+        return Err(error);
+    }
 
     let populate = (|| -> Result<()> {
         // The `.git` gitlink file must survive the overlay mount (which replaces
@@ -461,30 +447,115 @@ fn add_overlay_worktree(repo: &RepoContext, branch: &str, target: &Path, base: &
     })();
 
     if let Err(error) = populate {
-        overlay::unmount(target);
-        let _ = fs::remove_dir_all(target);
-        let _ = fs::remove_dir_all(&overlay_dir);
-        let _ = run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")]);
-        let _ = Command::new("git")
-            .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-            .args(["branch", "-D", branch])
-            .status();
+        overlay::unmount(target)
+            .context("detach failed overlay; workspace retained for recovery")?;
+        // Restore Git's link before asking Git to remove its registration.
+        if !target.join(".git").exists() && upper.join(".git").exists() {
+            fs::rename(upper.join(".git"), target.join(".git"))?;
+        }
+        rollback_created_worktree(repo, target, branch, new_branch)?;
+        fs::remove_dir_all(&overlay_dir).context("cleanup failed overlay state")?;
         return Err(error);
     }
     Ok(())
 }
 
-/// Tear down a worktree unconditionally, handling the overlay case (unmount +
-/// remove mount dir + drop upper/work + prune the registry) or delegating to
-/// `git worktree remove --force` for plain worktrees.
-fn force_teardown(repo: &RepoContext, target: &Path) -> Result<()> {
+/// Recheck dirty state at teardown so a command finishing during GC selection
+/// cannot turn a previously clean workspace into silently discarded work.
+fn teardown_worktree(repo: &RepoContext, target: &Path, force: bool) -> Result<()> {
+    ensure_unlocked(repo, target)?;
     if let Some(state) = overlay::state(repo, target) {
-        overlay::unmount(target);
-        let _ = fs::remove_dir_all(target);
-        let _ = fs::remove_dir_all(&state.overlay_dir);
-        run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")])
-    } else {
+        let lock = WorktreeLock::acquire(repo, target)?;
+        if !force && worktree_dirty(target)? {
+            bail!("worktree has uncommitted changes; pass --commit or --force");
+        }
+        overlay::unmount(target)?;
+        remove_dir_if_present(target)?;
+        remove_dir_if_present(&state.overlay_dir)?;
+        lock.release()?;
+        prune_git_worktrees(repo)
+    } else if force {
         remove_worktree_force(repo, target)
+    } else {
+        run_git_common(
+            repo,
+            [
+                OsStr::new("worktree"),
+                OsStr::new("remove"),
+                target.as_os_str(),
+            ],
+        )
+    }
+}
+
+fn remove_dir_if_present(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn worktree_lock_path(repo: &RepoContext, target: &Path) -> Result<PathBuf> {
+    if let Some(admin) = overlay::admin_dir(repo, target) {
+        return Ok(admin.join("locked"));
+    }
+    // Git cannot lock its main worktree, which it already refuses to remove.
+    // Use a separate marker there only to serialize simgit launches.
+    if target.join(".git").exists() && worktree_admin_dir(target)? == repo.common_git_dir {
+        return Ok(repo.common_git_dir.join("simgit-run.lock"));
+    }
+    bail!("cannot find worktree registration for {}", target.display())
+}
+
+fn ensure_unlocked(repo: &RepoContext, target: &Path) -> Result<()> {
+    if worktree_lock_path(repo, target).is_ok_and(|path| path.exists()) {
+        bail!(
+            "worktree is locked (a command may be running): {}",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+struct WorktreeLock {
+    path: Option<PathBuf>,
+}
+
+impl WorktreeLock {
+    fn acquire(repo: &RepoContext, target: &Path) -> Result<Self> {
+        let path = worktree_lock_path(repo, target)?;
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)
+            .with_context(|| format!("lock workspace at {}; if already locked, check for a running command before unlocking", path.display()))?;
+        use std::io::Write;
+        let lock = Self { path: Some(path) };
+        file.write_all(b"simgit: workspace in use\n")?;
+        Ok(lock)
+    }
+
+    fn release(mut self) -> Result<()> {
+        if let Some(path) = self.path.take() {
+            remove_file_if_present(&path)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for WorktreeLock {
+    fn drop(&mut self) {
+        if let Some(path) = &self.path {
+            if let Err(error) = remove_file_if_present(path) {
+                eprintln!("could not unlock worktree: {error:#}");
+            }
+        }
     }
 }
 
@@ -492,14 +563,12 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = discover_repo(&cwd)?;
     let target = resolve_worktree_target(&repo, args.target.as_deref())?;
+    ensure_unlocked(&repo, &target)?;
     let branch = list_worktrees(&repo)?
         .into_iter()
         .find(|entry| entry.path == target)
         .and_then(|entry| entry.branch)
         .or_else(|| overlay::branch(&repo, &target));
-    // Detect overlay backing while the worktree is still mounted/registered.
-    let overlay = overlay::state(&repo, &target);
-
     let mut committed = false;
     if args.commit {
         run_git_at(&target, ["add", "-A"]).context("stage worktree changes")?;
@@ -519,25 +588,7 @@ fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         }
     }
 
-    if let Some(state) = overlay {
-        if !args.force && !committed && worktree_dirty(&target)? {
-            bail!("worktree has uncommitted changes; pass --commit or --force");
-        }
-        overlay::unmount(&target);
-        let _ = fs::remove_dir_all(&target);
-        let _ = fs::remove_dir_all(&state.overlay_dir);
-        run_git_common(&repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
-    } else {
-        let mut command = Command::new("git");
-        command
-            .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-            .args(["worktree", "remove"]);
-        if args.force {
-            command.arg("--force");
-        }
-        command.arg(&target);
-        run_command(&mut command, "git worktree remove")?;
-    }
+    teardown_worktree(&repo, &target, args.force)?;
 
     let mut branch_deleted = false;
     if args.delete_branch {
@@ -587,24 +638,43 @@ fn worktree_path_for_branch(repo: &RepoContext, branch: &str) -> Result<Option<P
         .map(|entry| entry.path))
 }
 
+fn worktree_description(repo: &RepoContext, entry: &WorktreeEntry) -> String {
+    let branch = entry.branch.as_deref().unwrap_or("(detached)");
+    let persistence = if is_ephemeral(repo, &entry.path) {
+        "ephemeral"
+    } else {
+        "persistent"
+    };
+    let locked = if ensure_unlocked(repo, &entry.path).is_err() {
+        " locked"
+    } else {
+        ""
+    };
+    format!(
+        "{}\t{}\t{}{}",
+        branch.strip_prefix("refs/heads/").unwrap_or(branch),
+        entry.path.to_string_lossy().escape_debug(),
+        persistence,
+        locked
+    )
+}
+
 fn list(json_output: bool) -> Result<()> {
     let repo = discover_repo(&std::env::current_dir()?)?;
     if !json_output {
-        let output = git_output_common(&repo, ["worktree", "list"])?;
-        if !output.status.success() {
-            return Err(git_failure("git worktree list", &output));
+        for entry in list_worktrees(&repo)? {
+            println!("{}", worktree_description(&repo, &entry));
         }
-        print!("{}", String::from_utf8_lossy(&output.stdout));
         return Ok(());
     }
 
-    let output = git_output_common(&repo, ["worktree", "list", "--porcelain"])?;
+    let output = git_output_common(&repo, ["worktree", "list", "--porcelain", "-z"])?;
     if !output.status.success() {
         return Err(git_failure("git worktree list --porcelain", &output));
     }
     let mut entries = Vec::new();
     let mut current = serde_json::Map::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in String::from_utf8_lossy(&output.stdout).split('\0') {
         if line.is_empty() {
             if !current.is_empty() {
                 entries.push(serde_json::Value::Object(std::mem::take(&mut current)));
@@ -622,17 +692,44 @@ fn list(json_output: bool) -> Result<()> {
     if !current.is_empty() {
         entries.push(serde_json::Value::Object(current));
     }
+    for entry in &mut entries {
+        if let Some(path) = entry
+            .get("worktree")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from)
+        {
+            entry["ephemeral"] = json!(is_ephemeral(&repo, &path));
+            if entry.get("locked").is_none() && ensure_unlocked(&repo, &path).is_err() {
+                entry["locked"] = json!("simgit: workspace in use");
+            }
+        }
+    }
     println!("{}", serde_json::to_string_pretty(&entries)?);
+    Ok(())
+}
+
+/// Keep recoverable unmounted overlays registered during native pruning.
+fn prune_git_worktrees(repo: &RepoContext) -> Result<()> {
+    let mut locks = Vec::new();
+    for (path, state) in overlay::registrations(repo) {
+        if state.overlay_dir.is_dir() && ensure_unlocked(repo, &path).is_ok() {
+            locks.push(WorktreeLock::acquire(repo, &path)?);
+        }
+    }
+    run_git_common(repo, ["worktree", "prune"])?;
+    for lock in locks {
+        lock.release()?;
+    }
     Ok(())
 }
 
 fn prune(args: WorktreePrune) -> Result<()> {
     let repo = discover_repo(&std::env::current_dir()?)?;
-    run_git_common(&repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
-    let protected: HashSet<PathBuf> = list_worktrees(&repo)?
+    let protected: HashSet<PathBuf> = overlay::registrations(&repo)
         .into_iter()
-        .filter_map(|entry| overlay::state(&repo, &entry.path).and_then(|state| state.lower))
+        .filter_map(|(_, state)| state.lower)
         .collect();
+    prune_git_worktrees(&repo)?;
     let removed = cow::prune_baselines(&repo.common_git_dir, args.all, &protected)?;
     println!("pruned {removed} cached baseline(s)");
     Ok(())
@@ -741,7 +838,12 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
                 continue;
             }
         }
-        if args.ephemeral && !is_ephemeral(repo, &entry.path) {
+        if !args.include_persistent && !is_ephemeral(repo, &entry.path) {
+            skipped.push((entry.path.clone(), "persistent"));
+            continue;
+        }
+        if ensure_unlocked(repo, &entry.path).is_err() {
+            skipped.push((entry.path.clone(), "locked"));
             continue;
         }
         if worktree_idle(&entry.path) < older_than {
@@ -764,7 +866,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
             reaped.push(entry.path);
             continue;
         }
-        match force_teardown(repo, &entry.path) {
+        match teardown_worktree(repo, &entry.path, args.force) {
             Ok(()) => {
                 if args.delete_branches {
                     if let Some(branch) = &entry.branch {
@@ -782,7 +884,7 @@ fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
     }
 
     if !args.dry_run {
-        run_git_common(repo, [OsStr::new("worktree"), OsStr::new("prune")])?;
+        prune_git_worktrees(repo)?;
     }
     Ok(GcOutcome {
         reaped,
@@ -812,7 +914,7 @@ struct WorktreeEntry {
 }
 
 fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
-    let output = git_output_common(repo, ["worktree", "list", "--porcelain"])?;
+    let output = git_output_common(repo, ["worktree", "list", "--porcelain", "-z"])?;
     if !output.status.success() {
         return Err(git_failure("git worktree list --porcelain", &output));
     }
@@ -820,10 +922,10 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
     let mut entries = Vec::new();
     let mut path: Option<PathBuf> = None;
     let mut branch: Option<String> = None;
-    for line in text.lines() {
+    for line in text.split('\0') {
         if line.is_empty() {
             if let Some(path) = path.take() {
-                let is_main = path == repo.top_level;
+                let is_main = entries.is_empty();
                 entries.push(WorktreeEntry {
                     path,
                     branch: branch.take(),
@@ -838,7 +940,7 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
         }
     }
     if let Some(path) = path.take() {
-        let is_main = path == repo.top_level;
+        let is_main = entries.is_empty();
         entries.push(WorktreeEntry {
             path,
             branch,
@@ -1016,12 +1118,17 @@ fn ensure_clean(worktree: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rollback_created_worktree(repo: &RepoContext, target: &Path, branch: &str) {
-    let _ = remove_worktree_force(repo, target);
-    let _ = Command::new("git")
-        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
-        .args(["branch", "-D", branch])
-        .status();
+fn rollback_created_worktree(
+    repo: &RepoContext,
+    target: &Path,
+    branch: &str,
+    new_branch: bool,
+) -> Result<()> {
+    remove_worktree_force(repo, target).context("rollback incomplete worktree")?;
+    if new_branch {
+        delete_local_branch(repo, branch, true)?;
+    }
+    Ok(())
 }
 
 fn remove_worktree_force(repo: &RepoContext, target: &Path) -> Result<()> {

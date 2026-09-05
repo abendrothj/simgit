@@ -6,7 +6,7 @@
 
 **Disk-efficient, separate Git worktrees for running many agents on one repository at once.**
 
-<p align="center"><img src="assets/demo.gif" alt="sg worktree run: launch agents in copy-on-write worktrees, merge their branches, and clean up" width="820"></p>
+<p align="center"><img src="assets/demo.gif" alt="sg run: launch agents in copy-on-write worktrees, merge their branches, and clean up" width="820"></p>
 
 `sg worktree` creates real Git linked worktrees populated from a shared,
 immutable baseline using copy-on-write:
@@ -132,24 +132,76 @@ pass `--force`.
 
 ### Running agents
 
-Create an ephemeral worktree and launch an agent inside it with one command:
+Create a persistent workspace and launch your agent's normal terminal interface:
 
 ```bash
-sg worktree run agent/auth -- claude -p "implement authentication"
-sg worktree run agent/api  -- codex exec "implement the API"
+sg run chat/auth -- claude
+sg run chat/api -- codex
 
-# Integrate selected branches normally, then remove worktrees and merged branches:
-git merge agent/auth
-sg worktree gc --ephemeral --older-than 1h --delete-branches
+# Return to the same workspace and let the agent resume its conversation:
+sg run chat/auth -- claude --continue
+sg run chat/api -- codex resume --last
 
-# Explicitly discard abandoned work and its unmerged branch:
-sg worktree gc --ephemeral --older-than 24h --delete-branches --force
+# Or choose the workspace interactively, independently of the agent:
+sg run -- claude --continue
+sg run -- codex resume --last
+
+# Find workspace branches, paths, and persistence/lock status:
+sg worktree list
+
+# Explicitly mark disposable automation for garbage collection:
+sg run agent/test --ephemeral -- codex exec "implement the API"
+git merge agent/test
+sg worktree gc --older-than 1h --delete-branches
+
+# Explicitly discard abandoned ephemeral work and its unmerged branch:
+sg worktree gc --older-than 24h --delete-branches --force
 ```
 
-`worktree run` retains the worktree after the command exits and marks it
-ephemeral unless `--persistent` is passed. `--json` on `add` / `remove` / `gc`
-gives orchestrators structured output. `gc` skips worktrees with uncommitted
-changes unless `--force`, and takes `--prefix <branch-prefix>`,
+`sg run [branch] -- <command>` is the short form of `sg worktree run`.
+Omit the branch for a numbered picker of existing workspaces, including the
+main checkout and detached worktrees. The picker shows branch, path,
+persistence, and lock status; type a number to select or `q` to cancel.
+Selection requires an interactive terminal. Scripts must supply a branch.
+Always put `--` before the child command.
+
+Workspaces do not store a preferred agent or launch command: you can select
+the same workspace for Claude, Codex, a shell, or any other command. Claude's
+`--continue` resumes its most recent conversation in that directory;
+`--resume` opens its conversation picker. Codex uses `resume --last`.
+Those agent options select conversations; simgit's picker selects files and
+branches. To create a workspace, supply a new branch name explicitly.
+
+`run` reuses the branch's registered worktree, including uncommitted files. If
+only the branch exists, it creates a worktree at that branch's current commit;
+otherwise it creates both. `add` always requires a new branch and workspace.
+Everything after `--` goes to the child command unchanged. The agent owns its
+conversation history and resume behavior; simgit owns the workspace.
+
+New `run` worktrees are persistent by default. Existing worktrees keep their
+persistence setting unless you pass `--ephemeral` or `--persistent` explicitly.
+GC selects only ephemeral worktrees by default, even with `--force`; use
+`--include-persistent` to explicitly include persistent workspaces. This changes
+the earlier defaults: automation that relied on `run` creating disposable
+workspaces should now pass `--ephemeral`.
+
+On reuse, `--path` must identify the existing workspace. `--base` and
+`--require-cow` are creation-only options and are rejected on reuse; `--base`
+is also rejected when attaching an existing branch. `--require-cow` cannot be
+combined with `SIMGIT_POPULATE=checkout`.
+
+While a command launched by `run` is active, its linked worktree is locked
+against removal and GC, including `--force`. A second `run` in the same
+workspace is refused until the first exits. If the launcher is killed, the
+lock is deliberately retained: verify that its child has stopped, then use
+`git worktree unlock <path>` to recover (for the main worktree, remove
+`.git/simgit-run.lock` instead). Commands launched outside `sg run`
+are not tracked. Idle age still uses index/directory modification time, so
+it is only a cleanup heuristic for explicitly disposable workspaces.
+
+`--json` on `add` / `remove` / `list` / `gc` gives orchestrators structured
+output; `list` includes an `ephemeral` boolean. GC skips uncommitted changes
+unless `--force`, and accepts `--prefix <branch-prefix>`,
 `--older-than <90s|30m|24h|7d>`, `--delete-branches`, and `--dry-run`. Safe
 branch deletion retains unmerged work; combining it with `--force` explicitly
 discards unmerged branches.
@@ -162,7 +214,7 @@ as usual — there is no shared state to coordinate.
 ```text
 simgit/
 ├── sg/                 the CLI (`sg worktree`)
-│   └── src/commands/worktree/   CoW and overlay backends
+│   └── src/commands/worktree/   command launch/picker, CoW and overlay backends
 ├── tests/              CoW scaling benchmarks + overlay integration test
 ├── packaging/          Homebrew formula
 └── docs/               scaling benchmark methodology

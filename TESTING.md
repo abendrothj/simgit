@@ -1,16 +1,29 @@
 # Testing Guide
 
-simgit is a single-binary CLI (`sg worktree`) with no daemon or runtime
+simgit is a single-binary CLI (`sg run` / `sg worktree`) with no daemon or runtime
 services, so testing is correspondingly small.
 
 ## Rust
 
 ```bash
 cargo build      # compile the sg binary
-cargo test       # run unit tests
+cargo test       # run unit and CLI integration tests
 cargo clippy     # lint
 cargo fmt -- --check
 ```
+
+The CLI checks cover create/reuse/attach, persistence and GC selection, active
+workspace locks, failed launches, option validation, and argument passthrough.
+For the numbered picker, run the stdlib-only PTY test on macOS or Linux:
+
+```bash
+cargo build --locked
+python3 tests/cli_picker.py
+```
+
+It verifies both command spellings, invalid-number retry, cancellation,
+detached worktree selection, terminal inheritance, and noninteractive rejection.
+The macOS/Linux CI jobs run it after the Rust tests.
 
 ## Manual smoke test
 
@@ -19,10 +32,14 @@ sg=$(pwd)/target/debug/sg
 tmp=$(mktemp -d) && cd "$tmp"
 git init -q && git commit -q --allow-empty -m init
 
-cd "$("$sg" worktree add feature-x)"   # creates + enters a CoW worktree
-"$sg" worktree list                     # shows main + feature-x
-"$sg" worktree list --json              # machine-readable
-"$sg" worktree remove "$PWD" --force --delete-branch # tears it down
+"$sg" run feature-x -- sh -c 'echo unfinished > scratch.txt'
+"$sg" run feature-x -- cat scratch.txt  # same workspace and files
+"$sg" run -- pwd                       # choose a workspace by number
+"$sg" run -- sh                        # choose any workspace for another harness/shell
+"$sg" worktree list                    # branches, paths, persistence, locks
+"$sg" worktree list --json             # machine-readable
+"$sg" worktree gc --older-than 0s --force  # persistent workspace remains
+"$sg" worktree remove feature-x --force --delete-branch
 ```
 
 ## Overlay mode (Linux)
@@ -38,7 +55,8 @@ SG="$PWD/target/release/sg" bash tests/overlay_integration.sh
 
 `SIMGIT_POPULATE=reflink|overlay|checkout` forces a populate mode. The script
 also unmounts live overlays to verify `repair`, stale-state cleanup, upperdir
-preservation, branch cleanup, and normal remove/GC teardown.
+preservation, reuse/remount through `run`, failed-unmount protection, branch
+cleanup, and normal remove/GC teardown.
 
 ## CoW scaling benchmarks
 

@@ -16,8 +16,8 @@
 //! - `sg worktree list` — list worktrees
 //! - `sg worktree remove <branch|path>` — remove a worktree (optionally
 //!   committing first)
-//! - `sg worktree run <branch> -- <command>` — create an ephemeral worktree and
-//!   launch a command inside it
+//! - `sg run [branch] -- <command>` — create, reuse, or pick a workspace and
+//!   launch any command inside it (`sg worktree run` is also supported)
 //! - `sg worktree gc` — reap idle/ephemeral worktrees and optionally branches
 //! - `sg worktree repair` — remount interrupted Linux overlay worktrees
 //! - `sg worktree prune` — prune stale worktree administrative entries
@@ -53,6 +53,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run any command in a workspace; omit the branch to choose interactively.
+    Run(commands::worktree::WorktreeRun),
     /// Native CoW-backed linked worktrees.
     #[command(subcommand)]
     Worktree(commands::worktree::Worktree),
@@ -61,6 +63,9 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Run(args) => {
+            commands::worktree::run(commands::worktree::Worktree::Run(args), cli.json)
+        }
         Commands::Worktree(cmd) => commands::worktree::run(cmd, cli.json),
     }
 }

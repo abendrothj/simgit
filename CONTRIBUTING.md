@@ -10,18 +10,19 @@ cargo test --workspace
 ```
 
 You'll need:
-- Rust stable (1.75+)
+- Rust stable (the current stable toolchain is used in CI)
 - Git (any recent version)
 - macOS: no extra dependencies (APFS `clonefile`)
-- Linux: no extra dependencies (`overlayfs`, with a reflink-clone fallback)
+- Linux: native reflink where supported; install `fuse-overlayfs` for the
+  overlay fallback, otherwise a normal checkout is used
 
 ## Project structure
 
 ```
 simgit/
-├── sg/               the CLI — `sg worktree add/run/list/remove/prune/gc/repair`
+├── sg/               the CLI — `sg run` and `sg worktree add/run/list/remove/prune/gc/repair`
 │   ├── src/commands/worktree.rs   command and lifecycle orchestration
-│   └── src/commands/worktree/     CoW baseline and overlay backends
+│   └── src/commands/worktree/     launch/picker, CoW baseline, and overlay backends
 ├── tests/            CoW scaling benchmarks + overlay_integration.sh (Linux)
 ├── packaging/        Homebrew formula
 └── docs/             scaling benchmark methodology
@@ -40,6 +41,13 @@ via `clonefile`/reflink or a `fuse-overlayfs` mount from a cached baseline. The
 command lifecycle lives in `sg/src/commands/worktree.rs`; filesystem-specific
 CoW baseline and overlay recovery logic lives in the adjacent backend modules.
 
+The `sg run` alias and `sg worktree run` share the same argument parser and
+implementation. `sg/src/commands/worktree/launch.rs` handles workspace
+selection and child execution; it never stores a preferred harness. Omitting
+the branch opens a terminal-only picker; scripts must pass a branch and `--`
+before the command. New workspaces are persistent; disposable runs opt in with
+`--ephemeral`. GC requires `--include-persistent` to select persistent workspaces.
+
 The overlay path only activates on Linux with `fuse-overlayfs`; it can't run on
 macOS, so it's covered by `tests/overlay_integration.sh` in the `overlay-linux`
 CI job. `SIMGIT_POPULATE=reflink|overlay|checkout` forces a populate mode.
@@ -50,8 +58,9 @@ section and Git history.)
 
 ## Before submitting a PR
 
-1. Run tests: `cargo test`
-2. Lint (if available): `cargo clippy`
+1. Run tests: `cargo test --workspace --locked` and `python3 tests/cli_picker.py`
+   (run `cargo build --locked` first if testing the picker on its own)
+2. Lint: `cargo clippy --all-targets --locked -- -D warnings`
 3. Check formatting: `cargo fmt -- --check`
 4. Keep commits focused — one concept per commit
 5. Update docs if your change affects user-facing behavior

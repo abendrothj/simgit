@@ -29,12 +29,12 @@ fn gc_reaps_ephemeral_and_by_prefix_but_spares_others() -> Result<()> {
     let base = resolve_commit(&repo, "HEAD")?;
 
     let eph = fixture.root.join("eph");
-    add_git_worktree(&repo, "exp/eph", &eph, &base)?;
+    add_git_worktree(&repo, "exp/eph", &eph, &base, true)?;
     mark_ephemeral(&eph)?;
     let keep = fixture.root.join("keep");
-    add_git_worktree(&repo, "exp/keep", &keep, &base)?;
+    add_git_worktree(&repo, "exp/keep", &keep, &base, true)?;
     let other = fixture.root.join("other");
-    add_git_worktree(&repo, "feat/other", &other, &base)?;
+    add_git_worktree(&repo, "feat/other", &other, &base, true)?;
     mark_ephemeral(&other)?;
 
     let args = WorktreeGc {
@@ -45,7 +45,7 @@ fn gc_reaps_ephemeral_and_by_prefix_but_spares_others() -> Result<()> {
     };
     let outcome = run_gc(&repo, &args)?;
     assert_eq!(outcome.reaped, vec![eph]);
-    assert!(outcome.skipped.is_empty());
+    assert_eq!(outcome.skipped, vec![(keep.clone(), "persistent")]);
 
     let branches: Vec<_> = list_worktrees(&repo)?
         .iter()
@@ -67,13 +67,14 @@ fn gc_skips_dirty_worktrees_without_force() -> Result<()> {
     let repo = discover_repo(&fixture.repo)?;
     let base = resolve_commit(&repo, "HEAD")?;
     let dirty = fixture.root.join("dirty");
-    add_git_worktree(&repo, "dirty", &dirty, &base)?;
+    add_git_worktree(&repo, "dirty", &dirty, &base, true)?;
     fs::write(dirty.join("scratch.txt"), "uncommitted")?;
 
     let outcome = run_gc(
         &repo,
         &WorktreeGc {
             older_than: "0s".to_owned(),
+            include_persistent: true,
             ..Default::default()
         },
     )?;
@@ -84,6 +85,7 @@ fn gc_skips_dirty_worktrees_without_force() -> Result<()> {
         &repo,
         &WorktreeGc {
             older_than: "0s".to_owned(),
+            include_persistent: true,
             force: true,
             ..Default::default()
         },
@@ -98,12 +100,13 @@ fn gc_deletes_merged_branches_when_requested() -> Result<()> {
     let repo = discover_repo(&fixture.repo)?;
     let base = resolve_commit(&repo, "HEAD")?;
     let target = fixture.root.join("merged");
-    add_git_worktree(&repo, "agent/merged", &target, &base)?;
+    add_git_worktree(&repo, "agent/merged", &target, &base, true)?;
 
     let outcome = run_gc(
         &repo,
         &WorktreeGc {
             older_than: "0s".to_owned(),
+            include_persistent: true,
             delete_branches: true,
             ..Default::default()
         },
@@ -121,7 +124,7 @@ fn gc_retains_unmerged_branches_without_force() -> Result<()> {
     let repo = discover_repo(&fixture.repo)?;
     let base = resolve_commit(&repo, "HEAD")?;
     let target = fixture.root.join("unmerged");
-    add_git_worktree(&repo, "agent/unmerged", &target, &base)?;
+    add_git_worktree(&repo, "agent/unmerged", &target, &base, true)?;
     fs::write(target.join("agent.txt"), "result")?;
     run_git_at(&target, ["add", "."])?;
     run_git_at(&target, ["commit", "-q", "-m", "agent result"])?;
@@ -130,6 +133,7 @@ fn gc_retains_unmerged_branches_without_force() -> Result<()> {
         &repo,
         &WorktreeGc {
             older_than: "0s".to_owned(),
+            include_persistent: true,
             delete_branches: true,
             ..Default::default()
         },
@@ -146,7 +150,7 @@ fn worktree_paths_with_spaces_are_supported() -> Result<()> {
     let repo = discover_repo(&fixture.repo)?;
     let base = resolve_commit(&repo, "HEAD")?;
     let target = fixture.root.join("path with spaces");
-    add_git_worktree(&repo, "spaces", &target, &base)?;
+    add_git_worktree(&repo, "spaces", &target, &base, true)?;
     ensure_clean(&target)?;
     assert_eq!(fs::read_to_string(target.join("file.txt"))?, "content\n");
     Ok(())
@@ -158,7 +162,7 @@ fn overlay_marker_round_trips_through_common_admin_dir() -> Result<()> {
     let repo = discover_repo(&fixture.repo)?;
     let base = resolve_commit(&repo, "HEAD")?;
     let worktree = fixture.root.join("wt");
-    add_git_worktree(&repo, "wt", &worktree, &base)?;
+    add_git_worktree(&repo, "wt", &worktree, &base, true)?;
     assert!(overlay::state(&repo, &worktree).is_none());
 
     let state = overlay::State {
@@ -192,7 +196,7 @@ fn admin_dir_does_not_escape_to_the_common_git_dir_when_unmounted() -> Result<()
     // Mirrors production overlay worktrees, whose mountpoint lives inside the
     // common git dir itself (e.g. `.git/simgit/worktrees/<name>`).
     let worktree = repo.common_git_dir.join("simgit/worktrees/nested");
-    add_git_worktree(&repo, "nested", &worktree, &base)?;
+    add_git_worktree(&repo, "nested", &worktree, &base, true)?;
     let admin = overlay::admin_dir(&repo, &worktree).expect("admin dir while mounted");
     assert_ne!(admin, repo.common_git_dir);
 
@@ -225,7 +229,7 @@ fn native_worktree_fallback_is_clean_and_registered() -> Result<()> {
     let repo = discover_repo(&fixture.repo)?;
     let target = fixture.root.join("fallback");
     let base = resolve_commit(&repo, "HEAD")?;
-    add_git_worktree(&repo, "fallback-test", &target, &base)?;
+    add_git_worktree(&repo, "fallback-test", &target, &base, true)?;
     ensure_clean(&target)?;
     let listed = git_output_common(&repo, ["worktree", "list", "--porcelain"])?;
     assert!(String::from_utf8_lossy(&listed.stdout).contains(target.to_string_lossy().as_ref()));
@@ -302,7 +306,7 @@ fn cow_worktree_is_clean_when_filesystem_supports_clones() -> Result<()> {
     }
     let target = fixture.root.join("cow");
     let base = resolve_commit(&repo, "HEAD")?;
-    add_cow_worktree(&repo, "cow-test", &target, &base)?;
+    add_cow_worktree(&repo, "cow-test", &target, &base, true)?;
     ensure_clean(&target)?;
     assert_eq!(fs::read_to_string(target.join("file.txt"))?, "content\n");
     assert_eq!(
@@ -386,4 +390,77 @@ fn git<const N: usize>(path: &Path, args: [&str; N]) -> Result<()> {
     let mut command = Command::new("git");
     command.arg("-C").arg(path).args(args);
     run_command(&mut command, "test git")
+}
+
+#[test]
+fn cow_attachment_and_failed_population_preserve_existing_branch() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    if !cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        return Ok(());
+    }
+    let base = resolve_commit(&repo, "HEAD")?;
+    run_git_common(&repo, ["branch", "existing", &base])?;
+    let target = fixture.root.join("attached");
+    add_cow_worktree(&repo, "existing", &target, &base, false)?;
+    ensure_clean(&target)?;
+    assert_eq!(resolve_commit(&discover_repo(&target)?, "HEAD")?, base);
+    remove_worktree_force(&repo, &target)?;
+
+    // Corrupt only the disposable fixture's baseline to force verification failure.
+    let baseline = cow::ensure_baseline(&repo, &base)?;
+    fs::write(baseline.join("file.txt"), "incorrect baseline")?;
+    assert!(add_cow_worktree(&repo, "existing", &target, &base, false).is_err());
+    assert!(!target.exists());
+    assert_eq!(resolve_commit(&repo, "refs/heads/existing")?, base);
+    Ok(())
+}
+
+#[test]
+fn prune_retains_old_unmounted_overlay_registration() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+    let worktree = fixture.root.join("recoverable");
+    add_git_worktree(&repo, "recoverable", &worktree, &base, true)?;
+    let admin = worktree_admin_dir(&worktree)?;
+    let overlay_dir = overlay::root(&repo.common_git_dir).join("saved");
+    fs::create_dir_all(overlay_dir.join("upper"))?;
+    overlay::write_marker(
+        &admin,
+        &overlay::State {
+            overlay_dir,
+            lower: None,
+        },
+    )?;
+    fs::remove_file(worktree.join(".git"))?;
+    fs::File::open(admin.join("gitdir"))?
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+    prune_git_worktrees(&repo)?;
+    assert!(admin.is_dir());
+    assert!(!admin.join("locked").exists());
+    assert_eq!(
+        overlay::worktree_for_branch(&repo, "recoverable"),
+        Some(worktree)
+    );
+    Ok(())
+}
+
+#[test]
+fn registry_identifies_main_when_invoked_from_linked_worktree() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+    let target = fixture.root.join("linked");
+    add_git_worktree(&repo, "linked", &target, &base, true)?;
+    let entries = list_worktrees(&discover_repo(&target)?)?;
+    assert!(entries[0].is_main);
+    assert!(
+        !entries
+            .iter()
+            .find(|entry| entry.path == target)
+            .unwrap()
+            .is_main
+    );
+    Ok(())
 }

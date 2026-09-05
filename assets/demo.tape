@@ -17,7 +17,7 @@ Type "export SGTK=$PWD"
 Enter
 Type "export PATH=$SGTK/target/release:$SGTK/assets:$PATH"
 Enter
-Type "rm -rf /tmp/sgdemo /tmp/sg-auth /tmp/sg-api && mkdir /tmp/sgdemo && cd /tmp/sgdemo"
+Type "export SGDEMO=$(mktemp -d /tmp/sgdemo.XXXXXX) && cd $SGDEMO"
 Enter
 Type "git init -q && git config user.email demo@demo && git config user.name demo"
 Enter
@@ -30,12 +30,21 @@ Show
 Type "# one command creates a CoW worktree and runs the agent inside it"
 Enter
 Sleep 500ms
-Type "sg worktree run agent/auth --path /tmp/sg-auth -- demo-agent auth"
+Type "sg run agent/auth --ephemeral -- demo-agent auth"
 Enter
 Sleep 1400ms
-Type "sg worktree run agent/api --path /tmp/sg-api -- demo-agent api"
+Type "sg run agent/api --ephemeral -- demo-agent api"
 Enter
 Sleep 1400ms
+
+Type "# choose a workspace for any command"
+Enter
+Type "sg run -- pwd"
+Enter
+Sleep 700ms
+Type "2"
+Enter
+Sleep 1200ms
 
 Type "# separate branches, real commits"
 Enter
@@ -54,3 +63,7 @@ Type "sg worktree gc --ephemeral --older-than 0s --delete-branches"
 Enter
 Sleep 2200ms
 Sleep 700ms
+
+Hide
+Type "cd $SGTK && rm -rf $SGDEMO"
+Enter

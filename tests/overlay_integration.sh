@@ -78,6 +78,29 @@ grep -qx preserved "$repair/preserved.txt" || fail "repair lost upperdir data"
 git -C "$repair" status --porcelain >/dev/null || fail "repaired overlay is not a usable Git worktree"
 "$SG" worktree remove repair-me --force --delete-branch
 
+echo "== run reuses and repairs an existing overlay =="
+resume="$("$SG" worktree add resume-me --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
+echo ongoing >"$resume/chat.txt"
+sync "$resume/chat.txt"
+unmount_and_wait "$resume"
+"$SG" worktree run resume-me -- sh -c 'grep -qx ongoing chat.txt'
+"$SG" worktree remove resume-me --force --delete-branch
+
+echo "== failed unmount preserves files and reports failure =="
+blocked="$("$SG" worktree add blocked-me --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
+echo keep-me >"$blocked/keep.txt"
+mkdir fail-unmount
+for tool in fusermount3 fusermount umount; do
+    printf '#!/bin/sh\nexit 1\n' >"fail-unmount/$tool"
+    chmod +x "fail-unmount/$tool"
+done
+if PATH="$PWD/fail-unmount:$PATH" "$SG" worktree remove blocked-me --force; then
+    fail "remove succeeded despite failed unmount"
+fi
+mount_present "$blocked" || fail "failed teardown detached the mount unexpectedly"
+grep -qx keep-me "$blocked/keep.txt" || fail "failed teardown deleted work"
+"$SG" worktree remove blocked-me --force --delete-branch
+
 echo "== stale unmounted overlays can be removed without remounting =="
 stale="$("$SG" worktree add stale-me --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
 unmount_and_wait "$stale"

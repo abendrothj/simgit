@@ -37,20 +37,29 @@ pub(super) fn mount(lower: &Path, upper: &Path, work: &Path, mountpoint: &Path) 
     run_command(&mut command, "mount fuse-overlayfs overlay")
 }
 
-/// Best-effort unmount. An already-unmounted path is a successful no-op.
-pub(super) fn unmount(mountpoint: &Path) {
-    for tool in ["fusermount3", "fusermount"] {
-        let status = Command::new(tool)
-            .arg("-u")
+/// Refuse teardown until the mount table confirms the overlay is detached.
+pub(super) fn unmount(mountpoint: &Path) -> Result<()> {
+    if !is_mounted(mountpoint) {
+        return Ok(());
+    }
+    for tool in ["fusermount3", "fusermount", "umount"] {
+        let mut command = Command::new(tool);
+        if tool != "umount" {
+            command.arg("-u");
+        }
+        let _ = command
             .arg(mountpoint)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        if matches!(status, Ok(status) if status.success()) {
-            return;
+        if !is_mounted(mountpoint) {
+            return Ok(());
         }
     }
-    let _ = Command::new("umount").arg(mountpoint).status();
+    bail!(
+        "could not unmount {}; files and overlay state retained",
+        mountpoint.display()
+    )
 }
 
 pub(super) fn write_marker(admin: &Path, state: &State) -> Result<()> {
@@ -190,7 +199,8 @@ pub(super) fn is_mounted(worktree: &Path) -> bool {
                         .is_some_and(|path| path == wanted)
                 })
             })
-            .unwrap_or(false)
+            // Failure to inspect mounts must never authorize deleting a live view.
+            .unwrap_or(true)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -222,7 +232,7 @@ pub(super) fn repair(repo: &RepoContext, worktree: &Path) -> Result<bool> {
         // FUSE can leave a disconnected mount-table entry after an interrupted
         // or lazy unmount. Detach that stale entry before mounting the saved
         // upperdir again.
-        unmount(worktree);
+        unmount(worktree)?;
         for _ in 0..40 {
             if !is_mounted(worktree) {
                 break;
@@ -252,7 +262,7 @@ pub(super) fn repair(repo: &RepoContext, worktree: &Path) -> Result<bool> {
     fs::create_dir_all(worktree)?;
     mount(&lower, &upper, &work, worktree)?;
     if !worktree.join(".git").is_file() {
-        unmount(worktree);
+        unmount(worktree)?;
         bail!("repaired overlay does not expose its Git worktree metadata");
     }
     Ok(true)

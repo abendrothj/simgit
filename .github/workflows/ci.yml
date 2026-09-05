@@ -19,6 +19,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+      - run: python3 tests/cli_picker.py
 
   overlay-linux:
     # Validates the fuse-overlayfs populate mode, which cannot run on macOS.
