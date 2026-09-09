@@ -8,28 +8,28 @@
 class Simgit < Formula
   desc "Cheap, isolated copy-on-write Git worktrees for running many agents at once"
   homepage "https://github.com/abendrothj/simgit"
-  version "0.1.6"
+  version "0.1.7"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/abendrothj/simgit/releases/download/v0.1.6/sg-aarch64-apple-darwin.tar.gz"
-      sha256 "9036a0da9754d3afd62940fca609620e8f3cb9fdca0d077de9d59d9f0dc7ac51"
+      url "https://github.com/abendrothj/simgit/releases/download/v0.1.7/sg-aarch64-apple-darwin.tar.gz"
+      sha256 "11ec1a9aa1ae3960d70f9ce30c4194e6d7e36eb5306d948a10bbeb0acc56ed1e"
     end
     on_intel do
-      url "https://github.com/abendrothj/simgit/releases/download/v0.1.6/sg-x86_64-apple-darwin.tar.gz"
-      sha256 "49ed838be810f5278aa715c771cd068d013ecb0f805f308c0b6229263d70da0c"
+      url "https://github.com/abendrothj/simgit/releases/download/v0.1.7/sg-x86_64-apple-darwin.tar.gz"
+      sha256 "aa264706033464ff833d7322e90b471704cd1179a18bd19095332f8501f87b6f"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/abendrothj/simgit/releases/download/v0.1.6/sg-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "4fac3f4a49f8f76a00cca5fa1838c0eecf1f825058d19f42c41e8cfdfd5e8ef9"
+      url "https://github.com/abendrothj/simgit/releases/download/v0.1.7/sg-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "ca96ef55eeec23b40cfe4263fbbcef7bc183954bab961bdbc43ff68999f32d6a"
     end
     on_intel do
-      url "https://github.com/abendrothj/simgit/releases/download/v0.1.6/sg-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "e3774b4a1d1fdc32b55128012fdf6e0ccfb6dac5e39341989a1b03814823be3e"
+      url "https://github.com/abendrothj/simgit/releases/download/v0.1.7/sg-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "eb8f43101670074de0cd333e69527f71b859c6f7cf3c3113749fd4822e0db17c"
     end
   end
 
