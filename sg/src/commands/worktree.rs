@@ -49,6 +49,11 @@ pub struct WorktreeAdd {
     /// Worktree path. Defaults to `../.simgit/<repo>/<branch>`.
     pub path: Option<PathBuf>,
 
+    /// Same as the positional path argument; accepted because `sg run` spells
+    /// it this way.
+    #[arg(long = "path", value_name = "PATH", conflicts_with = "path")]
+    pub path_flag: Option<PathBuf>,
+
     /// Commit-ish to start from. Defaults to HEAD.
     #[arg(long)]
     pub base: Option<String>,
@@ -237,7 +242,8 @@ fn create_worktree(args: &WorktreeAdd, attach: bool) -> Result<CreatedWorktree> 
             args.base.as_deref().unwrap_or("HEAD")
         },
     )?;
-    let target = absolute_path(match args.path.clone() {
+    let requested = args.path.clone().or_else(|| args.path_flag.clone());
+    let target = absolute_path(match requested {
         Some(path) => path,
         None => default_worktree_path(&repo.common_git_dir, &args.branch)?,
     })?;
@@ -508,6 +514,15 @@ fn add_overlay_worktree(
 /// cannot turn a previously clean workspace into silently discarded work.
 fn teardown_worktree(repo: &RepoContext, target: &Path, force: bool) -> Result<()> {
     ensure_unlocked(repo, target)?;
+    // Report uncommitted work in simgit's own terms on every path: Git's
+    // `worktree remove` only knows about --force, not about --commit.
+    if !force && worktree_dirty(target)? {
+        bail!(
+            "worktree has uncommitted changes: {}\n\
+             keep the work with --commit, or discard it with --force",
+            target.display()
+        );
+    }
     let result = if let Some(state) = overlay::state(repo, target) {
         let lock = WorktreeLock::acquire(repo, target)?;
         if !force && worktree_dirty(target)? {
@@ -607,8 +622,18 @@ struct WorktreeLock {
 impl WorktreeLock {
     fn acquire(repo: &RepoContext, target: &Path) -> Result<Self> {
         let path = worktree_lock_path(repo, target)?;
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)
-            .with_context(|| format!("lock workspace at {}; if already locked, check for a running command before unlocking", path.display()))?;
+        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+                "workspace is already in use by a running command: {}\n\
+                 if nothing is running there, release it with: git worktree unlock {}",
+                target.display(),
+                target.display()
+            ),
+            Err(error) => {
+                return Err(error).with_context(|| format!("lock workspace at {}", path.display()))
+            }
+        };
         use std::io::Write;
         let lock = Self { path: Some(path) };
         file.write_all(b"simgit: workspace in use\n")?;
@@ -1128,6 +1153,15 @@ fn resolve_commit(repo: &RepoContext, base: &str) -> Result<String> {
     let spec = format!("{base}^{{commit}}");
     let output = git_output_common(repo, ["rev-parse", "--verify", &spec])?;
     if !output.status.success() {
+        // A fresh `git init` has an unborn HEAD, which is the first thing a
+        // new user hits; say so instead of reporting an unresolvable rev.
+        if base == "HEAD"
+            && !git_output_common(repo, ["rev-parse", "--verify", "--quiet", "HEAD"])?
+                .status
+                .success()
+        {
+            bail!("repository has no commits yet; make one before creating a worktree");
+        }
         bail!("cannot resolve base commit '{base}'");
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())

@@ -96,6 +96,7 @@ pub(super) fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
             &WorktreeAdd {
                 branch: branch.clone(),
                 path: args.path,
+                path_flag: None,
                 base: args.base,
                 require_cow: args.require_cow,
                 ephemeral: args.ephemeral,
@@ -128,11 +129,27 @@ pub(super) fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         branch.as_deref().unwrap_or("(detached)")
     );
     let (program, command_args) = args.command.split_first().context("command is required")?;
-    let status = Command::new(program)
+    let status = match Command::new(program)
         .args(command_args)
         .current_dir(&target)
         .status()
-        .with_context(|| format!("run command in {}", target.display()))?;
+    {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
+            "command not found: {}\nworkspace retained at {}",
+            program.to_string_lossy(),
+            target.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "run '{}' in {}",
+                    program.to_string_lossy(),
+                    target.display()
+                )
+            })
+        }
+    };
     lock.release()?;
     if !status.success() {
         bail!(
@@ -162,7 +179,10 @@ fn pick_worktree(repo: &RepoContext) -> Result<WorktreeEntry> {
         io::stderr().flush()?;
         let mut answer = String::new();
         if io::stdin().read_line(&mut answer)? == 0 || answer.trim().eq_ignore_ascii_case("q") {
-            bail!("workspace selection cancelled");
+            // Deliberate cancellation is not a failure to report as one; exit
+            // the way interactive tools do on an aborted prompt.
+            eprintln!("cancelled");
+            std::process::exit(130);
         }
         if let Ok(number) = answer.trim().parse::<usize>() {
             if (1..=entries.len()).contains(&number) {

@@ -465,3 +465,30 @@ fn cow_materialization_reproduces_the_checkout_git_would_make() {
 
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn add_accepts_the_same_path_flag_as_run() {
+    // `sg run` spells the location `--path`; `add` took it only positionally,
+    // so the documented flag failed with a clap error. Both spellings must
+    // land the worktree exactly where asked.
+    let fixture = Fixture::new();
+    let flagged = fixture.root.join("by-flag");
+    let positional = fixture.root.join("by-position");
+
+    success(&fixture.run(&[
+        "worktree",
+        "add",
+        "feat/flag",
+        "--path",
+        flagged.to_str().unwrap(),
+    ]));
+    success(&fixture.run(&[
+        "worktree",
+        "add",
+        "feat/positional",
+        positional.to_str().unwrap(),
+    ]));
+
+    assert!(flagged.join("README.md").is_file());
+    assert!(positional.join("README.md").is_file());
+}
