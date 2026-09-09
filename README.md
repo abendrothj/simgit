@@ -68,18 +68,20 @@ is slower while the filesystem splits shared extents. Full method:
 ## Install
 
 ```bash
-# From crates.io (installs the `sg` binary)
-cargo install simgit-cli
-
-# Prebuilt binary on supported macOS/Linux targets
-cargo binstall simgit-cli
+# macOS / Linux — prebuilt binary, no toolchain required
+curl -fsSL https://raw.githubusercontent.com/abendrothj/simgit/main/install.sh | sh
 
 # Homebrew
 brew install abendrothj/tap/simgit
 
-# From source
-cargo build --release   # binary at target/release/sg
+# Cargo — from crates.io (`cargo install` compiles, `binstall` fetches a binary)
+cargo install simgit-cli
+cargo binstall simgit-cli
 ```
+
+The script installs `sg` into `~/.local/bin`; set `SIMGIT_INSTALL_DIR` to
+choose another directory or `SIMGIT_VERSION=v0.1.4` to pin a release. Verify
+with `sg --version`.
 
 On Linux without a reflink filesystem, install `fuse-overlayfs` to get the CoW
 path (e.g. `apt-get install fuse-overlayfs`); otherwise `sg` falls back to a

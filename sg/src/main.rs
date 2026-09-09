@@ -41,7 +41,11 @@ use clap::{Parser, Subcommand};
 
 /// simgit — native copy-on-write Git worktrees.
 #[derive(Parser)]
-#[command(name = "sg", about = "simgit — native copy-on-write Git worktrees")]
+#[command(
+    name = "sg",
+    version,
+    about = "simgit — native copy-on-write Git worktrees"
+)]
 struct Cli {
     /// Output machine-readable JSON.
     #[arg(long, global = true)]
