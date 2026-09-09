@@ -86,7 +86,7 @@ fn adopt_entry(buffer: &mut [u8], offset: usize, worktree: &Path) -> Result<usiz
         .get(name_offset..name_offset + name_len)
         .context("index path runs past end of file")?;
     // Entries are NUL-padded to a multiple of eight bytes from the entry start.
-    let next = offset + (name_offset - offset + name_len + 1 + 7) / 8 * 8;
+    let next = offset + (name_offset - offset + name_len + 1).div_ceil(8) * 8;
 
     let path = worktree.join(Path::new(std::ffi::OsStr::from_bytes(name)));
     let Ok(metadata) = fs::symlink_metadata(&path) else {

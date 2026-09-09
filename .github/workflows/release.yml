@@ -14,7 +14,23 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    # Nine commits were released this session while CI was red. Artifacts now
+    # require the same gate CI applies, so a tag cannot ship a broken tree.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --all --locked
+      - run: python3 tests/cli_picker.py
+
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:

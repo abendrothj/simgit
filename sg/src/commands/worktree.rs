@@ -434,7 +434,10 @@ fn root_clone_worktree(target: &Path, baseline: &Path) -> Result<()> {
     }
     fs::write(&pointer, &pointer_bytes).context("restore linked-worktree pointer")?;
 
-    let git_dir = PathBuf::from(git_path_output(target, ["rev-parse", "--absolute-git-dir"])?);
+    let git_dir = PathBuf::from(git_path_output(
+        target,
+        ["rev-parse", "--absolute-git-dir"],
+    )?);
     let worktree_index = git_dir.join("index");
     fs::copy(&index, &worktree_index).context("install baseline index")?;
     // The copied index describes the baseline's inodes, which Git would treat
@@ -626,7 +629,11 @@ struct WorktreeLock {
 impl WorktreeLock {
     fn acquire(repo: &RepoContext, target: &Path) -> Result<Self> {
         let path = worktree_lock_path(repo, target)?;
-        let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => bail!(
                 "workspace is already in use by a running command: {}\n\
@@ -1223,7 +1230,9 @@ fn default_worktree_path(common_git_dir: &Path, branch: &str) -> Result<PathBuf>
         Some(root) if !root.is_empty() => PathBuf::from(root),
         _ => {
             let home = main_worktree(common_git_dir);
-            let name = home.file_name().context("repository has no directory name")?;
+            let name = home
+                .file_name()
+                .context("repository has no directory name")?;
             let parent = home.parent().with_context(|| {
                 format!(
                     "{} has no parent directory for worktrees; pass --path or set SIMGIT_WORKTREE_ROOT",

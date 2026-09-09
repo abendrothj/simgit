@@ -441,7 +441,9 @@ fn cow_materialization_reproduces_the_checkout_git_would_make() {
         Path::new("nested/deep/data.txt")
     );
     let mode = std::os::unix::fs::PermissionsExt::mode(
-        &fs::metadata(worktree.join("script.sh")).unwrap().permissions(),
+        &fs::metadata(worktree.join("script.sh"))
+            .unwrap()
+            .permissions(),
     );
     assert_eq!(mode & 0o111, 0o111, "executable bit lost: {mode:o}");
 
@@ -524,8 +526,8 @@ fn prune_and_list_answer_machine_readable_questions() {
 
     let pruned = fixture.run(&["worktree", "prune", "--json"]);
     success(&pruned);
-    let report: serde_json::Value = serde_json::from_slice(&pruned.stdout)
-        .expect("prune --json must emit JSON, not prose");
+    let report: serde_json::Value =
+        serde_json::from_slice(&pruned.stdout).expect("prune --json must emit JSON, not prose");
     assert!(report["pruned"].is_array());
     assert!(report["retained"].is_array());
     assert!(report["retained_bytes"].is_u64());

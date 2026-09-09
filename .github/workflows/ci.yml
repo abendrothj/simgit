@@ -2,10 +2,35 @@ name: CI
 
 on:
   push:
+    # Tags are verified by the release workflow, which gates artifacts on the
+    # same checks; running both would duplicate every release into two runs.
+    branches: ["**"]
+    tags-ignore: ["**"]
   pull_request:
 
+# A newer push to the same ref makes the older run's answer irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  check:
+  lint:
+    # Formatting and lints are platform-independent; running them once keeps
+    # a failure attributable to one job instead of two identical ones.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
     strategy:
       fail-fast: false
       matrix:
@@ -14,11 +39,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all
+      - uses: Swatinem/rust-cache@v2
+      # `--locked` catches a stale Cargo.lock here rather than at release
+      # time, where the build already uses it.
+      - run: cargo test --all --locked
       - run: python3 tests/cli_picker.py
 
   overlay-linux:
@@ -27,9 +51,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install fuse-overlayfs
         run: sudo apt-get update && sudo apt-get install -y fuse-overlayfs
-      - run: cargo build --release
+      - run: cargo build --release --locked
       - name: Overlay integration test
         run: SG="$PWD/target/release/sg" bash tests/overlay_integration.sh
 
@@ -40,6 +65,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64
       - name: Install Linux ARM64 linker
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Cross-build
