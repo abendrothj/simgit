@@ -87,6 +87,39 @@ and reclaims that cache.
 > it. Only `df` (physical blocks consumed) shows what a worktree actually
 > allocated.
 
+### Estimating it for your repository
+
+```bash
+# entries × ~0.4 KiB, plus ~60 KiB, is what each extra worktree will cost
+git ls-files | wc -l
+```
+
+Roughly `60 KiB + 0.4 KiB × tracked-paths` per worktree on APFS, so 5k paths
+cost ~2 MiB, 20k cost ~9 MiB, 250k cost ~110 MiB. Compare that against your
+working tree: the ratio is what you save per agent. Many small files is the
+bad case — 100k × 4 KiB pays ~10% of the tree per worktree — and even there
+eight worktrees cost about what one plain `git worktree` copy does.
+
+If that fraction is too high for your repository, the options are:
+
+- **On Linux with `fuse-overlayfs`, prefer the overlay mode:**
+  `SIMGIT_POPULATE=overlay sg worktree add …`. An overlay worktree's
+  `upperdir` starts empty, so it pays no per-file metadata at all regardless
+  of entry count — it trades that for FUSE overhead on every read. simgit
+  otherwise prefers reflink when both are available, which is the wrong
+  default for entry-heavy repositories. Neither the metadata saving nor the
+  read overhead has been measured yet; treat the direction as sound and the
+  magnitude as unknown.
+- **Keep worktrees on one base commit.** The per-worktree cost is small; a
+  second *baseline* is a whole tree. `sg worktree prune` reports the cache.
+- **Reuse workspaces instead of creating them.** `sg run <branch>` attaches to
+  an existing worktree, so a stable set of agent workspaces costs a stable
+  amount of disk.
+
+Sparse (cone) worktrees would cut the metadata proportionally — populating one
+of ten directories measured 3.3 MiB per worktree against 37.5 MiB — but that
+is not implemented and not committed to.
+
 ## Install
 
 ```bash

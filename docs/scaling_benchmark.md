@@ -195,6 +195,29 @@ for measuring this on a 256,886-path monorepo and identifying both halves.
 > the disk penalty was run-to-run `df` variance between two different clones.
 > The tables above were re-measured on an untouched repository.
 
+### Reducing the per-worktree cost
+
+For the 100k × 4 KiB worst case, the 38 MiB splits into ~30 MiB of APFS
+directory and inode records and 7.9 MiB of copied Git index — so any measure
+that only attacks the index is capped at ~20%.
+
+Evaluated:
+
+| Approach | Result |
+|---|---|
+| Sparse (cone) checkout | **3.27 MiB per worktree vs 37.5 MiB**, and a 0.79 MiB sparse index vs 7.91 MiB dense. Not implemented. |
+| `fuse-overlayfs` mode (Linux) | `upperdir` starts empty, so no per-file metadata at any entry count. Trades FUSE read overhead. Unmeasured. |
+| `core.splitIndex` | No effect. The shared base is written into the *worktree's own* git dir (`.git/worktrees/<name>/sharedindex.*`), not the common dir, so nothing is shared between worktrees. |
+| Index version 4 (path compression) | 7.91 → 6.64 MiB on short paths: 16% of the index, 3% of the total. Not worth teaching the stat patcher prefix-compressed paths. |
+| Hard links instead of clones | Rejected: a write through a hard link mutates every worktree, which is the failure simgit exists to prevent. |
+
+The sparse figure was measured by hand-populating one cone directory from a
+baseline clone; that probe left the index inconsistent, so it establishes the
+disk cost, not a working implementation. A real version has to populate only
+the cone directories and handle sparse index entries (directories, mode
+040000) in `adopt_stat_data`, which currently skips them on the size check —
+safe, but it leaves their stat data stale.
+
 ### Native file-I/O latency
 
 Hot-cache microbenchmark, 1,000 files × 16 KiB, six alternating rounds:
