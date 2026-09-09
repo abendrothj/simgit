@@ -256,6 +256,41 @@ otherwise it creates both. `add` always requires a new branch and workspace.
 Everything after `--` goes to the child command unchanged. The agent owns its
 conversation history and resume behavior; simgit owns the workspace.
 
+#### What the agent sees
+
+`sg run` does not emulate Git or intercept Git commands. It launches the child
+with its working directory set to a real, registered linked worktree. From the
+agent's perspective it is an ordinary repository: `git status`, `diff`, `add`,
+`commit`, `restore`, `switch`, `merge`, `rebase`, `cherry-pick`, hooks,
+attributes and ignores work through Git itself. The files are ordinary local
+files; copy-on-write is handled below Git by the filesystem.
+
+Each worktree has its own files, index, `HEAD`, current branch and in-progress
+merge/rebase state. Git objects, refs, remotes, configuration, hooks and
+stashes are shared with the main repository, exactly as with `git worktree`.
+That means Git will not let two worktrees check out the same branch, and
+repository-wide operations can affect the other worktrees. simgit provides
+workspace isolation, not a security boundary.
+
+When an agent commits, Git writes the commit to the shared object database and
+advances only that agent's branch. The commit is immediately visible from the
+main checkout, but the main branch and its files do not change until you merge
+or rebase it:
+
+```bash
+git log agent/auth
+git merge agent/auth
+sg worktree gc --ephemeral --older-than 0s --delete-branches
+```
+
+`sg run` retains the worktree after the child exits; `--ephemeral` only makes
+it eligible for GC. GC skips running or dirty worktrees. With
+`--delete-branches`, normal safe branch deletion retains unmerged commits;
+`--force` is the explicit path that may discard dirty or unmerged work.
+Workers therefore need no simgit-specific prompt: tell them to work in the
+current checkout and commit normally. The coordinator creates, integrates and
+cleans up the workspaces.
+
 New `run` worktrees are persistent by default. Existing worktrees keep their
 persistence setting unless you pass `--ephemeral` or `--persistent` explicitly.
 GC selects only ephemeral worktrees by default, even with `--force`; use
@@ -293,9 +328,6 @@ work; combining it with `--force` explicitly discards unmerged branches.
 commit and kept for seven days, so branching from several commits costs one
 full tree each until pruned — worth checking if disk grows faster than the
 7× worktree saving implies.
-
-Each agent commits to its own branch; you integrate with `git merge`/`rebase`
-as usual — there is no shared state to coordinate.
 
 ## Repository layout
 
