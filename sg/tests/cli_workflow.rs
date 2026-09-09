@@ -559,13 +559,26 @@ fn sparse_worktrees_check_out_only_the_requested_directories() {
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "initial"]);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sg"))
-        .current_dir(&repo)
-        .env_remove("SIMGIT_POPULATE")
-        .env_remove("SIMGIT_WORKTREE_ROOT")
-        .args(["worktree", "add", "agent/cone", "--sparse", "alpha"])
-        .output()
-        .unwrap();
+    // Cone behavior is backend-independent, and the plain-checkout path is
+    // available everywhere, so it is the deterministic case. The CoW path is
+    // additionally covered wherever the filesystem provides it; the
+    // fuse-overlayfs backend rejects --sparse by design and is skipped.
+    let create = |mode: Option<&str>, branch: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sg"));
+        command
+            .current_dir(&repo)
+            .env_remove("SIMGIT_WORKTREE_ROOT");
+        match mode {
+            Some(mode) => command.env("SIMGIT_POPULATE", mode),
+            None => command.env_remove("SIMGIT_POPULATE"),
+        };
+        command
+            .args(["worktree", "add", branch, "--sparse", "alpha"])
+            .output()
+            .unwrap()
+    };
+
+    let output = create(Some("checkout"), "agent/cone");
     success(&output);
     let printed = String::from_utf8(output.stdout).unwrap();
     let worktree = std::path::PathBuf::from(printed.lines().last().unwrap().trim());
@@ -604,6 +617,27 @@ fn sparse_worktrees_check_out_only_the_requested_directories() {
         String::from_utf8(status.stdout).unwrap(),
         " M alpha/sub/f0.txt\n"
     );
+
+    // Same invariants on the default backend, unless that is fuse-overlayfs.
+    let native = create(None, "agent/cone-native");
+    let complaint = String::from_utf8_lossy(&native.stderr).to_string();
+    if native.status.success() {
+        let printed = String::from_utf8(native.stdout).unwrap();
+        let native_worktree = std::path::PathBuf::from(printed.lines().last().unwrap().trim());
+        assert!(native_worktree.join("alpha/sub/f0.txt").is_file());
+        assert!(!native_worktree.join("beta").exists());
+        let status = Command::new("git")
+            .current_dir(&native_worktree)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(status.stdout).unwrap(), "");
+    } else {
+        assert!(
+            complaint.contains("fuse-overlayfs"),
+            "--sparse must work on every backend except overlay: {complaint}"
+        );
+    }
 
     let rejected = Command::new(env!("CARGO_BIN_EXE_sg"))
         .current_dir(&repo)
