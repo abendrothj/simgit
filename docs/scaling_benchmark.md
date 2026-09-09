@@ -76,11 +76,13 @@ tracked content** — with 8 worktrees on APFS, two runs each, September 8, 2026
 | Path | Physical allocation delta | Per worktree | Cold setup |
 |---|---:|---:|---:|
 | Git worktrees | 4534–4536 MiB | 567 MiB | 14.0–14.2 s |
-| `sg worktree` | 640–650 MiB | ~11 MiB after the baseline | 6.4–7.0 s |
+| `sg worktree` | 640–650 MiB | 9.8–10.8 MiB after the baseline | 6.4–7.0 s |
 
-The `sg` figure is one materialized baseline (553 MiB) plus ~11 MiB of
-per-worktree filesystem metadata, so total disk is `tree + N × 11 MiB` against
-`N × 567 MiB`. Setup is half of plain `git worktree`, not a tradeoff.
+The `sg` figure is one materialized baseline (553 MiB) plus ~10 MiB of
+per-worktree metadata, so total disk is `tree + N × 10 MiB` against
+`N × 567 MiB` here. That per-worktree constant is repository-specific — see
+[what a worktree actually costs](#what-a-worktree-actually-costs) — and
+setup is half of plain `git worktree`, not a tradeoff.
 
 ### Whole-tree cloning
 
@@ -125,27 +127,60 @@ checks are left untouched. Per worktree on vscode, warm baseline:
 | per-file clone + `read-tree` | 5.87 s | 0.10 s |
 | whole-tree clone + adopted index | 0.56 s | 0.11 s |
 
-### What the disk overhead scales with
+### What a worktree actually costs
 
-Each worktree costs filesystem metadata proportional to **entry count**, not
-repository size, and the two clone paths cost the same. Four clones of each
-synthetic tree, `df` deltas per worktree:
+The marginal worktree is filesystem and Git-index metadata. Measured end to
+end (`sg worktree add`, warm baseline, `df` deltas over four worktrees, twice
+for the real repositories):
 
-| Entries | Content | Whole-tree clone | Per-file clone |
+| Repository | Entries | Avg path | Per worktree | B/entry | Index B/entry | % of tree |
+|---|---:|---:|---:|---:|---:|---:|
+| `microsoft/vscode` | 23,122 | 68.5 | 9.8–10.8 MiB | 446 | 116 | 1.1% |
+| `git/git` | 5,075 | 27.2 | ~2.2 MiB | 456 | 91 | 3.1% |
+| simgit itself | 43 | 20.7 | 57 KiB | 1357 | 71 | 0.5% |
+| 100k × 4 KiB synthetic | 101,001 | 10.8 | 37.5–38.3 MiB | 389 | 79 | 9.4% |
+| 200 × 8 MiB synthetic | 205 | 6.5 | 107 KiB | 534 | 71 | 0.007% |
+
+Three things drive that, and one plausible candidate does not.
+
+**Content size does not.** At a fixed 200 files, growing each file from 4 KiB
+to 64 MiB — a 1 MiB tree to a 12.8 GiB tree — leaves the per-clone cost flat,
+because `clonefile` shares the extent tree by reference rather than copying
+extent records:
+
+| 200 files × | Tree | Per clone | Per file |
 |---:|---:|---:|---:|
-| 1,011 | 3 MiB | 304 KiB | 325 KiB |
-| 10,101 | 39 MiB | 3,095 KiB | 3,128 KiB |
-| 101,001 | 390 MiB | 31,203 KiB | 31,222 KiB |
-| 10,101 | 2,500 MiB | 3,087 KiB | 3,106 KiB |
+| 4 KiB | 1 MiB | 57.8 KiB | 296 B |
+| 256 KiB | 50 MiB | 45.0 KiB | 230 B |
+| 8 MiB | 1600 MiB | 57.8 KiB | 296 B |
+| 64 MiB | 12800 MiB | 56.5 KiB | 289 B |
 
-That is ~0.30 KiB per tracked path, unchanged when content grows 64×. So N
-worktrees of a tree with `bytes` of content and `entries` paths cost
-`bytes + N × 0.30 KiB × entries`, and the marginal worktree costs
-`0.30 KiB × entries` however large N gets. What varies between repositories
-is that constant as a fraction of the tree — set by average file size, not
-repository size: ~2% at vscode's 24 KiB average, ~8% for a tree of 4 KiB
-files, negligible when files are large. A repository of many tiny files is
-where the technique pays least.
+**Path length does.** Directory entries and Git index entries both store the
+name, so both grow with it. At a fixed 5,000 files:
+
+| Shape | Filesystem clone | Git index | Total per entry |
+|---|---:|---:|---:|
+| 4-character names | 305 B | 80 B | 385 B |
+| 40-character names | 382 B | 120 B | 502 B |
+| 120-character names | 572 B | 199 B | 771 B |
+| 12-character names, 4 levels deep | 334 B | 115 B | 449 B |
+
+**Entry count** sets the multiplier, and **a fixed ~60 KiB** per worktree
+covers the linked-worktree admin directory — measured at 67 KiB for a
+single-file repository, which is why simgit's own 43-entry tree shows an
+outlying 1357 B/entry.
+
+So: `per worktree ≈ 60 KiB + entries × (dirent + index bytes)`, where the
+per-entry term ran 389–456 B across the real repositories here and rises with
+path length. As a *fraction* of the tree it is set by average file size, which
+is why the same mechanism costs 0.007% on a large-file repository and 9.4% on
+100k tiny files. A repository of many small, shortly-named files is where the
+technique pays least.
+
+> An earlier revision of this section reported ~0.30 KiB per path from
+> `clonefile`-only measurements, which omitted the per-worktree Git index copy
+> — 20–26% of the real cost — and did not test path length. The figures above
+> measure `sg worktree add` end to end.
 
 Baselines published before stat adoption carry no index and fall back to the
 per-file path, as does Linux, which has no directory-level reflink.
