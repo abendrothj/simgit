@@ -62,6 +62,25 @@ The native CoW path used **at least 8.0× less physical disk** for eight
 untouched worktrees, at **2.1–2.2× the cold setup time** in these sequential
 runs.
 
+### Real repository: microsoft/vscode
+
+Synthetic trees understate per-file cost, so the same comparison was run on a
+`--depth 1` clone of `microsoft/vscode` — **18,709 tracked files, 553 MiB of
+tracked content** — with 8 worktrees on APFS, September 8, 2026:
+
+| Path | `du`-accounted | Physical allocation delta | Setup |
+|---|---:|---:|---:|
+| Git worktrees | 4427 MiB | 4535 MiB | 14.2 s |
+| native CoW `sg worktree` | 4427 MiB | 573 MiB | 48.1 s |
+
+**7.9× less physical disk.** The `sg` physical figure is essentially one
+materialized baseline (553 MiB) plus per-worktree metadata: eight further
+checkouts cost ~20 MiB between them.
+
+Setup, however, cost **3.4×** here versus 2.2× on the 400-file synthetic tree.
+Cloning is per file, so cold setup scales with file count while the disk saving
+scales with content size. Quote the ratio with the repository shape attached.
+
 ### Native file-I/O latency
 
 Hot-cache microbenchmark, 1,000 files × 16 KiB, six alternating rounds:

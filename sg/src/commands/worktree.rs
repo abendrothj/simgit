@@ -45,7 +45,7 @@ pub struct WorktreeAdd {
     /// Branch name to create (for example, feat/my-feature).
     pub branch: String,
 
-    /// Worktree path. Defaults to `.git/simgit/worktrees/<branch>`.
+    /// Worktree path. Defaults to `../.simgit/<repo>/<branch>`.
     pub path: Option<PathBuf>,
 
     /// Commit-ish to start from. Defaults to HEAD.
@@ -236,11 +236,10 @@ fn create_worktree(args: &WorktreeAdd, attach: bool) -> Result<CreatedWorktree> 
             args.base.as_deref().unwrap_or("HEAD")
         },
     )?;
-    let target = absolute_path(
-        args.path
-            .clone()
-            .unwrap_or_else(|| default_worktree_path(&repo.common_git_dir, &args.branch)),
-    )?;
+    let target = absolute_path(match args.path.clone() {
+        Some(path) => path,
+        None => default_worktree_path(&repo.common_git_dir, &args.branch)?,
+    })?;
 
     if target.exists() {
         bail!("worktree path already exists: {}", target.display());
@@ -464,7 +463,7 @@ fn add_overlay_worktree(
 /// cannot turn a previously clean workspace into silently discarded work.
 fn teardown_worktree(repo: &RepoContext, target: &Path, force: bool) -> Result<()> {
     ensure_unlocked(repo, target)?;
-    if let Some(state) = overlay::state(repo, target) {
+    let result = if let Some(state) = overlay::state(repo, target) {
         let lock = WorktreeLock::acquire(repo, target)?;
         if !force && worktree_dirty(target)? {
             bail!("worktree has uncommitted changes; pass --commit or --force");
@@ -485,6 +484,36 @@ fn teardown_worktree(repo: &RepoContext, target: &Path, force: bool) -> Result<(
                 target.as_os_str(),
             ],
         )
+    };
+    if result.is_ok() {
+        prune_empty_worktree_dirs(repo, target);
+    }
+    result
+}
+
+/// Drop the `.simgit/<repo>` scaffolding once its last worktree is gone, so
+/// removing every worktree leaves no empty directories beside the repository.
+/// Only empty directories are removed, and only up to the `.simgit` root.
+fn prune_empty_worktree_dirs(repo: &RepoContext, target: &Path) {
+    if std::env::var_os("SIMGIT_WORKTREE_ROOT").is_some() {
+        // A directory the user chose is theirs to keep, empty or not.
+        return;
+    }
+    let Some(root) = default_worktree_path(&repo.common_git_dir, "unused")
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    if target.parent() != Some(root.as_path()) {
+        return;
+    }
+    if fs::remove_dir(&root).is_ok() {
+        if let Some(parent) = root.parent() {
+            if parent.file_name() == Some(OsStr::new(".simgit")) {
+                let _ = fs::remove_dir(parent);
+            }
+        }
     }
 }
 
@@ -1059,11 +1088,40 @@ fn resolve_commit(repo: &RepoContext, base: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 
-fn default_worktree_path(common_git_dir: &Path, branch: &str) -> PathBuf {
-    common_git_dir
-        .join("simgit")
-        .join("worktrees")
-        .join(safe_path_component(branch))
+/// Default location for a new worktree: `<repo-parent>/.simgit/<repo>/<branch>`.
+///
+/// This must stay outside the common git dir. Agent harnesses and editors
+/// treat everything under `.git/` as off-limits — Claude Code refuses to edit
+/// files there — so a worktree nested in the git dir is unusable by exactly
+/// the tools simgit exists to serve. It must also stay on the repository's
+/// filesystem, since reflink/clonefile cannot cross volumes; a sibling of the
+/// main working tree satisfies both. `SIMGIT_WORKTREE_ROOT` overrides it.
+fn default_worktree_path(common_git_dir: &Path, branch: &str) -> Result<PathBuf> {
+    let root = match std::env::var_os("SIMGIT_WORKTREE_ROOT") {
+        Some(root) if !root.is_empty() => PathBuf::from(root),
+        _ => {
+            let home = main_worktree(common_git_dir);
+            let name = home.file_name().context("repository has no directory name")?;
+            let parent = home.parent().with_context(|| {
+                format!(
+                    "{} has no parent directory for worktrees; pass --path or set SIMGIT_WORKTREE_ROOT",
+                    home.display()
+                )
+            })?;
+            parent.join(".simgit").join(name)
+        }
+    };
+    Ok(root.join(safe_path_component(branch)))
+}
+
+/// The directory holding the main working tree, or the git dir itself for a
+/// bare repository.
+fn main_worktree(common_git_dir: &Path) -> &Path {
+    if common_git_dir.file_name() == Some(OsStr::new(".git")) {
+        common_git_dir.parent().unwrap_or(common_git_dir)
+    } else {
+        common_git_dir
+    }
 }
 
 fn safe_path_component(branch: &str) -> String {

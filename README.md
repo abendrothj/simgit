@@ -47,16 +47,25 @@ merges — no coordination layer, no conflict arbitration, no lock service.
 
 ### Measured
 
-Standing up eight isolated views of a 300 MiB tree on APFS:
+Standing up eight isolated views of a 300 MiB synthetic tree (400 files) on APFS:
 
 | Path | Physical disk added | Cold setup |
 |---|---:|---:|
 | 8 × `git worktree` | 2405.9–2583.4 MiB | 6.32–6.66 s |
 | 8 × `sg worktree` | 301.2 MiB | 14.10–14.15 s |
 
-At least **8.0× less physical disk** at **2.1–2.2× the cold setup time**. Hot
-read and metadata cost overlaps ordinary worktree I/O; the first durable write
-is slower while the filesystem splits shared extents. Full method:
+And on a real checkout of `microsoft/vscode` (18,709 tracked files, 553 MiB):
+
+| Path | Physical disk added | Cold setup |
+|---|---:|---:|
+| 8 × `git worktree` | 4535 MiB | 14.2 s |
+| 8 × `sg worktree` | 573 MiB | 48.1 s |
+
+**7.9–8.0× less physical disk.** Cold setup costs 2.2× on the synthetic tree
+and 3.4× on vscode: the clone is per file, so file-count-heavy repositories pay
+more setup for the same disk win. Hot read and metadata cost overlaps ordinary
+worktree I/O; the first durable write is slower while the filesystem splits
+shared extents. Full method:
 [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
 
 > **Measure with `df`, not `du`.** `du` reports *logical* size and cannot see
@@ -127,10 +136,18 @@ sg worktree repair
 sg worktree prune
 ```
 
-`remove` accepts either a path or a branch name. The worktree is registered in
-Git's normal `.git/worktrees/` registry; the cached baseline lives under
-`.git/simgit/baselines/`. Plain `remove` refuses a dirty worktree unless you
-pass `--force`.
+`remove` accepts either a path or a branch name. Plain `remove` refuses a dirty
+worktree unless you pass `--force`.
+
+New worktrees are created beside the repository, in
+`../.simgit/<repo>/<branch>`, and `SIMGIT_WORKTREE_ROOT` or `--path` overrides
+that. They are deliberately **not** placed inside `.git`: agent harnesses and
+editors treat everything under `.git/` as off-limits or invisible — Claude Code
+refuses to edit files there — so a worktree nested in the git dir is unusable
+by the tools this exists to serve. The worktree itself is still registered in
+Git's normal `.git/worktrees/` registry, and the cached baseline stays internal
+in `.git/simgit/baselines/`. Removing the last worktree also removes the empty
+`.simgit` directory.
 
 ### Running agents
 

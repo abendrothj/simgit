@@ -17,7 +17,7 @@ pub struct WorktreeRun {
     /// Branch to create or reuse. Omit to choose an existing workspace.
     pub branch: Option<String>,
 
-    /// Worktree path. Defaults to `.git/simgit/worktrees/<branch>`.
+    /// Worktree path. Defaults to `../.simgit/<repo>/<branch>`.
     #[arg(long)]
     pub path: Option<PathBuf>,
 

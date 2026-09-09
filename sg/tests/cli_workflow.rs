@@ -113,7 +113,8 @@ impl Fixture {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sg"));
         command
             .current_dir(&self.repo)
-            .env("SIMGIT_POPULATE", "checkout");
+            .env("SIMGIT_POPULATE", "checkout")
+            .env_remove("SIMGIT_WORKTREE_ROOT");
         command
     }
 
@@ -365,4 +366,34 @@ fn run_reuses_main_worktree_without_creating_another_checkout() {
     success(&output);
     let entries: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(entries.len(), 1);
+}
+
+#[test]
+fn default_worktree_path_stays_outside_the_git_directory() {
+    // Agent harnesses (Claude Code, editors, ripgrep) treat everything under
+    // `.git/` as off-limits or invisible, so a worktree nested in the git dir
+    // cannot be edited by the tools simgit exists to serve. The default must
+    // be a sibling of the main working tree.
+    let fixture = Fixture::new();
+    let output = fixture.run(&["worktree", "add", "agent/edit"]);
+    success(&output);
+    let printed = String::from_utf8(output.stdout).unwrap();
+    let path = std::path::PathBuf::from(printed.lines().last().unwrap().trim());
+
+    assert!(
+        !path.components().any(|part| part.as_os_str() == ".git"),
+        "default worktree must not live under .git: {}",
+        path.display()
+    );
+    assert_eq!(
+        path.parent().unwrap().canonicalize().unwrap(),
+        fixture.root.join(".simgit/repo").canonicalize().unwrap()
+    );
+    assert!(path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("agent-edit"));
+    assert!(path.join("README.md").is_file());
 }
