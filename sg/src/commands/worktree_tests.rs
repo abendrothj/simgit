@@ -393,6 +393,46 @@ fn git<const N: usize>(path: &Path, args: [&str; N]) -> Result<()> {
 }
 
 #[test]
+fn adopted_stat_data_equals_gits_own_refresh() -> Result<()> {
+    // The baseline index is copied into a clone that has its own inodes and
+    // ctimes. Adoption must reproduce, byte for byte, the index Git writes
+    // after inspecting every cloned file: anything less and Git either
+    // rehashes the whole tree on first use or trusts stale stat data.
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    if !cow::ROOT_CLONE || !cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        return Ok(());
+    }
+    let base = resolve_commit(&repo, "HEAD")?;
+    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let published = cow::baseline_index(&baseline).context("baseline publishes an index")?;
+
+    let clone = fixture.root.join("clone");
+    cow::clone_root(&baseline, &clone)?;
+
+    let adopted = fixture.root.join("adopted.index");
+    fs::copy(&published, &adopted)?;
+    index::adopt_stat_data(&adopted, &clone)?;
+
+    let refreshed = fixture.root.join("refreshed.index");
+    fs::copy(&published, &refreshed)?;
+    let mut refresh = Command::new("git");
+    refresh
+        .env("GIT_INDEX_FILE", &refreshed)
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .arg(format!("--work-tree={}", clone.display()))
+        .args(["update-index", "--really-refresh"]);
+    run_command(&mut refresh, "git update-index --really-refresh")?;
+
+    assert_eq!(
+        fs::read(&adopted)?,
+        fs::read(&refreshed)?,
+        "adopted stat data differs from Git's own refresh"
+    );
+    Ok(())
+}
+
+#[test]
 fn cow_attachment_and_failed_population_preserve_existing_branch() -> Result<()> {
     let fixture = Fixture::new()?;
     let repo = discover_repo(&fixture.repo)?;

@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 mod cow;
+mod index;
 mod launch;
 mod overlay;
 
@@ -424,22 +425,12 @@ fn root_clone_worktree(target: &Path, baseline: &Path) -> Result<()> {
     fs::write(&pointer, &pointer_bytes).context("restore linked-worktree pointer")?;
 
     let git_dir = PathBuf::from(git_path_output(target, ["rev-parse", "--absolute-git-dir"])?);
-    fs::copy(&index, git_dir.join("index")).context("install baseline index")?;
-    // The clone differs from the baseline only in inode and ctime, so one
-    // refresh under relaxed stat checks records the clone's own stat data
-    // without hashing file content. The worktree keeps Git's strict defaults.
-    run_git_at(
-        target,
-        [
-            "-c",
-            "core.checkStat=minimal",
-            "-c",
-            "core.trustctime=false",
-            "update-index",
-            "--refresh",
-        ],
-    )
-    .context("record cloned worktree stat data")
+    let worktree_index = git_dir.join("index");
+    fs::copy(&index, &worktree_index).context("install baseline index")?;
+    // The copied index describes the baseline's inodes, which Git would treat
+    // as stale and rehash. Re-record the clone's own stat data instead; Git's
+    // strict staleness checks are untouched.
+    index::adopt_stat_data(&worktree_index, target).context("adopt cloned worktree stat data")
 }
 
 fn add_git_worktree(

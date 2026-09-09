@@ -5,7 +5,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "0.1.6"
+version      = "0.1.7"
 edition      = "2021"
 license      = "MIT"
 authors      = ["simgit contributors"]
@@ -20,6 +20,9 @@ clap         = { version = "4", features = ["derive", "env"] }
 
 # UUIDs
 uuid         = { version = "1", features = ["v4", "v7"] }
+
+# Git index checksums
+sha1         = "0.10"
 
 # Error handling
 anyhow       = "1"

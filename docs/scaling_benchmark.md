@@ -65,50 +65,92 @@ runs.
 ### Real repository: microsoft/vscode
 
 Synthetic trees understate per-file cost, so the same comparison was run on a
-`--depth 1` clone of `microsoft/vscode` — **18,709 tracked files, 553 MiB of
-tracked content** — with 8 worktrees on APFS, September 8, 2026:
+`--depth 1` clone of `microsoft/vscode` — **18,707 tracked files, 553 MiB of
+tracked content** — with 8 worktrees on APFS, two runs each, September 8, 2026:
 
-| Path | `du`-accounted | Physical allocation delta | Setup |
-|---|---:|---:|---:|
-| Git worktrees | 4427 MiB | 4534 MiB | 14.0 s |
-| per-file CoW clone (`cp -c -R`) | 4427 MiB | 573 MiB | 48.1 s |
-| whole-tree clone (`clonefile`) | 4427 MiB | 651 MiB | 15.2 s |
+| Path | Physical allocation delta | Cold setup |
+|---|---:|---:|
+| Git worktrees | 4534–4536 MiB | 14.0–14.2 s |
+| `sg worktree` | 640–650 MiB | 6.4–7.0 s |
 
-**7.0–7.9× less physical disk.** The `sg` physical figure is essentially one
-materialized baseline (553 MiB) plus per-worktree directory metadata.
+**7.0× less physical disk at half the setup time.** The `sg` figure is one
+materialized baseline (553 MiB) plus per-worktree filesystem metadata.
 
 ### Whole-tree cloning
 
-Cloning file by file made setup scale with file count, not content size: 3.4×
-plain `git worktree` here versus 2.2× on the 400-file synthetic tree. macOS
-`clonefile(2)` clones a directory hierarchy recursively in one syscall, which
-removes that walk. Isolated on the same 23k-entry baseline:
+Cloning file by file made setup scale with file count rather than content
+size. macOS `clonefile(2)` clones a directory hierarchy recursively in one
+syscall, which removes the walk. Isolated on the same 23k-entry baseline:
 
 | Materialization | Time |
 |---|---:|
 | `cp -c -R baseline/. target` (per file) | 2.50 s |
 | `clonefile(baseline, target)` (whole tree) | 0.20 s |
 
-The worktree also adopts the baseline's index. `checkout-index -u` records
-stat data while materializing the baseline, and the clone differs from it only
-in inode and ctime, so one `update-index --refresh` under
-`core.checkStat=minimal core.trustctime=false` re-records the clone's own stat
-data without hashing any content. The worktree then keeps Git's strict
-defaults. Measured per worktree on vscode, warm baseline:
+### Adopting the baseline index
+
+A clone carries the baseline's content, mode, size and mtime but its own inode
+and ctime — exactly the fields Git compares before trusting an index entry. So
+a copied baseline index is worse than useless: Git rehashes every file on
+first use. Measured on vscode, each variant from a fresh clone:
+
+| Worktree index | Setup | First `git status` |
+|---|---:|---:|
+| `read-tree HEAD` | 0.00 s | 3.02 s |
+| copied baseline index, untouched | 0.00 s | 3.33 s |
+| copied index + `update-index --refresh` under relaxed stat checks | 0.13 s | 3.05 s |
+| copied index + strict `update-index --really-refresh` | 3.34 s | 0.15 s |
+| copied index + stat adoption | 0.16 s | 0.13 s |
+
+Nothing Git offers under relaxed stat settings persists strict-usable stat
+data: it only records stat information for entries it decides to inspect.
+`--really-refresh` does record it, but pays the full rehash to get there.
+
+So simgit rewrites the stat fields itself. `checkout-index -u` records the
+baseline's stat data when the baseline is materialized; copying that index and
+re-recording ctime, mtime, dev, ino, uid and gid from the clone costs one
+`lstat` per entry and no content reads. The result is **byte-for-byte
+identical to the index `git update-index --really-refresh` writes** — pinned
+by `adopted_stat_data_equals_gits_own_refresh` — and Git's strict staleness
+checks are left untouched. Per worktree on vscode, warm baseline:
 
 | Path | `sg worktree add` | First `git status` |
 |---|---:|---:|
-| per-file clone + `read-tree` | 5.6 s | 0.10 s |
-| whole-tree clone + baseline index | 1.2 s | 0.10 s |
+| per-file clone + `read-tree` | 5.87 s | 0.10 s |
+| whole-tree clone + adopted index | 0.56 s | 0.11 s |
 
-Cost: whole-tree cloning allocates ~8 MiB more directory metadata per
-worktree (573 → 651 MiB across eight), trading 13% more physical disk for a
-3.2× faster creation. Baselines published by older versions carry no index;
-those fall back to the per-file path, as does Linux, which has no
-directory-level reflink.
+### What the disk overhead scales with
+
+Each worktree costs filesystem metadata proportional to **entry count**, not
+repository size, and the two clone paths cost the same. Four clones of each
+synthetic tree, `df` deltas per worktree:
+
+| Entries | Content | Whole-tree clone | Per-file clone |
+|---:|---:|---:|---:|
+| 1,011 | 3 MiB | 304 KiB | 325 KiB |
+| 10,101 | 39 MiB | 3,095 KiB | 3,128 KiB |
+| 101,001 | 390 MiB | 31,203 KiB | 31,222 KiB |
+| 10,101 | 2,500 MiB | 3,087 KiB | 3,106 KiB |
+
+That is ~0.30 KiB per tracked path, unchanged when content grows 64×. The
+disk multiple therefore depends on average file size: N worktrees of a tree
+with `bytes` of content and `entries` paths cost
+`bytes + N × 0.30 KiB × entries`. Trees of 4 KiB files cap near 5× at eight
+worktrees, vscode's 24 KiB average yields 7×, and large-file repositories
+approach N.
+
+Baselines published before stat adoption carry no index and fall back to the
+per-file path, as does Linux, which has no directory-level reflink.
 
 Thanks to @pasteley ([#20](https://github.com/abendrothj/simgit/issues/20))
 for measuring this on a 256,886-path monorepo and identifying both halves.
+
+> **Correction.** An earlier revision of this document claimed 1.2 s per
+> worktree and a 13% disk penalty for whole-tree cloning. Both were wrong: the
+> timings came from a repository where a benchmark had left
+> `core.checkStat=minimal` and `core.trustctime=false` in `.git/config`, and
+> the disk penalty was run-to-run `df` variance between two different clones.
+> The tables above were re-measured on an untouched repository.
 
 ### Native file-I/O latency
 

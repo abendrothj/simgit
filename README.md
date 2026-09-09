@@ -54,20 +54,25 @@ Standing up eight isolated views of a 300 MiB synthetic tree (400 files) on APFS
 | 8 × `git worktree` | 2405.9–2583.4 MiB | 6.32–6.66 s |
 | 8 × `sg worktree` | 301.2 MiB | 14.10–14.15 s |
 
-And on a real checkout of `microsoft/vscode` (18,709 tracked files, 553 MiB),
-where a whole-tree `clonefile` replaces per-file cloning:
+And on a real checkout of `microsoft/vscode` (18,707 tracked files, 553 MiB),
+two runs each, default Git configuration:
 
 | Path | Physical disk added | Cold setup |
 |---|---:|---:|
-| 8 × `git worktree` | 4534 MiB | 14.0 s |
-| 8 × `sg worktree` | 651 MiB | 15.2 s |
+| 8 × `git worktree` | 4534–4536 MiB | 14.0–14.2 s |
+| 8 × `sg worktree` | 640–650 MiB | 6.4–7.0 s |
 
-**7.0–8.0× less physical disk.** On macOS the whole tree is cloned in one
-`clonefile(2)` call and the worktree adopts the baseline's index, so setup is
-1.09× plain `git worktree` on vscode — a single worktree lands in 1.2 s
-against 5.6 s for the per-file path still used on Linux reflink filesystems.
-Hot read and metadata cost overlaps ordinary worktree I/O; the first durable
-write is slower while the filesystem splits shared extents. Full method:
+**7.0× less physical disk, and about half the setup time** — on macOS the
+whole tree is cloned in one `clonefile(2)` call and the worktree adopts the
+baseline's index, so a single worktree lands in 0.56 s against 5.87 s for the
+per-file path still used on Linux reflink filesystems. Hot read and metadata
+cost overlaps ordinary worktree I/O; the first durable write is slower while
+the filesystem splits shared extents.
+
+The disk multiple depends on average file size, not repository size: each
+worktree costs ~0.30 KiB of filesystem metadata per tracked path regardless of
+content. Trees of 4 KiB files cap out near 5×, vscode's 24 KiB average gives
+7×, and large-file repositories approach the worktree count. Full method:
 [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
 
 > **Measure with `df`, not `du`.** `du` reports *logical* size and cannot see

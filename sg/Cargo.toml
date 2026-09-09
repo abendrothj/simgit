@@ -19,6 +19,7 @@ clap.workspace        = true
 serde_json.workspace  = true
 anyhow.workspace      = true
 uuid.workspace        = true
+sha1.workspace        = true
 
 # cargo-binstall: fetch a prebuilt `sg` from GitHub Releases instead of
 # compiling. Expects release assets named sg-<target>.tar.gz once published.
