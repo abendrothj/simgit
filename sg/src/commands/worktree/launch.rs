@@ -25,6 +25,11 @@ pub struct WorktreeRun {
     #[arg(long)]
     pub base: Option<String>,
 
+    /// Check out only these directories (Git cone-mode sparse checkout).
+    /// Repeatable, and creation-only like `--base`.
+    #[arg(long = "sparse", value_name = "DIR")]
+    pub sparse: Vec<String>,
+
     /// Fail instead of using a normal Git checkout when CoW is unavailable.
     #[arg(long)]
     pub require_cow: bool,
@@ -54,8 +59,10 @@ pub(super) fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
             (Some(branch), path)
         }
         None => {
-            if args.base.is_some() || args.require_cow {
-                bail!("--base and --require-cow require an explicit branch to create a worktree");
+            if args.base.is_some() || args.require_cow || !args.sparse.is_empty() {
+                bail!(
+                    "--base, --require-cow and --sparse require an explicit branch to create a worktree"
+                );
             }
             let entry = pick_worktree(&repo)?;
             let branch = entry.branch.map(|reference| {
@@ -68,8 +75,8 @@ pub(super) fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         }
     };
     let target = if let Some(target) = existing {
-        if args.base.is_some() || args.require_cow {
-            bail!("--base and --require-cow apply only when creating a worktree");
+        if args.base.is_some() || args.require_cow || !args.sparse.is_empty() {
+            bail!("--base, --require-cow and --sparse apply only when creating a worktree");
         }
         if let Some(path) = &args.path {
             if path.canonicalize()? != target.canonicalize()? {
@@ -97,6 +104,7 @@ pub(super) fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
                 branch: branch.clone(),
                 path: args.path,
                 path_flag: None,
+                sparse: args.sparse,
                 base: args.base,
                 require_cow: args.require_cow,
                 ephemeral: args.ephemeral,

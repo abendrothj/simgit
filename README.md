@@ -102,6 +102,22 @@ eight worktrees cost about what one plain `git worktree` copy does.
 
 If that fraction is too high for your repository, the options are:
 
+- **Check out only what the agent needs:** `--sparse <dir>`, repeatable, using
+  Git's cone-mode sparse checkout. The cost falls with the cone, because both
+  the files on disk and the worktree's index shrink: on the 100k × 4 KiB tree,
+  one directory of ten costs **3.8 MiB per worktree instead of 37.9 MiB**, and
+  the index drops from 7.9 MiB to 0.79 MiB. Paths outside the cone are marked
+  `skip-worktree`, so `git status` stays clean and commits and merges behave
+  normally — but the agent cannot see or build against them, so it only suits
+  work that is genuinely confined to a subtree.
+
+  ```bash
+  sg worktree add agent/api --sparse services/api --sparse libs/shared
+  sg run agent/api --sparse services/api -- claude
+  ```
+
+  `--sparse` applies only when creating a workspace, like `--base`; reusing an
+  existing one keeps whatever cone it was created with.
 - **On Linux with `fuse-overlayfs`, prefer the overlay mode:**
   `SIMGIT_POPULATE=overlay sg worktree add …`. An overlay worktree's
   `upperdir` starts empty, so it pays no per-file metadata at all regardless
@@ -109,16 +125,13 @@ If that fraction is too high for your repository, the options are:
   otherwise prefers reflink when both are available, which is the wrong
   default for entry-heavy repositories. Neither the metadata saving nor the
   read overhead has been measured yet; treat the direction as sound and the
-  magnitude as unknown.
+  magnitude as unknown. `--sparse` is rejected with this backend, where the
+  lower layer is the whole baseline and narrowing the view saves nothing.
 - **Keep worktrees on one base commit.** The per-worktree cost is small; a
   second *baseline* is a whole tree. `sg worktree prune` reports the cache.
 - **Reuse workspaces instead of creating them.** `sg run <branch>` attaches to
   an existing worktree, so a stable set of agent workspaces costs a stable
   amount of disk.
-
-Sparse (cone) worktrees would cut the metadata proportionally — populating one
-of ten directories measured 3.3 MiB per worktree against 37.5 MiB — but that
-is not implemented and not committed to.
 
 ## Install
 
@@ -250,10 +263,10 @@ GC selects only ephemeral worktrees by default, even with `--force`; use
 the earlier defaults: automation that relied on `run` creating disposable
 workspaces should now pass `--ephemeral`.
 
-On reuse, `--path` must identify the existing workspace. `--base` and
-`--require-cow` are creation-only options and are rejected on reuse; `--base`
-is also rejected when attaching an existing branch. `--require-cow` cannot be
-combined with `SIMGIT_POPULATE=checkout`.
+On reuse, `--path` must identify the existing workspace. `--base`,
+`--require-cow` and `--sparse` are creation-only options and are rejected on
+reuse; `--base` is also rejected when attaching an existing branch.
+`--require-cow` cannot be combined with `SIMGIT_POPULATE=checkout`.
 
 While a command launched by `run` is active, its linked worktree is locked
 against removal and GC, including `--force`. A second `run` in the same

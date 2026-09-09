@@ -532,3 +532,85 @@ fn prune_and_list_answer_machine_readable_questions() {
     assert!(report["retained"].is_array());
     assert!(report["retained_bytes"].is_u64());
 }
+
+#[test]
+fn sparse_worktrees_check_out_only_the_requested_directories() {
+    // A worktree costs metadata per path, so narrowing what is materialized is
+    // the only lever that reduces it on macOS. The contract: just the cone on
+    // disk, everything else marked skip-worktree, a clean status, and edits in
+    // the cone behaving normally.
+    let root = std::env::temp_dir().join(format!("simgit-sparse-{}", uuid::Uuid::new_v4()));
+    let repo = root.join("repo");
+    for area in ["alpha", "beta"] {
+        fs::create_dir_all(repo.join(area).join("sub")).unwrap();
+    }
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    for area in ["alpha", "beta"] {
+        for i in 0..8 {
+            fs::write(
+                repo.join(area).join("sub").join(format!("f{i}.txt")),
+                format!("{area}-{i}\n"),
+            )
+            .unwrap();
+        }
+    }
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "initial"]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sg"))
+        .current_dir(&repo)
+        .env_remove("SIMGIT_POPULATE")
+        .env_remove("SIMGIT_WORKTREE_ROOT")
+        .args(["worktree", "add", "agent/cone", "--sparse", "alpha"])
+        .output()
+        .unwrap();
+    success(&output);
+    let printed = String::from_utf8(output.stdout).unwrap();
+    let worktree = std::path::PathBuf::from(printed.lines().last().unwrap().trim());
+
+    assert!(worktree.join("alpha/sub/f0.txt").is_file());
+    assert!(
+        !worktree.join("beta").exists(),
+        "paths outside the cone must not be materialized"
+    );
+
+    let listed = Command::new("git")
+        .current_dir(&worktree)
+        .args(["ls-files", "-t"])
+        .output()
+        .unwrap();
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(
+        listed.lines().any(|line| line.starts_with('S')),
+        "paths outside the cone must be marked skip-worktree: {listed}"
+    );
+
+    let status = Command::new("git")
+        .current_dir(&worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(status.stdout).unwrap(), "");
+
+    fs::write(worktree.join("alpha/sub/f0.txt"), "edited\n").unwrap();
+    let status = Command::new("git")
+        .current_dir(&worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(status.stdout).unwrap(),
+        " M alpha/sub/f0.txt\n"
+    );
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_sg"))
+        .current_dir(&repo)
+        .args(["worktree", "add", "agent/escape", "--sparse", "../outside"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+
+    let _ = fs::remove_dir_all(root);
+}

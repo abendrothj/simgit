@@ -205,18 +205,27 @@ Evaluated:
 
 | Approach | Result |
 |---|---|
-| Sparse (cone) checkout | **3.27 MiB per worktree vs 37.5 MiB**, and a 0.79 MiB sparse index vs 7.91 MiB dense. Not implemented. |
+| Sparse (cone) checkout | **Implemented** as `--sparse <dir>`: 3.79 MiB per worktree against 37.9 MiB for one directory of ten, 11.43 MiB for three of ten. Needs the sparse *index* too — dense it costs 11.56 MiB, because a 7.9 MiB index per worktree dominates once the files are gone. |
 | `fuse-overlayfs` mode (Linux) | `upperdir` starts empty, so no per-file metadata at any entry count. Trades FUSE read overhead. Unmeasured. |
 | `core.splitIndex` | No effect. The shared base is written into the *worktree's own* git dir (`.git/worktrees/<name>/sharedindex.*`), not the common dir, so nothing is shared between worktrees. |
 | Index version 4 (path compression) | 7.91 → 6.64 MiB on short paths: 16% of the index, 3% of the total. Not worth teaching the stat patcher prefix-compressed paths. |
 | Hard links instead of clones | Rejected: a write through a hard link mutates every worktree, which is the failure simgit exists to prevent. |
 
-The sparse figure was measured by hand-populating one cone directory from a
-baseline clone; that probe left the index inconsistent, so it establishes the
-disk cost, not a working implementation. A real version has to populate only
-the cone directories and handle sparse index entries (directories, mode
-040000) in `adopt_stat_data`, which currently skips them on the size check —
-safe, but it leaves their stat data stale.
+`--sparse` writes the cone patterns while the worktree's index is still empty,
+so Git checks nothing out from the object store, clones each requested
+directory from the baseline, and then runs `sparse-checkout reapply` under
+`index.sparse=true`. That last step does two things: it marks every path
+outside the cone `skip-worktree`, and it collapses them into single directory
+entries in the index. Both matter — an earlier revision applied the patterns
+without the sparse index and measured 11.56 MiB per worktree instead of 3.79,
+since the dense index is the largest remaining component once the files are
+gone.
+
+Sparse worktrees use `read-tree` rather than the adopted baseline index, so
+they pay Git's normal scan of the cone on creation instead of the 0.16 s stat
+adoption; on a 10k-file cone that is fractions of a second. The plain-checkout
+fallback builds the index first and configures the cone after it, which is the
+order in which `sparse-checkout set` materializes files itself.
 
 ### Native file-I/O latency
 
