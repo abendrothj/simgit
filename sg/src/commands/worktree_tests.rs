@@ -284,15 +284,17 @@ fn pruning_preserves_baselines_used_by_active_overlays() -> Result<()> {
     let commit = resolve_commit(&repo, "HEAD")?;
     let baseline = cow::ensure_baseline(&repo, &commit)?;
     let protected = HashSet::from([baseline.clone()]);
-    assert_eq!(
-        cow::prune_baselines(&repo.common_git_dir, true, &protected)?,
-        0
+    let protected_run = cow::prune_baselines(&repo.common_git_dir, true, &protected)?;
+    assert!(protected_run.removed.is_empty());
+    assert_eq!(protected_run.retained.len(), 1);
+    assert!(
+        protected_run.retained_bytes > 0,
+        "a retained baseline must report its disk cost"
     );
     assert!(baseline.is_dir());
-    assert_eq!(
-        cow::prune_baselines(&repo.common_git_dir, true, &HashSet::new())?,
-        1
-    );
+    let full_run = cow::prune_baselines(&repo.common_git_dir, true, &HashSet::new())?;
+    assert_eq!(full_run.removed.len(), 1);
+    assert_eq!(full_run.retained_bytes, 0);
     assert!(!baseline.exists());
     Ok(())
 }

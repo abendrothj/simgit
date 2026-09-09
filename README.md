@@ -225,12 +225,22 @@ lock is deliberately retained: verify that its child has stopped, then use
 are not tracked. Idle age still uses index/directory modification time, so
 it is only a cleanup heuristic for explicitly disposable workspaces.
 
-`--json` on `add` / `remove` / `list` / `gc` gives orchestrators structured
-output; `list` includes an `ephemeral` boolean. GC skips uncommitted changes
-unless `--force`, and accepts `--prefix <branch-prefix>`,
-`--older-than <90s|30m|24h|7d>`, `--delete-branches`, and `--dry-run`. Safe
-branch deletion retains unmerged work; combining it with `--force` explicitly
-discards unmerged branches.
+`--json` on `add` / `remove` / `list` / `gc` / `prune` / `repair` gives
+orchestrators structured output. `list` reports each worktree's `ephemeral`
+flag, its `locked` state while a command runs, and the `mode` it was populated
+with (`cow-clone`, `overlay`, `git-checkout`, or `null` for the main worktree)
+— so you can confirm a workspace really is CoW-backed rather than a silent
+full-copy fallback. The human `list` appends the same mode as a fourth
+tab-separated field. GC skips uncommitted changes unless `--force`, and
+accepts `--prefix <branch-prefix>`, `--older-than <90s|30m|24h|7d>`,
+`--delete-branches`, and `--dry-run`. Safe branch deletion retains unmerged
+work; combining it with `--force` explicitly discards unmerged branches.
+
+`prune` reports what the baseline cache still costs, in both formats
+(`retained_bytes` in JSON). One baseline is materialized per distinct base
+commit and kept for seven days, so branching from several commits costs one
+full tree each until pruned — worth checking if disk grows faster than the
+7× worktree saving implies.
 
 Each agent commits to its own branch; you integrate with `git merge`/`rebase`
 as usual — there is no shared state to coordinate.

@@ -492,3 +492,41 @@ fn add_accepts_the_same_path_flag_as_run() {
     assert!(flagged.join("README.md").is_file());
     assert!(positional.join("README.md").is_file());
 }
+
+#[test]
+fn prune_and_list_answer_machine_readable_questions() {
+    // `prune --json` advertised JSON in --help and printed prose, which breaks
+    // any orchestrator parsing it. And the populate mode was printed once at
+    // creation and never again, so nothing could answer "is this worktree
+    // actually CoW-backed?" — the one thing simgit exists to provide.
+    let fixture = Fixture::new();
+    let created = fixture.run(&["worktree", "add", "feat/mode"]);
+    success(&created);
+    let mode = String::from_utf8_lossy(&created.stderr)
+        .lines()
+        .find_map(|line| line.strip_prefix("mode: ").map(str::to_owned))
+        .expect("add reports the populate mode");
+
+    let listed = fixture.run(&["worktree", "list", "--json"]);
+    success(&listed);
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&listed.stdout).unwrap();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["branch"] == "refs/heads/feat/mode")
+        .expect("worktree is listed");
+    assert_eq!(entry["mode"], mode);
+
+    let human = fixture.run(&["worktree", "list"]);
+    success(&human);
+    assert!(String::from_utf8_lossy(&human.stdout)
+        .lines()
+        .any(|line| line.starts_with("feat/mode\t") && line.ends_with(&mode)));
+
+    let pruned = fixture.run(&["worktree", "prune", "--json"]);
+    success(&pruned);
+    let report: serde_json::Value = serde_json::from_slice(&pruned.stdout)
+        .expect("prune --json must emit JSON, not prose");
+    assert!(report["pruned"].is_array());
+    assert!(report["retained"].is_array());
+    assert!(report["retained_bytes"].is_u64());
+}

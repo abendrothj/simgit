@@ -191,7 +191,7 @@ pub fn run(cmd: Worktree, global_json: bool) -> Result<()> {
             remove(args, json)
         }
         Worktree::List(args) => list(args.json || global_json),
-        Worktree::Prune(args) => prune(args),
+        Worktree::Prune(args) => prune(args, global_json),
         Worktree::Gc(args) => {
             let json = args.json || global_json;
             gc(args, json)
@@ -270,6 +270,10 @@ fn create_worktree(args: &WorktreeAdd, attach: bool) -> Result<CreatedWorktree> 
             add_git_worktree(&repo, &args.branch, &target, &base, new_branch)?
         }
     }
+
+    // Best effort: a worktree that works but cannot report its mode is far
+    // better than tearing down a good checkout over a marker file.
+    let _ = mark_mode(&target, mode);
 
     if args.ephemeral {
         if let Err(error) = mark_ephemeral(&target) {
@@ -749,12 +753,15 @@ fn worktree_description(repo: &RepoContext, entry: &WorktreeEntry) -> String {
     } else {
         ""
     };
+    // Mode is appended, not inserted: existing scripts read fields 1-3.
+    let mode = worktree_mode(repo, &entry.path).unwrap_or_else(|| "-".to_owned());
     format!(
-        "{}\t{}\t{}{}",
+        "{}\t{}\t{}{}\t{}",
         branch.strip_prefix("refs/heads/").unwrap_or(branch),
         entry.path.to_string_lossy().escape_debug(),
         persistence,
-        locked
+        locked,
+        mode
     )
 }
 
@@ -798,6 +805,7 @@ fn list(json_output: bool) -> Result<()> {
             .map(PathBuf::from)
         {
             entry["ephemeral"] = json!(is_ephemeral(&repo, &path));
+            entry["mode"] = json!(worktree_mode(&repo, &path));
             if entry.get("locked").is_none() && ensure_unlocked(&repo, &path).is_err() {
                 entry["locked"] = json!("simgit: workspace in use");
             }
@@ -822,15 +830,29 @@ fn prune_git_worktrees(repo: &RepoContext) -> Result<()> {
     Ok(())
 }
 
-fn prune(args: WorktreePrune) -> Result<()> {
+fn prune(args: WorktreePrune, json: bool) -> Result<()> {
     let repo = discover_repo(&std::env::current_dir()?)?;
     let protected: HashSet<PathBuf> = overlay::registrations(&repo)
         .into_iter()
         .filter_map(|(_, state)| state.lower)
         .collect();
     prune_git_worktrees(&repo)?;
-    let removed = cow::prune_baselines(&repo.common_git_dir, args.all, &protected)?;
-    println!("pruned {removed} cached baseline(s)");
+    let outcome = cow::prune_baselines(&repo.common_git_dir, args.all, &protected)?;
+
+    if json {
+        emit(&json!({
+            "pruned": outcome.removed,
+            "retained": outcome.retained,
+            "retained_bytes": outcome.retained_bytes,
+        }));
+        return Ok(());
+    }
+    println!(
+        "pruned {} cached baseline(s); {} retained ({:.1} MiB)",
+        outcome.removed.len(),
+        outcome.retained.len(),
+        outcome.retained_bytes as f64 / (1024.0 * 1024.0)
+    );
     Ok(())
 }
 
@@ -1060,6 +1082,27 @@ fn mark_ephemeral(worktree: &Path) -> Result<()> {
     let admin = worktree_admin_dir(worktree)?;
     fs::write(admin.join("simgit-ephemeral"), b"").context("write ephemeral marker")?;
     Ok(())
+}
+
+/// Record how a worktree was populated, so `list` can answer the question the
+/// whole tool exists for — is this checkout actually sharing disk? — long
+/// after the creating command printed it.
+fn mark_mode(worktree: &Path, mode: PopulateMode) -> Result<()> {
+    let admin = worktree_admin_dir(worktree)?;
+    fs::write(admin.join("simgit-mode"), mode.label()).context("write mode marker")?;
+    Ok(())
+}
+
+/// The recorded populate mode, or `None` for the main worktree and any
+/// worktree simgit did not create.
+fn worktree_mode(repo: &RepoContext, worktree: &Path) -> Option<String> {
+    if overlay::state(repo, worktree).is_some() {
+        return Some(PopulateMode::Overlay.label().to_owned());
+    }
+    let admin = overlay::admin_dir(repo, worktree)?;
+    let recorded = fs::read_to_string(admin.join("simgit-mode")).ok()?;
+    let recorded = recorded.trim();
+    (!recorded.is_empty()).then(|| recorded.to_owned())
 }
 
 fn is_ephemeral(repo: &RepoContext, worktree: &Path) -> bool {

@@ -3,6 +3,7 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
@@ -202,26 +203,44 @@ pub(super) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
+/// What a prune did, and what the baseline cache still costs.
+///
+/// The retained size is the cache's own on-disk footprint. Baselines are the
+/// originals every clone shares extents with, so this is the physical price of
+/// keeping them — the one disk number about simgit that `du` reports honestly.
+pub(super) struct PruneOutcome {
+    pub removed: Vec<String>,
+    pub retained: Vec<String>,
+    pub retained_bytes: u64,
+}
+
 pub(super) fn prune_baselines(
     common_git_dir: &Path,
     all: bool,
     protected_trees: &HashSet<PathBuf>,
-) -> Result<usize> {
+) -> Result<PruneOutcome> {
+    let mut outcome = PruneOutcome {
+        removed: Vec::new(),
+        retained: Vec::new(),
+        retained_bytes: 0,
+    };
     let root = state_dir(common_git_dir).join("baselines");
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(outcome),
         Err(error) => return Err(error).context("read baseline cache"),
     };
     let now = SystemTime::now();
-    let mut removed = 0;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
         if protected_trees.contains(&path.join("tree")) {
+            outcome.retained.push(name);
+            outcome.retained_bytes += tree_size(&path);
             continue;
         }
-        let temporary = entry.file_name().to_string_lossy().starts_with('.');
+        let temporary = name.starts_with('.');
         let age_source = if path.join("ready").is_file() {
             path.join("ready")
         } else {
@@ -243,10 +262,32 @@ pub(super) fn prune_baselines(
             } else {
                 fs::remove_file(&path)?;
             }
-            removed += 1;
+            outcome.removed.push(name);
+        } else {
+            outcome.retained_bytes += tree_size(&path);
+            outcome.retained.push(name);
         }
     }
-    Ok(removed)
+    Ok(outcome)
+}
+
+/// Bytes allocated under `path`, skipping anything unreadable.
+fn tree_size(path: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        total += if metadata.is_dir() {
+            tree_size(&entry.path())
+        } else {
+            metadata.blocks() * 512
+        };
+    }
+    total
 }
 
 fn touch(path: &Path) -> Result<()> {
