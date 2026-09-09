@@ -375,17 +375,71 @@ fn add_cow_worktree(
     let baseline = cow::ensure_baseline(repo, base)?;
     register_worktree(repo, branch, target, base, false, new_branch)?;
 
-    let populate_result = (|| -> Result<()> {
-        run_git_at(target, ["read-tree", "HEAD"]).context("initialize linked-worktree index")?;
-        cow::clone_tree(&baseline, target).context("clone cached baseline")?;
-        ensure_clean(target).context("verify cloned worktree")
-    })();
+    let populate_result = populate_cow_worktree(target, &baseline);
 
     if let Err(error) = populate_result {
         rollback_created_worktree(repo, target, branch, new_branch)?;
         return Err(error);
     }
     Ok(())
+}
+
+/// Fill a registered, empty linked worktree from the cached baseline.
+///
+/// Prefers one directory-level clone plus the baseline's stat-refreshed index.
+/// That makes creation and the worktree's first `git status` an order of
+/// magnitude cheaper than cloning file by file and building an index with
+/// `read-tree`, which leaves Git to rescan every file. Falls back to the
+/// per-file clone when the platform or the cached baseline cannot support it.
+fn populate_cow_worktree(target: &Path, baseline: &Path) -> Result<()> {
+    if cow::ROOT_CLONE && root_clone_worktree(target, baseline).is_ok() {
+        return ensure_clean(target).context("verify cloned worktree");
+    }
+    run_git_at(target, ["read-tree", "HEAD"]).context("initialize linked-worktree index")?;
+    cow::clone_tree(baseline, target).context("clone cached baseline")?;
+    ensure_clean(target).context("verify cloned worktree")
+}
+
+/// Replace the empty registered worktree with a whole-tree clone.
+///
+/// `clonefile(2)` requires a destination that does not exist, so the
+/// directory Git just created is removed and its `.git` pointer restored
+/// afterwards. Any failure restores the empty worktree so the caller can fall
+/// back without leaving a half-populated checkout behind.
+fn root_clone_worktree(target: &Path, baseline: &Path) -> Result<()> {
+    let index = cow::baseline_index(baseline).context("baseline has no published index")?;
+    let pointer = target.join(".git");
+    let pointer_bytes = fs::read(&pointer).context("read linked-worktree pointer")?;
+
+    fs::remove_file(&pointer).context("detach linked-worktree pointer")?;
+    if let Err(error) = fs::remove_dir(target) {
+        fs::write(&pointer, &pointer_bytes)?;
+        return Err(error).context("registered worktree was not empty");
+    }
+    if let Err(error) = cow::clone_root(baseline, target) {
+        fs::create_dir_all(target)?;
+        fs::write(&pointer, &pointer_bytes)?;
+        return Err(error);
+    }
+    fs::write(&pointer, &pointer_bytes).context("restore linked-worktree pointer")?;
+
+    let git_dir = PathBuf::from(git_path_output(target, ["rev-parse", "--absolute-git-dir"])?);
+    fs::copy(&index, git_dir.join("index")).context("install baseline index")?;
+    // The clone differs from the baseline only in inode and ctime, so one
+    // refresh under relaxed stat checks records the clone's own stat data
+    // without hashing file content. The worktree keeps Git's strict defaults.
+    run_git_at(
+        target,
+        [
+            "-c",
+            "core.checkStat=minimal",
+            "-c",
+            "core.trustctime=false",
+            "update-index",
+            "--refresh",
+        ],
+    )
+    .context("record cloned worktree stat data")
 }
 
 fn add_git_worktree(

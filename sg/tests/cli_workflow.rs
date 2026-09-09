@@ -397,3 +397,71 @@ fn default_worktree_path_stays_outside_the_git_directory() {
         .starts_with("agent-edit"));
     assert!(path.join("README.md").is_file());
 }
+
+#[test]
+fn cow_materialization_reproduces_the_checkout_git_would_make() {
+    // The fast path replaces the registered worktree directory with a
+    // whole-tree clone and installs the baseline's index, so this pins what
+    // that dance must preserve: file content, symlinks, the executable bit, a
+    // clean first status, and normal change detection afterwards.
+    let root = std::env::temp_dir().join(format!("simgit-materialize-{}", uuid::Uuid::new_v4()));
+    let repo = root.join("repo");
+    fs::create_dir_all(repo.join("nested/deep")).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test User"]);
+    fs::write(repo.join("nested/deep/data.txt"), "payload\n").unwrap();
+    fs::write(repo.join("script.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(
+        repo.join("script.sh"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("nested/deep/data.txt", repo.join("link.txt")).unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "initial"]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sg"))
+        .current_dir(&repo)
+        .env_remove("SIMGIT_POPULATE")
+        .env_remove("SIMGIT_WORKTREE_ROOT")
+        .args(["worktree", "add", "agent/clone"])
+        .output()
+        .unwrap();
+    success(&output);
+    let printed = String::from_utf8(output.stdout).unwrap();
+    let worktree = std::path::PathBuf::from(printed.lines().last().unwrap().trim());
+
+    assert_eq!(
+        fs::read_to_string(worktree.join("nested/deep/data.txt")).unwrap(),
+        "payload\n"
+    );
+    assert_eq!(
+        fs::read_link(worktree.join("link.txt")).unwrap(),
+        Path::new("nested/deep/data.txt")
+    );
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &fs::metadata(worktree.join("script.sh")).unwrap().permissions(),
+    );
+    assert_eq!(mode & 0o111, 0o111, "executable bit lost: {mode:o}");
+
+    let status = Command::new("git")
+        .current_dir(&worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8(status.stdout).unwrap(), "");
+
+    fs::write(worktree.join("nested/deep/data.txt"), "edited\n").unwrap();
+    let status = Command::new("git")
+        .current_dir(&worktree)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(status.stdout).unwrap(),
+        " M nested/deep/data.txt\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}

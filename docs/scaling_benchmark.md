@@ -70,16 +70,45 @@ tracked content** — with 8 worktrees on APFS, September 8, 2026:
 
 | Path | `du`-accounted | Physical allocation delta | Setup |
 |---|---:|---:|---:|
-| Git worktrees | 4427 MiB | 4535 MiB | 14.2 s |
-| native CoW `sg worktree` | 4427 MiB | 573 MiB | 48.1 s |
+| Git worktrees | 4427 MiB | 4534 MiB | 14.0 s |
+| per-file CoW clone (`cp -c -R`) | 4427 MiB | 573 MiB | 48.1 s |
+| whole-tree clone (`clonefile`) | 4427 MiB | 651 MiB | 15.2 s |
 
-**7.9× less physical disk.** The `sg` physical figure is essentially one
-materialized baseline (553 MiB) plus per-worktree metadata: eight further
-checkouts cost ~20 MiB between them.
+**7.0–7.9× less physical disk.** The `sg` physical figure is essentially one
+materialized baseline (553 MiB) plus per-worktree directory metadata.
 
-Setup, however, cost **3.4×** here versus 2.2× on the 400-file synthetic tree.
-Cloning is per file, so cold setup scales with file count while the disk saving
-scales with content size. Quote the ratio with the repository shape attached.
+### Whole-tree cloning
+
+Cloning file by file made setup scale with file count, not content size: 3.4×
+plain `git worktree` here versus 2.2× on the 400-file synthetic tree. macOS
+`clonefile(2)` clones a directory hierarchy recursively in one syscall, which
+removes that walk. Isolated on the same 23k-entry baseline:
+
+| Materialization | Time |
+|---|---:|
+| `cp -c -R baseline/. target` (per file) | 2.50 s |
+| `clonefile(baseline, target)` (whole tree) | 0.20 s |
+
+The worktree also adopts the baseline's index. `checkout-index -u` records
+stat data while materializing the baseline, and the clone differs from it only
+in inode and ctime, so one `update-index --refresh` under
+`core.checkStat=minimal core.trustctime=false` re-records the clone's own stat
+data without hashing any content. The worktree then keeps Git's strict
+defaults. Measured per worktree on vscode, warm baseline:
+
+| Path | `sg worktree add` | First `git status` |
+|---|---:|---:|
+| per-file clone + `read-tree` | 5.6 s | 0.10 s |
+| whole-tree clone + baseline index | 1.2 s | 0.10 s |
+
+Cost: whole-tree cloning allocates ~8 MiB more directory metadata per
+worktree (573 → 651 MiB across eight), trading 13% more physical disk for a
+3.2× faster creation. Baselines published by older versions carry no index;
+those fall back to the per-file path, as does Linux, which has no
+directory-level reflink.
+
+Thanks to @pasteley ([#20](https://github.com/abendrothj/simgit/issues/20))
+for measuring this on a 256,886-path monorepo and identifying both halves.
 
 ### Native file-I/O latency
 

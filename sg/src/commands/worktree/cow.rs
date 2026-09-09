@@ -116,18 +116,67 @@ fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) ->
         .args(["read-tree", commit]);
     run_command(&mut read_tree, "initialize baseline index")?;
 
+    // `-u` records each file's stat data in the baseline index. A worktree
+    // cloned from this tree can then adopt that index and skip Git's initial
+    // full rescan; see `populate_cow_worktree`. The index is published with
+    // the tree and shares its lifetime.
     let mut checkout = Command::new("git");
     checkout
         .env("GIT_INDEX_FILE", &index)
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
         .arg(format!("--work-tree={}", destination.display()))
-        .args(["checkout-index", "--all", "--force"]);
-    let result = run_command(
+        .args(["checkout-index", "--all", "--force", "-u"]);
+    run_command(
         &mut checkout,
         "materialize baseline with Git checkout-index",
-    );
-    let _ = fs::remove_file(index);
-    result
+    )
+}
+
+/// True when this platform can clone a whole directory tree in one call.
+pub(super) const ROOT_CLONE: bool = cfg!(target_os = "macos");
+
+/// Clone an entire baseline tree with a single `clonefile(2)` call.
+///
+/// APFS clones a directory hierarchy recursively in one syscall, sharing the
+/// same extents as a per-file clone but without walking the tree: 0.20 s vs
+/// 2.50 s for a 23k-entry checkout. `destination` must not exist. Linux has no
+/// directory-level reflink, so there is no equivalent path there.
+#[cfg(target_os = "macos")]
+pub(super) fn clone_root(source: &Path, destination: &Path) -> Result<()> {
+    use std::ffi::{c_char, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn clonefile(source: *const c_char, destination: *const c_char, flags: u32) -> i32;
+    }
+
+    let from = CString::new(source.as_os_str().as_bytes())?;
+    let to = CString::new(destination.as_os_str().as_bytes())?;
+    // SAFETY: both pointers are NUL-terminated and outlive the call, and
+    // clonefile only reads them.
+    if unsafe { clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error()).with_context(|| {
+        format!(
+            "clonefile {} -> {}",
+            source.display(),
+            destination.display()
+        )
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn clone_root(source: &Path, destination: &Path) -> Result<()> {
+    let _ = (source, destination);
+    bail!("directory-level cloning is unavailable on this platform")
+}
+
+/// The stat-refreshed index published beside a baseline tree, if the baseline
+/// was materialized by a version that writes one.
+pub(super) fn baseline_index(baseline_tree: &Path) -> Option<PathBuf> {
+    let index = baseline_tree.parent()?.join("index");
+    index.is_file().then_some(index)
 }
 
 pub(super) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
