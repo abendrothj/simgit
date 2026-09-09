@@ -58,9 +58,14 @@ Two dedicated APFS runs, **300 MiB tree and 8 worktrees**:
 
 `du` remains intentionally shown because it catches accidental extra trees,
 but the physical allocation delta is the result that tests extent sharing.
-The native CoW path used **at least 8.0× less physical disk** for eight
-untouched worktrees, at **2.1–2.2× the cold setup time** in these sequential
-runs.
+Eight untouched worktrees cost roughly one tree, at **2.1–2.2× the cold setup
+time** in these sequential runs.
+
+> **Report the marginal cost, not a multiple.** "8× less disk with 8
+> worktrees" is the worktree count restated — the same run yields 12× at
+> twelve and 50× at fifty, which says nothing new. The invariant is that the
+> CoW path pays for one tree plus a small per-worktree constant, while plain
+> `git worktree` pays for a tree every time.
 
 ### Real repository: microsoft/vscode
 
@@ -68,13 +73,14 @@ Synthetic trees understate per-file cost, so the same comparison was run on a
 `--depth 1` clone of `microsoft/vscode` — **18,707 tracked files, 553 MiB of
 tracked content** — with 8 worktrees on APFS, two runs each, September 8, 2026:
 
-| Path | Physical allocation delta | Cold setup |
-|---|---:|---:|
-| Git worktrees | 4534–4536 MiB | 14.0–14.2 s |
-| `sg worktree` | 640–650 MiB | 6.4–7.0 s |
+| Path | Physical allocation delta | Per worktree | Cold setup |
+|---|---:|---:|---:|
+| Git worktrees | 4534–4536 MiB | 567 MiB | 14.0–14.2 s |
+| `sg worktree` | 640–650 MiB | ~11 MiB after the baseline | 6.4–7.0 s |
 
-**7.0× less physical disk at half the setup time.** The `sg` figure is one
-materialized baseline (553 MiB) plus per-worktree filesystem metadata.
+The `sg` figure is one materialized baseline (553 MiB) plus ~11 MiB of
+per-worktree filesystem metadata, so total disk is `tree + N × 11 MiB` against
+`N × 567 MiB`. Setup is half of plain `git worktree`, not a tradeoff.
 
 ### Whole-tree cloning
 
@@ -132,12 +138,14 @@ synthetic tree, `df` deltas per worktree:
 | 101,001 | 390 MiB | 31,203 KiB | 31,222 KiB |
 | 10,101 | 2,500 MiB | 3,087 KiB | 3,106 KiB |
 
-That is ~0.30 KiB per tracked path, unchanged when content grows 64×. The
-disk multiple therefore depends on average file size: N worktrees of a tree
-with `bytes` of content and `entries` paths cost
-`bytes + N × 0.30 KiB × entries`. Trees of 4 KiB files cap near 5× at eight
-worktrees, vscode's 24 KiB average yields 7×, and large-file repositories
-approach N.
+That is ~0.30 KiB per tracked path, unchanged when content grows 64×. So N
+worktrees of a tree with `bytes` of content and `entries` paths cost
+`bytes + N × 0.30 KiB × entries`, and the marginal worktree costs
+`0.30 KiB × entries` however large N gets. What varies between repositories
+is that constant as a fraction of the tree — set by average file size, not
+repository size: ~2% at vscode's 24 KiB average, ~8% for a tree of 4 KiB
+files, negligible when files are large. A repository of many tiny files is
+where the technique pays least.
 
 Baselines published before stat adoption carry no index and fall back to the
 per-file path, as does Linux, which has no directory-level reflink.

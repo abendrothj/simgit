@@ -47,39 +47,39 @@ merges — no coordination layer, no conflict arbitration, no lock service.
 
 ### Measured
 
-Standing up eight isolated views of a 300 MiB synthetic tree (400 files) on APFS:
+The number that matters is the **marginal cost of one more worktree**, not a
+multiple: a multiple is just the worktree count restated. On a real checkout
+of `microsoft/vscode` (18,707 tracked files, 553 MiB), APFS, two runs each:
 
-| Path | Physical disk added | Cold setup |
+| | First extra worktree | Each one after that |
 |---|---:|---:|
-| 8 × `git worktree` | 2405.9–2583.4 MiB | 6.32–6.66 s |
-| 8 × `sg worktree` | 301.2 MiB | 14.10–14.15 s |
+| `git worktree` | 567 MiB (a full copy) | **567 MiB** (another full copy) |
+| `sg worktree` | ~564 MiB (one shared baseline) | **~11 MiB** (2% of the tree) |
 
-And on a real checkout of `microsoft/vscode` (18,707 tracked files, 553 MiB),
-two runs each, default Git configuration:
+So N worktrees cost `tree + N × 11 MiB` instead of `N × 567 MiB`: 640–650 MiB
+versus 4534–4536 MiB at eight, and the gap keeps widening with N because only
+one side grows. Cold setup for those eight: **6.4–7.0 s** for `sg` against
+**14.0–14.2 s** for plain `git worktree` — on macOS the whole tree is cloned
+in one `clonefile(2)` call and the worktree adopts the baseline's index, so a
+single worktree lands in 0.56 s (5.87 s on the per-file path Linux reflink
+still uses).
 
-| Path | Physical disk added | Cold setup |
-|---|---:|---:|
-| 8 × `git worktree` | 4534–4536 MiB | 14.0–14.2 s |
-| 8 × `sg worktree` | 640–650 MiB | 6.4–7.0 s |
-
-**7.0× less physical disk, and about half the setup time** — on macOS the
-whole tree is cloned in one `clonefile(2)` call and the worktree adopts the
-baseline's index, so a single worktree lands in 0.56 s against 5.87 s for the
-per-file path still used on Linux reflink filesystems. Hot read and metadata
-cost overlaps ordinary worktree I/O; the first durable write is slower while
-the filesystem splits shared extents.
-
-The disk multiple depends on average file size, not repository size: each
-worktree costs ~0.30 KiB of filesystem metadata per tracked path regardless of
-content. Trees of 4 KiB files cap out near 5×, vscode's 24 KiB average gives
-7×, and large-file repositories approach the worktree count. Full method:
+That marginal cost is filesystem metadata, **~0.30 KiB per tracked path**,
+independent of content size — so it scales with file count, and as a fraction
+of the tree it depends on average file size: ~2% for vscode's 24 KiB average,
+~8% for a tree of 4 KiB files, negligible for large-file repositories. Hot
+read and metadata cost overlaps ordinary worktree I/O; the first durable write
+is slower while the filesystem splits shared extents. Full method:
 [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
+
+One baseline is materialized per distinct base commit, so branching from
+several commits costs one tree each; `sg worktree prune` reports and reclaims
+that cache.
 
 > **Measure with `df`, not `du`.** `du` reports *logical* size and cannot see
 > clonefile/reflink block-sharing, so a CoW worktree looks like a full copy to
-> it. Only `df` (physical blocks consumed) shows the real saving — e.g. 4 × `sg
-> worktree` of a 100 MB tree consumes ~97 MB physical vs ~403 MB for 4 × plain
-> `git worktree`.
+> it. Only `df` (physical blocks consumed) shows what a worktree actually
+> allocated.
 
 ## Install
 
