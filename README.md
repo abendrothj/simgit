@@ -218,7 +218,8 @@ simgit/
 ├── sg/                 the CLI (`sg worktree`)
 │   └── src/commands/worktree/   command launch/picker, CoW and overlay backends
 ├── tests/              CoW scaling benchmarks + overlay integration test
-├── packaging/          Homebrew formula
+├── packaging/          Homebrew formula (prebuilt-binary install)
+├── install.sh          curl | sh installer for the release binaries
 └── docs/               scaling benchmark methodology
 ```
 
