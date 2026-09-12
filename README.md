@@ -148,7 +148,7 @@ cargo binstall simgit-cli
 ```
 
 The script installs `sg` into `~/.local/bin`; set `SIMGIT_INSTALL_DIR` to
-choose another directory or `SIMGIT_VERSION=v0.1.4` to pin a release. Verify
+choose another directory or `SIMGIT_VERSION=v0.2.0` to pin a release. Verify
 with `sg --version`.
 
 On Linux without a reflink filesystem, install `fuse-overlayfs` to get the CoW
