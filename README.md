@@ -326,8 +326,9 @@ work; combining it with `--force` explicitly discards unmerged branches.
 `prune` reports what the baseline cache still costs, in both formats
 (`retained_bytes` in JSON). One baseline is materialized per distinct base
 commit and kept for seven days, so branching from several commits costs one
-full tree each until pruned — worth checking if disk grows faster than the
-7× worktree saving implies.
+full tree each until pruned. Compare the retained baseline cost directly with
+the marginal cost of each additional worktree; the savings depend on repository
+shape, not a fixed multiplier.
 
 ## Repository layout
 
