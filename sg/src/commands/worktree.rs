@@ -495,18 +495,68 @@ fn validate_sparse(sparse: &[String]) -> Result<Vec<String>> {
 
 /// Fill a registered, empty linked worktree from the cached baseline.
 ///
-/// Prefers one directory-level clone plus the baseline's stat-refreshed index.
-/// That makes creation and the worktree's first `git status` an order of
-/// magnitude cheaper than cloning file by file and building an index with
-/// `read-tree`, which leaves Git to rescan every file. Falls back to the
-/// per-file clone when the platform or the cached baseline cannot support it.
+/// Prefers one directory-level clone where the platform supports it, falling
+/// back to per-file clones. Both paths then adopt the baseline's
+/// stat-refreshed index, which makes the worktree's first `git status` an
+/// order of magnitude cheaper than building an index with `read-tree` and
+/// leaving Git to rescan every file.
 fn populate_cow_worktree(target: &Path, baseline: &Path) -> Result<()> {
-    if cow::ROOT_CLONE && root_clone_worktree(target, baseline).is_ok() {
-        return ensure_clean(target).context("verify cloned worktree");
+    if cow::ROOT_CLONE {
+        match root_clone_worktree(target, baseline) {
+            Ok(()) => return ensure_clean(target).context("verify cloned worktree"),
+            Err(error) => {
+                if !is_empty_linked_worktree(target) {
+                    return Err(error);
+                }
+            }
+        }
     }
-    run_git_at(target, ["read-tree", "HEAD"]).context("initialize linked-worktree index")?;
+    populate_by_file(target, baseline)
+}
+
+/// A root-clone failure may fall back only after the original Git registration
+/// has been restored and the target contains no cloned entries.
+fn is_empty_linked_worktree(target: &Path) -> bool {
+    if !target.join(".git").is_file() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(target) else {
+        return false;
+    };
+    entries
+        .filter_map(Result::ok)
+        .all(|entry| entry.file_name() == ".git")
+}
+
+/// Per-file population for filesystems without directory-level cloning:
+/// clone every file from the baseline in parallel, then adopt the baseline's
+/// published index. Caches published by versions that wrote no index fall
+/// back to `read-tree`, which leaves Git to rescan on first use.
+fn populate_by_file(target: &Path, baseline: &Path) -> Result<()> {
     cow::clone_tree(baseline, target).context("clone cached baseline")?;
+    if adopt_baseline_index(target, baseline).is_err() {
+        run_git_at(target, ["read-tree", "HEAD"]).context("initialize linked-worktree index")?;
+    }
     ensure_clean(target).context("verify cloned worktree")
+}
+
+/// Install the baseline's published, stat-refreshed index as this worktree's
+/// index, re-recorded to describe the clone's own inodes; see `index`.
+fn adopt_baseline_index(target: &Path, baseline: &Path) -> Result<()> {
+    let index = cow::baseline_index(baseline).context("baseline has no published index")?;
+    let git_dir = PathBuf::from(git_path_output(
+        target,
+        ["rev-parse", "--absolute-git-dir"],
+    )?);
+    let worktree_index = git_dir.join("index");
+    fs::copy(&index, &worktree_index).context("install baseline index")?;
+    if let Err(error) = index::adopt_stat_data(&worktree_index, target) {
+        // Leave no half-adopted index behind; the caller's `read-tree`
+        // fallback rebuilds one from scratch.
+        let _ = fs::remove_file(&worktree_index);
+        return Err(error).context("adopt cloned worktree stat data");
+    }
+    Ok(())
 }
 
 /// Replace the empty registered worktree with a whole-tree clone.
@@ -516,7 +566,9 @@ fn populate_cow_worktree(target: &Path, baseline: &Path) -> Result<()> {
 /// afterwards. Any failure restores the empty worktree so the caller can fall
 /// back without leaving a half-populated checkout behind.
 fn root_clone_worktree(target: &Path, baseline: &Path) -> Result<()> {
-    let index = cow::baseline_index(baseline).context("baseline has no published index")?;
+    // Check before the pointer dance: without a published index the per-file
+    // path is no worse, and nothing destructive has happened yet.
+    cow::baseline_index(baseline).context("baseline has no published index")?;
     let pointer = target.join(".git");
     let pointer_bytes = fs::read(&pointer).context("read linked-worktree pointer")?;
 
@@ -526,22 +578,32 @@ fn root_clone_worktree(target: &Path, baseline: &Path) -> Result<()> {
         return Err(error).context("registered worktree was not empty");
     }
     if let Err(error) = cow::clone_root(baseline, target) {
-        fs::create_dir_all(target)?;
-        fs::write(&pointer, &pointer_bytes)?;
+        restore_empty_worktree(target, &pointer_bytes)?;
         return Err(error);
     }
-    fs::write(&pointer, &pointer_bytes).context("restore linked-worktree pointer")?;
 
-    let git_dir = PathBuf::from(git_path_output(
-        target,
-        ["rev-parse", "--absolute-git-dir"],
-    )?);
-    let worktree_index = git_dir.join("index");
-    fs::copy(&index, &worktree_index).context("install baseline index")?;
-    // The copied index describes the baseline's inodes, which Git would treat
-    // as stale and rehash. Re-record the clone's own stat data instead; Git's
-    // strict staleness checks are untouched.
-    index::adopt_stat_data(&worktree_index, target).context("adopt cloned worktree stat data")
+    let result = (|| {
+        fs::write(&pointer, &pointer_bytes).context("restore linked-worktree pointer")?;
+        adopt_baseline_index(target, baseline)
+    })();
+    if let Err(error) = result {
+        // The clone exists by this point. Restore the empty linked worktree so
+        // the caller's per-file fallback never walks into a populated target.
+        if let Err(cleanup) = restore_empty_worktree(target, &pointer_bytes) {
+            return Err(error).context(format!("restore failed root clone: {cleanup}"));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn restore_empty_worktree(target: &Path, pointer_bytes: &[u8]) -> Result<()> {
+    if target.exists() {
+        fs::remove_dir_all(target).context("remove failed cloned worktree")?;
+    }
+    fs::create_dir_all(target).context("recreate empty linked worktree")?;
+    fs::write(target.join(".git"), pointer_bytes).context("restore linked-worktree pointer")?;
+    Ok(())
 }
 
 fn add_git_worktree(

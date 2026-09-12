@@ -1,15 +1,20 @@
 use super::{run_command, state_dir, RepoContext};
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 const BASELINE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Cap on per-file clone workers. Reflink clones are metadata operations, so
+/// a handful of threads saturates the filesystem's allocation structures and
+/// more only adds contention.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CLONE_WORKERS_MAX: usize = 8;
 
 pub(super) fn clone_supported(common_git_dir: &Path, destination_dir: &Path) -> Result<bool> {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -26,36 +31,68 @@ pub(super) fn clone_supported(common_git_dir: &Path, destination_dir: &Path) -> 
         let source = probe.join(format!("{token}.source"));
         let destination = destination_dir.join(format!(".simgit-clone-probe-{token}"));
         fs::write(&source, b"simgit-cow-probe")?;
-        let status = clone_file_command(&source, &destination)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Probe with the exact operation `clone_tree` performs, so a positive
+        // probe can never select a clone mechanism that then fails.
+        let cloned = clone_file(&source, &destination).is_ok();
         let _ = fs::remove_file(&source);
         let _ = fs::remove_file(&destination);
-        Ok(status.map(|status| status.success()).unwrap_or(false))
+        Ok(cloned)
     }
 }
 
-#[cfg(target_os = "macos")]
-fn clone_file_command(source: &Path, destination: &Path) -> Command {
-    let mut command = Command::new("cp");
-    command.args([
-        OsStr::new("-c"),
-        source.as_os_str(),
-        destination.as_os_str(),
-    ]);
-    command
+/// Clone one file's extents with the `FICLONE` ioctl — the operation behind
+/// `cp --reflink=always`, without spawning a process per tree.
+#[cfg(target_os = "linux")]
+fn clone_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    /// `_IOW(0x94, 9, int)` from `linux/fs.h`.
+    const FICLONE: std::ffi::c_ulong = 0x4004_9409;
+    extern "C" {
+        fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
+    }
+
+    let from = fs::File::open(source)?;
+    let mode = from.metadata()?.mode();
+    let to = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(destination)?;
+    // SAFETY: both descriptors are owned and open for the duration of the
+    // call; FICLONE reads extents from `from` and links them into `to`.
+    if unsafe { ioctl(to.as_raw_fd(), FICLONE, from.as_raw_fd()) } != 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    // The mode passed to `create_new` is filtered by the umask; re-assert the
+    // baseline's mode so the executable bit always survives the clone.
+    to.set_permissions(fs::Permissions::from_mode(mode))
 }
 
-#[cfg(target_os = "linux")]
-fn clone_file_command(source: &Path, destination: &Path) -> Command {
-    let mut command = Command::new("cp");
-    command.args([
-        OsStr::new("--reflink=always"),
-        source.as_os_str(),
-        destination.as_os_str(),
-    ]);
-    command
+/// Clone one path with `clonefile(2)`. Files and directory trees alike; the
+/// destination must not exist.
+#[cfg(target_os = "macos")]
+fn clone_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::{c_char, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn clonefile(source: *const c_char, destination: *const c_char, flags: u32) -> i32;
+    }
+
+    let nul = |_| std::io::Error::from(std::io::ErrorKind::InvalidInput);
+    let from = CString::new(source.as_os_str().as_bytes()).map_err(nul)?;
+    let to = CString::new(destination.as_os_str().as_bytes()).map_err(nul)?;
+    // SAFETY: both pointers are NUL-terminated and outlive the call, and
+    // clonefile only reads them.
+    if unsafe { clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Return an immutable checkout cache for `commit`.
@@ -144,21 +181,7 @@ pub(super) const ROOT_CLONE: bool = cfg!(target_os = "macos");
 /// directory-level reflink, so there is no equivalent path there.
 #[cfg(target_os = "macos")]
 pub(super) fn clone_root(source: &Path, destination: &Path) -> Result<()> {
-    use std::ffi::{c_char, CString};
-    use std::os::unix::ffi::OsStrExt;
-
-    extern "C" {
-        fn clonefile(source: *const c_char, destination: *const c_char, flags: u32) -> i32;
-    }
-
-    let from = CString::new(source.as_os_str().as_bytes())?;
-    let to = CString::new(destination.as_os_str().as_bytes())?;
-    // SAFETY: both pointers are NUL-terminated and outlive the call, and
-    // clonefile only reads them.
-    if unsafe { clonefile(from.as_ptr(), to.as_ptr(), 0) } == 0 {
-        return Ok(());
-    }
-    Err(std::io::Error::last_os_error()).with_context(|| {
+    clone_file(source, destination).with_context(|| {
         format!(
             "clonefile {} -> {}",
             source.display(),
@@ -180,27 +203,99 @@ pub(super) fn baseline_index(baseline_tree: &Path) -> Option<PathBuf> {
     index.is_file().then_some(index)
 }
 
+/// Clone `source`'s contents into the existing directory `destination`, file
+/// by file. Directories and symlinks are recreated; regular files share their
+/// extents with the baseline via reflink clones issued from a small thread
+/// pool — each clone is an independent metadata operation, and the serial
+/// walk `cp -R` performs is what made this path slow on large trees.
 pub(super) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("cp");
-        command.args(["-c", "-R"]);
-        command
-    };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = Command::new("cp");
-        command.args(["--reflink=always", "-R"]);
-        command
-    };
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    bail!("CoW tree cloning is not supported on this platform");
+    {
+        let _ = (source, destination);
+        bail!("CoW tree cloning is not supported on this platform");
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        command.arg(source.join(".")).arg(destination);
-        run_command(&mut command, "copy-on-write tree clone")
+        let mut files = Vec::new();
+        collect_tree(source, destination, &mut files)
+            .with_context(|| format!("replicate baseline tree {}", source.display()))?;
+        clone_files(&files)
     }
+}
+
+/// Recreate directories and symlinks now; queue regular files for cloning.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn collect_tree(
+    source: &Path,
+    destination: &Path,
+    files: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        if kind.is_dir() {
+            fs::create_dir(&to)?;
+            collect_tree(&from, &to, files)?;
+        } else if kind.is_symlink() {
+            let link = fs::read_link(&from)?;
+            std::os::unix::fs::symlink(link, &to)?;
+        } else if kind.is_file() {
+            files.push((from, to));
+        } else {
+            // Baselines come from `git checkout-index`, which only writes
+            // files and symlinks; anything else means the cache was tampered
+            // with, and a partial clone must not pass for a checkout.
+            bail!("unsupported baseline entry: {}", from.display());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn clone_files(jobs: &[(PathBuf, PathBuf)]) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(CLONE_WORKERS_MAX)
+        .min(jobs.len());
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| loop {
+                    if failed.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    let Some((from, to)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        return Ok(());
+                    };
+                    if let Err(error) = clone_file(from, to) {
+                        failed.store(true, Ordering::Relaxed);
+                        return Err(error).with_context(|| {
+                            format!("clone {} -> {}", from.display(), to.display())
+                        });
+                    }
+                })
+            })
+            .collect();
+        let mut result = Ok(());
+        for handle in handles {
+            let outcome = handle.join().expect("clone worker panicked");
+            if result.is_ok() {
+                result = outcome;
+            }
+        }
+        result
+    })
 }
 
 /// What a prune did, and what the baseline cache still costs.

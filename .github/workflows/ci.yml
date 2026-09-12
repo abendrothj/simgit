@@ -47,6 +47,17 @@ jobs:
       - run: cargo test --all --locked
       - run: python3 tests/cli_picker.py
 
+  reflink-linux:
+    # Exercises the native FICLONE path on a real reflink filesystem; the
+    # standard Ubuntu runner filesystem is not guaranteed to support it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Reflink integration tests
+        run: bash tests/reflink_integration.sh
+
   overlay-linux:
     # Validates the fuse-overlayfs populate mode, which cannot run on macOS.
     runs-on: ubuntu-latest

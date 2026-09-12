@@ -375,7 +375,12 @@ impl Fixture {
             "still part of a checkout\n",
         )?;
         #[cfg(unix)]
-        std::os::unix::fs::symlink("file.txt", repo.join("file-link"))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::os::unix::fs::symlink("file.txt", repo.join("file-link"))?;
+            fs::write(repo.join("tool.sh"), "#!/bin/sh\n")?;
+            fs::set_permissions(repo.join("tool.sh"), fs::Permissions::from_mode(0o755))?;
+        }
         git(&repo, ["add", "."])?;
         git(&repo, ["commit", "-q", "-m", "initial"])?;
         Ok(Self { root, repo })
@@ -431,6 +436,133 @@ fn adopted_stat_data_equals_gits_own_refresh() -> Result<()> {
         fs::read(&refreshed)?,
         "adopted stat data differs from Git's own refresh"
     );
+    Ok(())
+}
+
+#[test]
+fn required_reflink_backend_is_available() -> Result<()> {
+    if std::env::var_os("SIMGIT_REQUIRE_REFLINK").is_none() {
+        return Ok(());
+    }
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    assert!(
+        cow::clone_supported(&repo.common_git_dir, &fixture.root)?,
+        "SIMGIT_REQUIRE_REFLINK=1 but the test filesystem rejected reflink cloning"
+    );
+    Ok(())
+}
+
+#[test]
+fn root_clone_failure_restores_empty_worktree_before_fallback() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    if !cow::ROOT_CLONE || !cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        return Ok(());
+    }
+    let base = resolve_commit(&repo, "HEAD")?;
+    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let published = cow::baseline_index(&baseline).context("baseline publishes an index")?;
+    fs::write(published, b"corrupt index")?;
+
+    let target = fixture.root.join("root-fallback");
+    register_worktree(&repo, "root-fallback", &target, &base, false, true)?;
+    populate_cow_worktree(&target, &baseline)?;
+
+    ensure_clean(&target)?;
+    assert_eq!(fs::read_to_string(target.join("file.txt"))?, "content\n");
+    assert!(target.join(".git").is_file());
+    Ok(())
+}
+
+#[test]
+fn per_file_adopted_stat_data_matches_git_refresh() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    if !cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        return Ok(());
+    }
+    let base = resolve_commit(&repo, "HEAD")?;
+    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let target = fixture.root.join("per-file-index");
+    register_worktree(&repo, "per-file-index", &target, &base, false, true)?;
+    populate_by_file(&target, &baseline)?;
+
+    let git_dir = PathBuf::from(git_path_output(
+        &target,
+        ["rev-parse", "--absolute-git-dir"],
+    )?);
+    let installed = git_dir.join("index");
+    let adopted = fixture.root.join("per-file-adopted.index");
+    fs::copy(&installed, &adopted)?;
+    let refreshed = fixture.root.join("per-file-refreshed.index");
+    fs::copy(&installed, &refreshed)?;
+    let mut refresh = Command::new("git");
+    refresh
+        .env("GIT_INDEX_FILE", &refreshed)
+        .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+        .arg(format!("--work-tree={}", target.display()))
+        .args(["update-index", "--really-refresh"]);
+    run_command(&mut refresh, "git update-index --really-refresh")?;
+
+    assert_eq!(
+        fs::read(&adopted)?,
+        fs::read(&refreshed)?,
+        "per-file stat adoption differs from Git's own refresh"
+    );
+    Ok(())
+}
+
+#[test]
+fn per_file_population_is_clean_and_preserves_file_kinds() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    if !cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        return Ok(());
+    }
+    let base = resolve_commit(&repo, "HEAD")?;
+    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let target = fixture.root.join("per-file");
+    register_worktree(&repo, "per-file", &target, &base, false, true)?;
+    populate_by_file(&target, &baseline)?;
+    assert_eq!(fs::read_to_string(target.join("file.txt"))?, "content\n");
+    assert_eq!(
+        fs::read_to_string(target.join("filtered.txt"))?,
+        "smudged:content\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(fs::symlink_metadata(target.join("file-link"))?
+            .file_type()
+            .is_symlink());
+        let mode = fs::metadata(target.join("tool.sh"))?.permissions().mode();
+        assert_ne!(
+            mode & 0o100,
+            0,
+            "executable bit must survive the per-file clone"
+        );
+    }
+    Ok(())
+}
+
+/// Baseline caches published before the stat-refreshed index existed must
+/// still populate correctly through the `read-tree` fallback.
+#[test]
+fn per_file_population_survives_a_baseline_without_published_index() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    if !cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+        return Ok(());
+    }
+    let base = resolve_commit(&repo, "HEAD")?;
+    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let published = cow::baseline_index(&baseline).context("baseline publishes an index")?;
+    fs::remove_file(published)?;
+    let target = fixture.root.join("pre-index");
+    register_worktree(&repo, "pre-index", &target, &base, false, true)?;
+    populate_by_file(&target, &baseline)?;
+    assert_eq!(fs::read_to_string(target.join("file.txt"))?, "content\n");
     Ok(())
 }
 
