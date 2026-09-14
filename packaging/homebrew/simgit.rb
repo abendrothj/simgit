@@ -1,4 +1,4 @@
-# Homebrew formula for `sg` (simgit worktree CLI).
+# Homebrew formula for the canonical `simgit` CLI and its short `sg` alias.
 #
 # Installs the prebuilt binary attached to the GitHub release, so no Rust
 # toolchain is pulled in. Update `version` and the four `sha256` values for
@@ -34,10 +34,13 @@ class Simgit < Formula
   end
 
   def install
-    bin.install "sg"
+    # v0.2.0 archives predate the dual-name layout, so promote their `sg`
+    # executable to the canonical name and retain `sg` as the short alias.
+    bin.install "sg" => "simgit"
+    bin.install_symlink bin/"simgit" => "sg"
   end
 
   test do
-    assert_match "sg #{version}", shell_output("#{bin}/sg --version")
+    assert_match version.to_s, shell_output("#{bin}/simgit --version")
   end
 end

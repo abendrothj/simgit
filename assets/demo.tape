@@ -59,7 +59,7 @@ Sleep 400ms
 Type "git merge --quiet agent/auth agent/api -m 'merge agent work'"
 Enter
 Sleep 1s
-Type "sg worktree gc --ephemeral --older-than 0s --delete-branches"
+Type "sg gc --older-than 0s --delete-branches"
 Enter
 Sleep 2200ms
 Sleep 700ms

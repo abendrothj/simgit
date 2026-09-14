@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Scaling benchmark: does simgit's "avoid N copies of the working tree" claim hold?
 # Compares real host disk and time-to-ready for N `git worktree` checkouts vs
-# N native CoW-backed `sg worktree` checkouts. See docs/scaling_benchmark.md.
+# N native CoW-backed `sg add` checkouts. See docs/scaling_benchmark.md.
 #
 #   NFILES=400 FSIZE_KB=128 NS="1 2 4 8 16" bash tests/bench_scaling.sh
 #
@@ -73,7 +73,7 @@ for N in $NS; do
   settle_disk
   sg_before=$(used_kb "$WORK")
   t0=$(now_ns)
-  ( cd "$SGREPO"; for j in $(seq 1 "$N"); do "$SG" worktree add "feat/s$j" >/dev/null 2>&1; done )
+  ( cd "$SGREPO"; for j in $(seq 1 "$N"); do "$SG" add "feat/s$j" >/dev/null 2>&1; done )
   t1=$(now_ns)
   settle_disk
   sg_after=$(used_kb "$WORK")

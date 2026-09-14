@@ -1,6 +1,6 @@
-# Scaling benchmark — native CoW `sg worktree` vs `git worktree`
+# Scaling benchmark — native CoW simgit worktrees vs `git worktree`
 
-`sg worktree` is now a thin wrapper around real Git linked worktrees. It uses
+`sg add` is now a thin wrapper around real Git linked worktrees. It uses
 the same local filesystem and Git code paths as `git worktree`, but populates
 each checkout from one immutable baseline using APFS clones or Linux reflinks.
 There is no daemon, mount, synthetic `.git`, delta capture, or second commit.
@@ -54,7 +54,7 @@ Two dedicated APFS runs, **300 MiB tree and 8 worktrees**:
 | Path | `du`-accounted | Physical allocation delta | Setup |
 |---|---:|---:|---:|
 | Git worktrees | 2404.7 MiB | 2405.9–2583.4 MiB | 6.32–6.66 s |
-| native CoW `sg worktree` | 2705.3 MiB | 301.2 MiB | 14.10–14.15 s |
+| native CoW simgit worktrees | 2705.3 MiB | 301.2 MiB | 14.10–14.15 s |
 
 `du` remains intentionally shown because it catches accidental extra trees,
 but the physical allocation delta is the result that tests extent sharing.
@@ -76,7 +76,7 @@ tracked content** — with 8 worktrees on APFS, two runs each, September 8, 2026
 | Path | Physical allocation delta | Per worktree | Cold setup |
 |---|---:|---:|---:|
 | Git worktrees | 4534–4536 MiB | 567 MiB | 14.0–14.2 s |
-| `sg worktree` | 640–650 MiB | 9.8–10.8 MiB after the baseline | 6.4–7.0 s |
+| simgit worktrees | 640–650 MiB | 9.8–10.8 MiB after the baseline | 6.4–7.0 s |
 
 The `sg` figure is one materialized baseline (553 MiB) plus ~10 MiB of
 per-worktree metadata, so total disk is `tree + N × 10 MiB` against
@@ -122,7 +122,7 @@ identical to the index `git update-index --really-refresh` writes** — pinned
 by `adopted_stat_data_equals_gits_own_refresh` — and Git's strict staleness
 checks are left untouched. Per worktree on vscode, warm baseline:
 
-| Path | `sg worktree add` | First `git status` |
+| Path | `sg add` | First `git status` |
 |---|---:|---:|
 | per-file clone + `read-tree` | 5.87 s | 0.10 s |
 | whole-tree clone + adopted index | 0.56 s | 0.11 s |
@@ -130,7 +130,7 @@ checks are left untouched. Per worktree on vscode, warm baseline:
 ### What a worktree actually costs
 
 The marginal worktree is filesystem and Git-index metadata. Measured end to
-end (`sg worktree add`, warm baseline, `df` deltas over four worktrees, twice
+end (`sg add`, warm baseline, `df` deltas over four worktrees, twice
 for the real repositories):
 
 | Repository | Entries | Avg path | Per worktree | B/entry | Index B/entry | % of tree |
@@ -180,7 +180,7 @@ technique pays least.
 > An earlier revision of this section reported ~0.30 KiB per path from
 > `clonefile`-only measurements, which omitted the per-worktree Git index copy
 > — 20–26% of the real cost — and did not test path length. The figures above
-> measure `sg worktree add` end to end.
+> measure `sg add` end to end.
 
 Baselines published before stat adoption carry no index and fall back to the
 per-file path, as does Linux, which has no directory-level reflink.
@@ -262,7 +262,7 @@ of the sharing.
 | Approach | Agent I/O | Physical disk | Git/tool integration | Operational complexity | Best fit |
 |---|---|---|---|---|---|
 | Plain Git worktrees | Native; no first-write split | `N × tree` | Exact | Lowest | Few worktrees or small repos |
-| **Native CoW linked worktrees (`sg worktree`)** | Native reads; first write splits extents | `1 × baseline + changed extents` | Exact; real `.git/worktrees` entries | Low | Default for many local agents |
+| **Native CoW linked worktrees (`sg add`)** | Native reads; first write splits extents | `1 × baseline + changed extents` | Exact; real `.git/worktrees` entries | Low | Default for many local agents |
 | Daemon native-CoW sessions | Native reads; capture/commit overhead | Baseline + changed extents + captured deltas | Synthetic Git proxy | Medium | Path leases, RPC lifecycle, telemetry |
 | Linux overlayfs | Lookup/overlay tax; whole-file copy-up | One lower + changed upper files | Good but mount-sensitive | Medium/high; privileges and whiteouts | Controlled Linux hosts |
 | FUSE/NFS/WinFSP VFS | Every operation crosses userspace/RPC | Git objects + deltas | Requires proxy behavior | Highest | Synchronous write-time rejection |
@@ -277,7 +277,7 @@ platform and latency costs.
 
 ## Platform behavior
 
-| OS/filesystem | `sg worktree` population | Result |
+| OS/filesystem | `sg add` population | Result |
 |---|---|---|
 | macOS on APFS | `cp -c` clonefile | CoW disk sharing |
 | Linux on reflink-capable Btrfs/XFS | `cp --reflink=always` | CoW disk sharing |
@@ -285,9 +285,9 @@ platform and latency costs.
 | Linux without reflinks or `fuse-overlayfs` | capability probes fail | normal Git checkout fallback |
 | Windows | intentionally unsupported (ordinary NTFS lacks the required general reflink primitive) | use Git worktrees or WSL |
 
-Use `sg worktree add --require-cow ...` in automation when falling back to N
+Use `sg add --require-cow ...` in automation when falling back to N
 full checkouts would violate a disk budget. Baselines unused for seven days are
-removed by `sg worktree prune`; active overlay lowerdirs remain protected even
+removed by `sg prune`; active overlay lowerdirs remain protected even
 with `--all`.
 
 ## Historical benchmark note
@@ -296,7 +296,8 @@ Measurements recorded before July 2, 2026 exercised the daemon session/VFS or
 daemon-managed CoW architecture. Those results remain useful for comparing
 filesystem approaches, but they are not evidence for the current native
 linked-worktree control plane. In particular, old 15–46% read/metadata
-overheads and duplicate commit-capture costs do not apply to `sg worktree` now.
+overheads and duplicate commit-capture costs do not apply to simgit's native
+linked worktrees now.
 
 ## Reproduce
 
@@ -304,7 +305,7 @@ overheads and duplicate commit-capture costs do not apply to `sg worktree` now.
 cargo build -p simgit-cli
 bash tests/bench_scaling.sh
 
-# For the I/O comparison, create equivalent untouched Git and sg worktrees:
+# For the I/O comparison, create equivalent untouched git and simgit worktrees:
 python3 tests/bench_worktree_io.py /path/to/git-wt /path/to/sg-wt
 ```
 

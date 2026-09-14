@@ -1,4 +1,4 @@
-use super::{run_command, state_dir, RepoContext};
+use super::{main_worktree, run_command, state_dir, RepoContext};
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::fs;
@@ -113,7 +113,7 @@ pub(super) fn ensure_baseline(repo: &RepoContext, commit: &str) -> Result<PathBu
     fs::create_dir_all(&root)?;
     if final_dir.exists() {
         bail!(
-            "cached baseline {} is incomplete; run `sg worktree prune --all`",
+            "cached baseline {} is incomplete; run `simgit prune --all`",
             final_dir.display()
         );
     }
@@ -149,6 +149,7 @@ fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) ->
         .join("index");
     let mut read_tree = Command::new("git");
     read_tree
+        .current_dir(main_worktree(&repo.common_git_dir))
         .env("GIT_INDEX_FILE", &index)
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
         .args(["read-tree", commit]);
@@ -160,6 +161,7 @@ fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) ->
     // the tree and shares its lifetime.
     let mut checkout = Command::new("git");
     checkout
+        .current_dir(main_worktree(&repo.common_git_dir))
         .env("GIT_INDEX_FILE", &index)
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
         .arg(format!("--work-tree={}", destination.display()))
@@ -221,6 +223,27 @@ pub(super) fn clone_tree(source: &Path, destination: &Path) -> Result<()> {
         collect_tree(source, destination, &mut files)
             .with_context(|| format!("replicate baseline tree {}", source.display()))?;
         clone_files(&files)
+    }
+}
+
+/// Clone one non-directory baseline entry. Symlinks are recreated rather than
+/// cloned, matching `clone_tree`'s handling; regular files share extents.
+pub(super) fn clone_path(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (source, destination);
+        bail!("CoW cloning is not supported on this platform");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        if fs::symlink_metadata(source)?.file_type().is_symlink() {
+            let link = fs::read_link(source)?;
+            std::os::unix::fs::symlink(link, destination)?;
+            return Ok(());
+        }
+        clone_file(source, destination)
+            .with_context(|| format!("clone {} -> {}", source.display(), destination.display()))
     }
 }
 
@@ -307,6 +330,43 @@ pub(super) struct PruneOutcome {
     pub removed: Vec<String>,
     pub retained: Vec<String>,
     pub retained_bytes: u64,
+}
+
+/// A read-only snapshot of the immutable checkout cache.
+pub(super) struct BaselineInventory {
+    pub root: PathBuf,
+    pub retained: Vec<String>,
+    pub retained_bytes: u64,
+}
+
+/// Inventory cached baselines without touching their access times or pruning
+/// incomplete/old entries.
+pub(super) fn baseline_inventory(common_git_dir: &Path) -> Result<BaselineInventory> {
+    let root = state_dir(common_git_dir).join("baselines");
+    let mut retained = Vec::new();
+    let mut retained_bytes = 0;
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BaselineInventory {
+                root,
+                retained,
+                retained_bytes,
+            });
+        }
+        Err(error) => return Err(error).context("read baseline cache"),
+    };
+    for entry in entries {
+        let entry = entry?;
+        retained_bytes += tree_size(&entry.path());
+        retained.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    retained.sort();
+    Ok(BaselineInventory {
+        root,
+        retained,
+        retained_bytes,
+    })
 }
 
 pub(super) fn prune_baselines(

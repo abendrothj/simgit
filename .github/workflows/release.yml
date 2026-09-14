@@ -1,10 +1,9 @@
 name: Release
 
-# On every version tag, build `sg` for the common targets and attach them to
-# the GitHub release as sg-<target>.tar.gz (containing sg-<target>/sg). This
-# naming matches the [package.metadata.binstall] config in sg/Cargo.toml, so
-# `cargo binstall simgit-cli` fetches these prebuilt binaries instead of
-# compiling.
+# On every version tag, build `simgit` for the common targets and publish
+# sg-<target>.tar.gz archives containing both the canonical `simgit` executable
+# and its `sg` alias. The archive layout matches sg/Cargo.toml's cargo-binstall
+# metadata.
 
 on:
   push:
@@ -60,15 +59,50 @@ jobs:
         run: |
           dir="sg-${{ matrix.target }}"
           mkdir "$dir"
-          cp "target/${{ matrix.target }}/release/sg" "$dir/"
+          cp "target/${{ matrix.target }}/release/simgit" "$dir/simgit"
+          cp "target/${{ matrix.target }}/release/simgit" "$dir/sg"
           cp README.md LICENSE "$dir/"
           tar czf "$dir.tar.gz" "$dir"
-      - name: Attach to release
+      - name: Upload packaged target
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-${{ matrix.target }}
+          path: sg-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged targets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksum manifest
+        working-directory: dist
+        run: |
+          sha256sum \
+            sg-aarch64-apple-darwin.tar.gz \
+            sg-x86_64-apple-darwin.tar.gz \
+            sg-aarch64-unknown-linux-gnu.tar.gz \
+            sg-x86_64-unknown-linux-gnu.tar.gz \
+            > SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
+      - name: Attach archives and checksum manifest to release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="$GITHUB_REF_NAME"
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --verify-tag --title "$tag" --generate-notes || sleep 3
+            gh release create "$tag" --verify-tag --title "$tag" --generate-notes
           fi
-          gh release upload "$tag" "sg-${{ matrix.target }}.tar.gz" --clobber
+          gh release upload "$tag" \
+            dist/sg-aarch64-apple-darwin.tar.gz \
+            dist/sg-x86_64-apple-darwin.tar.gz \
+            dist/sg-aarch64-unknown-linux-gnu.tar.gz \
+            dist/sg-x86_64-unknown-linux-gnu.tar.gz \
+            dist/SHA256SUMS \
+            --clobber

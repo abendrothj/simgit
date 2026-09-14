@@ -1,23 +1,26 @@
 //! Command launch and workspace selection, independent of the chosen agent.
 
 use super::{
-    create_worktree, discover_repo, git_failure, git_output_common, list_worktrees, mark_ephemeral,
-    overlay, remove_file_if_present, worktree_admin_dir, worktree_description,
-    worktree_path_for_branch, RepoContext, WorktreeAdd, WorktreeEntry, WorktreeLock,
+    create_worktree, discover_repo, ensure_unlocked, git_failure, git_output_common,
+    list_worktrees, mark_ephemeral, overlay, remove_file_if_present, worktree_admin_dir,
+    worktree_description, worktree_path_for_branch, RepoContext, WorktreeAdd, WorktreeEntry,
+    WorktreeLock,
 };
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 #[derive(Args)]
 pub struct WorktreeRun {
     /// Branch to create or reuse. Omit to choose an existing workspace.
     pub branch: Option<String>,
 
-    /// Worktree path. Defaults to `../.simgit/<repo>/<branch>`.
+    /// Worktree path. Defaults to a slug of the branch under
+    /// `../.simgit/<repo>/`.
     #[arg(long)]
     pub path: Option<PathBuf>,
 
@@ -47,7 +50,7 @@ pub struct WorktreeRun {
     pub command: Vec<OsString>,
 }
 
-pub(super) fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
+pub fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
     if json {
         bail!("--json is not supported with `run` because command output is streamed");
     }
@@ -79,10 +82,21 @@ pub(super) fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
             bail!("--base, --require-cow and --sparse apply only when creating a worktree");
         }
         if let Some(path) = &args.path {
-            if path.canonicalize()? != target.canonicalize()? {
+            // The given path is often the mistake being reported, so it may
+            // not exist at all: compare resolved forms where possible and fall
+            // back to the literal ones rather than failing with a bare errno.
+            let given = path.canonicalize().unwrap_or_else(|_| path.clone());
+            let registered = target.canonicalize().unwrap_or_else(|_| target.clone());
+            if given != registered {
+                let owner = match branch.as_deref() {
+                    Some(name) => format!("branch '{name}'"),
+                    None => "that workspace".to_owned(),
+                };
                 bail!(
-                    "branch '{}' already has a worktree at {}",
-                    branch.as_deref().unwrap_or("(detached)"),
+                    "--path {} does not match the workspace registered for {owner}: {}\n\
+                     pass --path {} instead, or omit --path to reuse it",
+                    path.display(),
+                    target.display(),
                     target.display()
                 );
             }
@@ -101,14 +115,13 @@ pub(super) fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         };
         let created = create_worktree(
             &WorktreeAdd {
-                branch: branch.clone(),
+                branch: Some(branch.clone()),
+                detach: false,
                 path: args.path,
-                path_flag: None,
                 sparse: args.sparse,
                 base: args.base,
                 require_cow: args.require_cow,
                 ephemeral: args.ephemeral,
-                json: false,
             },
             attach,
         )?;
@@ -116,8 +129,8 @@ pub(super) fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         created.target
     };
     // Git's lock also protects against native `git worktree remove/prune`.
-    // A killed launcher leaves the lock in place; unlock manually after checking
-    // the child has stopped. This conservatively avoids PID-reuse heuristics.
+    // A killed launcher leaves the lock in place; `simgit unlock` clears it,
+    // and refuses while the recorded launcher process is still alive.
     let lock = WorktreeLock::acquire(&repo, &target)?;
     overlay::repair(&repo, &target)?;
     let actual = discover_repo(&target)?;
@@ -160,12 +173,28 @@ pub(super) fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
     };
     lock.release()?;
     if !status.success() {
-        bail!(
+        // Collapsing every failure to 1 defeats `simgit run … && git merge …`
+        // and hides 127 (command not found). The lock is released and nothing
+        // else is outstanding, so this process can adopt the child's status;
+        // the retained-workspace notice stays on stderr.
+        eprintln!(
             "command exited with {status}; worktree retained at {}",
             target.display()
         );
+        io::stdout().flush()?;
+        io::stderr().flush()?;
+        std::process::exit(child_exit_code(&status));
     }
     Ok(())
+}
+
+/// The status a shell reports for a finished child: its own exit code, or
+/// `128 + signal` when a signal killed it.
+fn child_exit_code(status: &ExitStatus) -> i32 {
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
 }
 
 fn pick_worktree(repo: &RepoContext) -> Result<WorktreeEntry> {
@@ -194,6 +223,14 @@ fn pick_worktree(repo: &RepoContext) -> Result<WorktreeEntry> {
         }
         if let Ok(number) = answer.trim().parse::<usize>() {
             if (1..=entries.len()).contains(&number) {
+                // A workspace that is in use cannot be launched into, but an
+                // unavailable choice is no reason to abandon the prompt: say
+                // why and re-ask, exactly as an out-of-range number does.
+                if let Err(reason) = ensure_unlocked(repo, &entries[number - 1].path) {
+                    eprintln!("{reason}");
+                    eprintln!("Choose another workspace.");
+                    continue;
+                }
                 return Ok(entries.remove(number - 1));
             }
         }

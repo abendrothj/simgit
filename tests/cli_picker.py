@@ -96,11 +96,6 @@ def main():
         assert not (root / "beta/chosen").exists()
         assert not (repo / "chosen").exists()
 
-        # The same picker is available through the original command spelling.
-        status, output = interact(repo, ["worktree", *args], ["3"])
-        assert status == 0, output
-        assert (root / "beta/chosen").read_text() == "--resume"
-
         status, output = interact(repo, args, ["4"])
         assert status == 0 and "(detached)" in output, output
         assert (root / "detached/chosen").read_text() == "--resume"

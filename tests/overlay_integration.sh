@@ -46,7 +46,7 @@ git commit -qm init
 export SIMGIT_POPULATE=overlay
 
 echo "== add (overlay) =="
-out="$("$SG" worktree add agent-1 --ephemeral --json)"
+out="$("$SG" --json add agent-1 --ephemeral)"
 echo "$out"
 echo "$out" | grep -q '"mode": "overlay"' || fail "expected overlay mode"
 wt="$(echo "$out" | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
@@ -68,56 +68,56 @@ echo "== baseline (main worktree) is untouched =="
 grep -qx root root.txt || fail "baseline root.txt was mutated through the overlay"
 
 echo "== repair remounts an interrupted overlay without losing its upperdir =="
-repair="$("$SG" worktree add repair-me --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
+repair="$("$SG" --json add repair-me --ephemeral | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
 echo preserved >"$repair/preserved.txt"
 sync "$repair/preserved.txt"
 unmount_and_wait "$repair"
-repair_out="$("$SG" worktree repair)"
+repair_out="$("$SG" repair)"
 echo "$repair_out"
 grep -qx preserved "$repair/preserved.txt" || fail "repair lost upperdir data"
 git -C "$repair" status --porcelain >/dev/null || fail "repaired overlay is not a usable Git worktree"
-"$SG" worktree remove repair-me --force --delete-branch
+"$SG" remove repair-me --discard-dirty --delete-branch
 
 echo "== run reuses and repairs an existing overlay =="
-resume="$("$SG" worktree add resume-me --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
+resume="$("$SG" --json add resume-me | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
 echo ongoing >"$resume/chat.txt"
 sync "$resume/chat.txt"
 unmount_and_wait "$resume"
-"$SG" worktree run resume-me -- sh -c 'grep -qx ongoing chat.txt'
-"$SG" worktree remove resume-me --force --delete-branch
+"$SG" run resume-me -- sh -c 'grep -qx ongoing chat.txt'
+"$SG" remove resume-me --discard-dirty --delete-branch
 
 echo "== failed unmount preserves files and reports failure =="
-blocked="$("$SG" worktree add blocked-me --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
+blocked="$("$SG" --json add blocked-me | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
 echo keep-me >"$blocked/keep.txt"
 mkdir fail-unmount
 for tool in fusermount3 fusermount umount; do
     printf '#!/bin/sh\nexit 1\n' >"fail-unmount/$tool"
     chmod +x "fail-unmount/$tool"
 done
-if PATH="$PWD/fail-unmount:$PATH" "$SG" worktree remove blocked-me --force; then
+if PATH="$PWD/fail-unmount:$PATH" "$SG" remove blocked-me --discard-dirty; then
     fail "remove succeeded despite failed unmount"
 fi
 mount_present "$blocked" || fail "failed teardown detached the mount unexpectedly"
 grep -qx keep-me "$blocked/keep.txt" || fail "failed teardown deleted work"
-"$SG" worktree remove blocked-me --force --delete-branch
+"$SG" remove blocked-me --discard-dirty --delete-branch
 
 echo "== stale unmounted overlays can be removed without remounting =="
-stale="$("$SG" worktree add stale-me --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
+stale="$("$SG" --json add stale-me --ephemeral | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
 unmount_and_wait "$stale"
-"$SG" worktree remove stale-me --force --delete-branch
+"$SG" remove stale-me --discard-dirty --delete-branch
 if test -d "$stale"; then fail "stale overlay directory survived remove"; fi
 if git show-ref --verify --quiet refs/heads/stale-me; then fail "stale branch survived remove"; fi
 
 echo "== remove unmounts and deregisters =="
-"$SG" worktree remove agent-1 --force --delete-branch
+"$SG" remove agent-1 --delete-branch --delete-unmerged
 if test -d "$wt"; then fail "worktree dir still present after remove"; fi
 if mount | grep -q "$wt"; then fail "overlay still mounted after remove"; fi
-if "$SG" worktree list --json | grep -q agent-1; then fail "agent-1 still registered"; fi
+if "$SG" --json list | grep -q agent-1; then fail "agent-1 still registered"; fi
 
 echo "== gc reaps ephemeral overlay worktrees and unmounts them =="
-a="$("$SG" worktree add gc-a --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
-b="$("$SG" worktree add gc-b --ephemeral --json | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
-"$SG" worktree gc --ephemeral --older-than 0s --delete-branches --force
+a="$("$SG" --json add gc-a --ephemeral | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
+b="$("$SG" --json add gc-b --ephemeral | sed -n 's/.*"worktree": "\(.*\)".*/\1/p')"
+"$SG" gc --older-than 0s --delete-branches --discard-dirty
 for d in "$a" "$b"; do
     if test -d "$d"; then fail "gc left $d on disk"; fi
     if mount | grep -q "$d"; then fail "gc left $d mounted"; fi

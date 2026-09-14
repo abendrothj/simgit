@@ -1,6 +1,6 @@
 [package]
 name        = "simgit-cli"
-description = "sg — disk-efficient copy-on-write Git worktrees for running many agents at once"
+description = "simgit — disk-efficient copy-on-write Git worktrees for running many agents at once"
 version.workspace     = true
 edition.workspace     = true
 license.workspace     = true
@@ -10,9 +10,17 @@ readme      = "../README.md"
 keywords    = ["git", "worktree", "copy-on-write", "agents", "cli"]
 categories  = ["command-line-utilities", "development-tools"]
 
+[lib]
+name = "simgit_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "simgit"
+path = "src/bin/simgit.rs"
+
 [[bin]]
 name = "sg"
-path = "src/main.rs"
+path = "src/bin/sg.rs"
 
 [dependencies]
 clap.workspace        = true
@@ -21,8 +29,8 @@ anyhow.workspace      = true
 uuid.workspace        = true
 sha1.workspace        = true
 
-# cargo-binstall: fetch a prebuilt `sg` from GitHub Releases instead of
-# compiling. Expects release assets named sg-<target>.tar.gz once published.
+# cargo-binstall: fetch the prebuilt `simgit` and `sg` binaries from GitHub
+# Releases. Archives are named sg-<target>.tar.gz and contain both binaries.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/sg-{ target }{ archive-suffix }"
 bin-dir = "sg-{ target }/{ bin }{ binary-ext }"
