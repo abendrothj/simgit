@@ -75,6 +75,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # `gh release create --verify-tag` resolves the tag through git, so the
+      # publishing job needs the repository, not just the built artifacts.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          fetch-depth: 0
       - name: Download packaged targets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
