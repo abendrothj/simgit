@@ -79,10 +79,20 @@ Linux and in CI; do not treat them as gates on macOS.
 
 ### Documentation is part of the change
 
-Any user-facing behavior change must update `README.md`,
-`skills/simgit-worktrees/SKILL.md`, and `docs/agent-integration.md` in the same
-change. These three describe the same surface to humans, skill-driven agents,
-and harness integrators; letting them drift is a defect.
+Each documentation file owns a different audience, and a behavior change must
+update the ones that state the changed fact, in the same change:
+
+- `docs/reference.md` — the detailed semantics of every command. Any change to
+  flags, output, defaults, or error conditions lands here.
+- `README.md` — the overview, the command table, and the disk numbers. Update
+  it when the command surface or the value proposition changes, not for
+  detail that `docs/reference.md` owns.
+- `docs/agent-integration.md` — the allocator/provider contract for harness
+  integrators, including the JSON field tables they depend on.
+- `skills/simgit-worktrees/SKILL.md` — the model-facing version of that policy.
+
+Restating one fact in several of these is how they drift. Prefer a link to a
+second copy.
 
 ## simgit worktrees for autonomous agents
 

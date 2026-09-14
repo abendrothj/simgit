@@ -94,8 +94,10 @@ section and Git history.)
    (run `cargo build --locked` first if testing the picker on its own)
 4. Linux only: `tests/reflink_integration.sh` and `tests/overlay_integration.sh`
 5. Keep commits focused — one concept per commit
-6. User-facing changes must be reflected in `README.md`,
-   `skills/simgit-worktrees/SKILL.md`, and `docs/agent-integration.md`
+6. User-facing changes must be reflected in the docs that state the changed
+   fact: `docs/reference.md` for command semantics, `README.md` for the
+   surface and value proposition, and `docs/agent-integration.md` plus
+   `skills/simgit-worktrees/SKILL.md` for the agent-facing contract
 
 ## Code style
 
