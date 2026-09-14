@@ -1,42 +1,42 @@
 # Homebrew formula for the canonical `simgit` CLI and its short `sg` alias.
 #
-# Installs the prebuilt binary attached to the GitHub release, so no Rust
+# Installs the prebuilt binaries attached to the GitHub release, so no Rust
 # toolchain is pulled in. Update `version` and the four `sha256` values for
-# each tagged release:
+# each tagged release; the digests are published as the release's SHA256SUMS.
 #
 #   brew install abendrothj/tap/simgit
 class Simgit < Formula
   desc "Cheap, isolated copy-on-write Git worktrees for running many agents at once"
   homepage "https://github.com/abendrothj/simgit"
-  version "0.2.0"
+  version "0.3.0"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/abendrothj/simgit/releases/download/v0.2.0/sg-aarch64-apple-darwin.tar.gz"
-      sha256 "0d0652233beb9773ab2b9b91c95d4ddf90ccd40cb7edcdb0481276bdd5635327"
+      url "https://github.com/abendrothj/simgit/releases/download/v0.3.0/sg-aarch64-apple-darwin.tar.gz"
+      sha256 "8bb0ae7c10166fd16950eb701f3b11974ad68d879776ace7755f55c3118b0dec"
     end
     on_intel do
-      url "https://github.com/abendrothj/simgit/releases/download/v0.2.0/sg-x86_64-apple-darwin.tar.gz"
-      sha256 "5d4d7c44424f73775060dc743eb5ee8796b98e474080e53954c7609d9615885f"
+      url "https://github.com/abendrothj/simgit/releases/download/v0.3.0/sg-x86_64-apple-darwin.tar.gz"
+      sha256 "e3724aa327fe490417e53cf4111ef77bd4638d9c46ac8d5d1eb801303b1ef961"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/abendrothj/simgit/releases/download/v0.2.0/sg-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "34b7f3a7c4e640af6b1582743b1ffc90164b503122143d2ea4d3897886c02459"
+      url "https://github.com/abendrothj/simgit/releases/download/v0.3.0/sg-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "1300ec0fac43ee9da0ab055549a2e67433f882c74475bf4a10a57290ab3f5421"
     end
     on_intel do
-      url "https://github.com/abendrothj/simgit/releases/download/v0.2.0/sg-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "e17089ffb9885db76a75857735951cc322ec805388185cbb04dbb24bf1f7333e"
+      url "https://github.com/abendrothj/simgit/releases/download/v0.3.0/sg-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "bb086c0c6731cd3635b5101de1920b907db7b8d47f73a2908ca50cbf574b7582"
     end
   end
 
   def install
-    # v0.2.0 archives predate the dual-name layout, so promote their `sg`
-    # executable to the canonical name and retain `sg` as the short alias.
-    bin.install "sg" => "simgit"
+    # Release archives ship both names; `sg` is a copy of the same binary, so
+    # install the canonical one and link the alias to it.
+    bin.install "simgit"
     bin.install_symlink bin/"simgit" => "sg"
   end
 
