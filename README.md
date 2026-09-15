@@ -182,9 +182,13 @@ Everything here is deliberate, and none of it is guessable:
   there is no override flag.
 - **Cleanup is idempotent.** `remove` on an absent target exits 0 with
   `already_absent: true`, and `unlock` on an unlocked or absent target exits 0
-  with `was_locked: false`, so retried cleanup is safe. The one error case is
-  `remove <absent-path> --delete-branch`: a path that is gone cannot name the
-  branch it once held.
+  with `was_locked: false`, so retried cleanup is safe. Two cases still error:
+  `remove <absent-path> --delete-branch`, because a path that is gone cannot
+  name the branch it once held, and a path holding files that Git does not
+  register as a worktree, which simgit refuses to delete.
+- **A failed `--commit` removal keeps its commit and says so.** The commit is
+  made before the worktree is removed and is never rolled back; retrying the
+  same command commits nothing twice.
 - **Directory names are slugs, not branch names.** `feat/my-feature` becomes
   `../.simgit/<repo>/feat-my-feature-c75e230f`. Script against the `path` that
   `add --json` returns, never against a formula.

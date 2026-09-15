@@ -13,14 +13,29 @@ containing the current directory. Plain `remove` refuses a dirty worktree; use
 `--discard-dirty` only with the owner's explicit authority to discard it.
 Deleting a branch that is not merged additionally requires `--delete-unmerged`
 next to `--delete-branch`. `--commit` with an optional `-m <message>` commits
-leftover changes first, instead of discarding them.
+leftover changes first, instead of discarding them; `commit` in the `--json`
+output carries that commit's full hash, and `committed` stays `false` when
+there was nothing to commit.
+
+`--commit` commits before removing the worktree, and the commit is never
+rolled back if the removal then fails: it is the work you asked to keep. Such a
+failure names the commit it kept, so a caller can tell it from one that
+committed nothing. Repeating the same command is safe either way — `--commit`
+stages and commits only what the worktree still holds, so a retry after a
+successful commit commits nothing a second time.
 
 Removing a target that no longer has a worktree succeeds and reports
-`already_absent: true`, so a retried or at-least-once cleanup is safe. With
-`--delete-branch` that idempotence holds only for the branch-name form, which
-still deletes a leftover branch of that name: an already-removed *path* cannot
-name a branch, so `remove <absent-path> --delete-branch` is an error telling you
-to pass the branch name instead.
+`already_absent: true`, so a retried or at-least-once cleanup is safe. That
+includes the residue of an interrupted teardown: Git can delete a worktree's
+contents and its registration and still fail to unlink the directory itself, and
+the empty directory left behind is reported as already absent (and deleted when
+the filesystem now permits it) rather than mistaken for a live worktree. A
+directory at that path that still holds files is refused instead — simgit does
+not delete directories it does not manage. With `--delete-branch` the
+idempotence holds only for the branch-name form, which still deletes a leftover
+branch of that name: a path with no worktree cannot name a branch, so
+`remove <absent-path> --delete-branch` is an error telling you to pass the
+branch name instead.
 
 `unlock` is idempotent in the same way and one step further: a target that is
 not locked, and a target that no longer exists at all, both exit 0 and report
@@ -158,7 +173,7 @@ one exists.
 | `doctor` | `identity`, `product`, `version`, `filesystem`, `cow_supported`, `populate_mode`, `repository`, `repository_details`, `git_worktree_supported`, `default_worktree_root`, `default_worktree_root_inside_repository`, `baseline_cache`, `stale_worktree_registrations` |
 | `add` | `worktree`, `path`, `cleanup_token`, `branch`, `base`, `mode`, `ephemeral` |
 | `list` | array of `worktree`, `branch`, `HEAD`, `ephemeral`, `mode`, and `locked` while a command runs |
-| `remove` | `removed`, `already_absent`, `branch_deleted`, `committed` |
+| `remove` | `removed`, `already_absent`, `branch_deleted`, `committed`, `commit` |
 | `unlock` | `unlocked`, `was_locked`, `owner_pid` |
 | `gc` | `reaped`, `skipped`, `deleted_branches`, `retained_branches`, `dry_run` |
 | `prune` | `pruned`, `pruned_registrations`, `retained`, `retained_bytes` |

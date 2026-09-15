@@ -903,3 +903,66 @@ fn a_lock_names_its_owner_and_an_exited_owner_is_not_alive() -> Result<()> {
     assert_eq!(lock_owner_pid("simgit: workspace in use\n"), None);
     Ok(())
 }
+
+/// Git can delete a worktree's contents and its registration and still fail to
+/// unlink the directory itself — a read-only parent is enough. The empty shell
+/// that survives is not a worktree, and resolving it as one is what strands a
+/// retried cleanup on `fatal: not a git repository`.
+#[test]
+fn an_unregistered_leftover_directory_does_not_resolve_as_a_worktree() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+    let target = fixture.root.join("leftover");
+    add_git_worktree(
+        &repo,
+        "leftover",
+        &target,
+        &base,
+        WorktreeKind::NewBranch,
+        &[],
+    )?;
+    let spec = target.display().to_string();
+
+    match lookup_worktree_target(&repo, Some(&spec))? {
+        TargetLookup::Found(path) => assert_eq!(path, canonical_path(&target)),
+        _ => panic!("a registered worktree must resolve as found"),
+    }
+
+    teardown_worktree(&repo, &target, false)?;
+    fs::create_dir_all(&target)?;
+
+    match lookup_worktree_target(&repo, Some(&spec))? {
+        TargetLookup::Stray(path) => assert_eq!(path, canonical_path(&target)),
+        _ => panic!("an unregistered directory must not resolve as a live worktree"),
+    }
+    Ok(())
+}
+
+/// Finishing an interrupted teardown is only safe because the residue is
+/// empty. A directory with files in it is somebody's data, whatever its name.
+#[test]
+fn stray_removal_clears_an_empty_shell_and_refuses_one_holding_files() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let args = WorktreeRemove {
+        target: None,
+        commit: false,
+        message: "simgit remove".to_owned(),
+        discard_dirty: false,
+        delete_branch: false,
+        delete_unmerged: false,
+    };
+
+    let occupied = fixture.root.join("occupied");
+    fs::create_dir_all(&occupied)?;
+    fs::write(occupied.join("work.txt"), "unexplained")?;
+    let refused = remove_stray(&occupied, &args, false).expect_err("files must not be deleted");
+    assert!(refused.to_string().contains("not empty"));
+    assert!(occupied.join("work.txt").is_file());
+
+    let empty = fixture.root.join("empty");
+    fs::create_dir_all(&empty)?;
+    remove_stray(&empty, &args, false)?;
+    assert!(!empty.exists());
+    Ok(())
+}

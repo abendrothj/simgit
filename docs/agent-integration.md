@@ -360,11 +360,12 @@ never that authority.
 Safe cleanup is idempotent. When the target no longer resolves to a worktree —
 an earlier attempt already removed it, or the workspace is gone for some other
 reason — `remove` exits successfully and reports `"already_absent": true`
-beside `"removed"`, `"committed"`, and `"branch_deleted"`; when the worktree
-was present the same output carries `"already_absent": false`. `removed` is a
-string, `committed` and `branch_deleted` are booleans. `removed` is never
-evidence that anything was removed: it is present for a path that was never
-allocated just as it is for a real removal. Its two shapes differ, though. When
+beside `"removed"`, `"committed"`, `"commit"`, and `"branch_deleted"`; when the
+worktree was present the same output carries `"already_absent": false`.
+`removed` is a string, `committed` and `branch_deleted` are booleans, and
+`commit` is the full hash a `--commit` removal created or `null`. `removed` is
+never evidence that anything was removed: it is present for a path that was
+never allocated just as it is for a real removal. Its two shapes differ. When
 the target resolved to a worktree, `removed` is that worktree's canonical
 symlink-resolved path, even if the provider named it by branch or by a relative
 path — so it is safe to compare against a recorded `cleanup_token`. When
@@ -381,6 +382,17 @@ resolves cannot say which branch it once held. A provider that deletes branches
 should do it while the worktree still exists, passing `cleanup_token`, or
 afterwards pass the `branch` value from its own allocation record. A target
 that exists but cannot be removed safely still fails.
+
+A removal that fails partway is reported as a failure, not as a partial
+success: `--json` failures emit no JSON, so a provider reads the exit status
+and the stderr line. Two of those failures are worth handling explicitly.
+`remove --commit` commits before it removes, and simgit never rolls that commit
+back, so a failure after committing names the commit it kept — a provider that
+surfaces the stderr line verbatim passes that fact on, and a retry of the same
+command commits nothing a second time, because `--commit` commits only what the
+worktree still holds. A failure after the worktree is gone but before
+`--delete-branch` finished names the branch instead, because the path form can
+no longer identify it; retry that one by branch name.
 
 The provider should treat cleanup as idempotent at the job level: record a
 successful removal, and do not reinterpret a missing or mismatched path as

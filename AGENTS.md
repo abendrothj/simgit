@@ -73,7 +73,15 @@ Linux and in CI; do not treat them as gates on macOS.
 - `remove` is idempotent: an already-absent target exits 0 with
   `already_absent: true` rather than failing. With `--delete-branch` that holds
   for a branch-name target, while an already-absent path target is an error,
-  because the branch such a path once held is unknowable.
+  because the branch such a path once held is unknowable. A directory Git no
+  longer registers is not a worktree, however much it looks like one: an empty
+  one is already-absent and is cleaned up where the filesystem allows, and a
+  non-empty one is refused rather than deleted.
+- `remove --commit` commits before it removes, and a commit that succeeded is
+  never rolled back when a later step fails. Such a failure names the commit it
+  kept, so a caller can distinguish it from one that committed nothing, and
+  `commit` in `remove --json` carries that hash on success. Retrying is safe
+  because `--commit` commits only what the worktree still holds.
 - A `--json` failure emits no JSON: nonzero exit, empty stdout, one line of
   diagnostic text on stderr.
 

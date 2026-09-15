@@ -1234,6 +1234,7 @@ pub fn unlock(args: WorktreeUnlock, json: bool) -> Result<()> {
             let path = worktree_lock_path(&repo, &target)?;
             (target.display().to_string(), Some(path))
         }
+        TargetLookup::Stray(path) => (path.display().to_string(), None),
         TargetLookup::Absent(spec) => (spec, None),
     };
     let contents = match &lock_path {
@@ -1284,6 +1285,9 @@ pub fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         // agent that crashed mid-cleanup, or handed the same cleanup token
         // back twice, must not have to tell the two cases apart.
         TargetLookup::Absent(spec) => return remove_absent(&repo, &spec, &args, json),
+        // A directory that is no longer registered is not a worktree, however
+        // much it looks like one: finishing that teardown is its own path.
+        TargetLookup::Stray(path) => return remove_stray(&path, &args, json),
     };
     ensure_unlocked(&repo, &target)?;
     let branch = list_worktrees(&repo)?
@@ -1299,7 +1303,11 @@ pub fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
             target.display()
         );
     }
-    let mut committed = false;
+    // A commit that succeeded is never rolled back when a later step fails: it
+    // is the work the caller asked to keep, and an "atomic" remove that
+    // un-commits it would trade a visible seam for destroyed work. The failure
+    // says so instead.
+    let mut commit = None;
     if args.commit {
         run_git_at(&target, ["add", "-A"]).context("stage worktree changes")?;
         let diff = git_output_at(&target, ["diff", "--cached", "--quiet"])?;
@@ -1312,17 +1320,26 @@ pub fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
             Some(1) => {
                 run_git_at(&target, ["commit", "-m", &args.message])
                     .context("commit worktree changes")?;
-                committed = true;
+                commit = Some(git_path_output(&target, ["rev-parse", "HEAD"])?);
             }
             _ => return Err(git_failure("git diff --cached --quiet", &diff)),
         }
     }
 
-    teardown_worktree(&repo, &target, args.discard_dirty)?;
+    teardown_worktree(&repo, &target, args.discard_dirty)
+        .map_err(|error| annotate_commit_kept(error, commit.as_deref(), branch.as_deref()))?;
 
     let mut branch_deleted = false;
-    if let (true, Some(branch)) = (args.delete_branch, branch) {
-        delete_local_branch(&repo, &branch, args.delete_unmerged)?;
+    if let (true, Some(reference)) = (args.delete_branch, branch) {
+        delete_local_branch(&repo, &reference, args.delete_unmerged).map_err(|error| {
+            // The worktree is gone by now, so a retry by path can no longer
+            // name this branch. Hand back the form that still works.
+            let name = short_branch(&reference);
+            error.context(format!(
+                "the worktree is removed, but branch {name} was not deleted; \
+                 retry with `simgit remove {name} --delete-branch`"
+            ))
+        })?;
         branch_deleted = true;
     }
 
@@ -1330,7 +1347,8 @@ pub fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         emit(&json!({
             "removed": target.display().to_string(),
             "already_absent": false,
-            "committed": committed,
+            "committed": commit.is_some(),
+            "commit": commit,
             "branch_deleted": branch_deleted,
         }));
     } else {
@@ -1369,12 +1387,88 @@ fn remove_absent(repo: &RepoContext, spec: &str, args: &WorktreeRemove, json: bo
             "removed": spec,
             "already_absent": true,
             "committed": false,
+            "commit": null,
             "branch_deleted": branch_deleted,
         }));
     } else {
         println!("{spec} (already absent)");
     }
     Ok(())
+}
+
+/// Finish a teardown Git left half-done.
+///
+/// `git worktree remove` can delete a worktree's contents and its registration
+/// and still fail to unlink the directory itself — a read-only parent is
+/// enough. What survives is an empty directory that is no longer a worktree,
+/// and a retried cleanup has to converge on it instead of asking Git about a
+/// checkout Git has already forgotten.
+fn remove_stray(path: &Path, args: &WorktreeRemove, json: bool) -> Result<()> {
+    if args.delete_branch {
+        bail!(
+            "cannot infer a branch from a path that is no longer a worktree; pass the branch name\n\
+             {} is not registered, so nothing records which branch it held",
+            path.display()
+        );
+    }
+    // Emptiness is the whole safety argument for deleting this at all.
+    if !is_empty_dir(path)? {
+        bail!(
+            "{} is not a worktree of this repository, and it is not empty\n\
+             simgit does not delete directories it does not manage; inspect it and remove it yourself",
+            path.display()
+        );
+    }
+    // Best effort: whatever stopped Git from unlinking this directory stops
+    // simgit too, and the worktree the caller asked about is gone either way.
+    let _ = fs::remove_dir(path);
+
+    if json {
+        emit(&json!({
+            "removed": path.display().to_string(),
+            "already_absent": true,
+            "committed": false,
+            "commit": null,
+            "branch_deleted": false,
+        }));
+    } else {
+        println!("{} (already absent)", path.display());
+    }
+    Ok(())
+}
+
+fn is_empty_dir(path: &Path) -> Result<bool> {
+    let mut entries = fs::read_dir(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(entries.next().is_none())
+}
+
+/// Name the commit a partially completed `remove --commit` already created.
+///
+/// A `--json` failure emits no JSON, so this diagnostic is the only place the
+/// fact can be said — and without it "removing the worktree failed" is
+/// indistinguishable from a failure that committed nothing, which is exactly
+/// the ambiguity that makes a script afraid to retry.
+fn annotate_commit_kept(
+    error: anyhow::Error,
+    commit: Option<&str>,
+    branch: Option<&str>,
+) -> anyhow::Error {
+    let Some(commit) = commit else {
+        return error;
+    };
+    let short = commit.get(..12).unwrap_or(commit);
+    let location = match branch {
+        Some(reference) => format!(" on {}", short_branch(reference)),
+        None => String::new(),
+    };
+    error.context(format!(
+        "the worktree was not removed, but its changes are committed as {short}{location}; \
+         that commit is kept, and repeating this remove will not create a second one"
+    ))
+}
+
+fn short_branch(reference: &str) -> &str {
+    reference.strip_prefix("refs/heads/").unwrap_or(reference)
 }
 
 /// Whether a removal target names a filesystem location rather than a branch.
@@ -1391,8 +1485,12 @@ fn spec_is_path(spec: &str) -> bool {
 
 /// What a user-supplied worktree reference resolved to.
 enum TargetLookup {
-    /// An existing path, or the worktree checked out on a branch.
+    /// A live worktree: an existing registered path, or the worktree checked
+    /// out on a branch.
     Found(PathBuf),
+    /// A directory that exists where a worktree used to be, but that Git no
+    /// longer registers — the residue of an interrupted teardown.
+    Stray(PathBuf),
     /// The reference names no worktree: an already-removed path, or a branch
     /// that has no worktree.
     Absent(String),
@@ -1406,16 +1504,43 @@ fn lookup_worktree_target(repo: &RepoContext, target: Option<&str>) -> Result<Ta
         return Ok(TargetLookup::Found(repo.top_level.clone()));
     };
     let as_path = absolute_path(PathBuf::from(spec))?;
-    if as_path.exists() {
-        return Ok(TargetLookup::Found(canonical_path(&as_path)));
-    }
+    let stray = if as_path.exists() {
+        let canonical = canonical_path(&as_path);
+        if is_registered_worktree(repo, &canonical)? {
+            return Ok(TargetLookup::Found(canonical));
+        }
+        // An unregistered directory must not shadow a branch of the same name,
+        // so it is remembered rather than returned here.
+        Some(canonical)
+    } else {
+        None
+    };
     if let Some(path) = worktree_path_for_branch(repo, spec)? {
         return Ok(TargetLookup::Found(path));
     }
     if let Some(path) = overlay::worktree_for_branch(repo, spec) {
         return Ok(TargetLookup::Found(path));
     }
-    Ok(TargetLookup::Absent(spec.to_owned()))
+    match stray {
+        Some(path) => Ok(TargetLookup::Stray(path)),
+        None => Ok(TargetLookup::Absent(spec.to_owned())),
+    }
+}
+
+/// Whether `path` is still a registered worktree of this repository.
+///
+/// Existence is not the test. A `git worktree remove` that deleted the
+/// registration but could not unlink the directory leaves a shell behind, and
+/// treating that as a live worktree makes every later command interrogate a
+/// checkout Git has already forgotten.
+fn is_registered_worktree(repo: &RepoContext, path: &Path) -> Result<bool> {
+    if list_worktrees(repo)?
+        .iter()
+        .any(|entry| canonical_path(&entry.path).as_path() == path)
+    {
+        return Ok(true);
+    }
+    Ok(overlay::state(repo, path).is_some())
 }
 
 /// Find the worktree checked out on `branch`, if any, via Git's registry.
