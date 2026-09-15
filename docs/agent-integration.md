@@ -145,6 +145,11 @@ documented shape, not a malformed response. `run` is the exception to the whole
 contract: it streams the child's output, rejects `--json`, and exits with the
 child's own status (`128 + signal` when a signal killed the child).
 
+A tool that classifies simgit invocations before they run — an approval gate or
+checkpointer, rather than an allocator — depends on a narrower promise: which
+flags can destroy work. That contract lives in
+[AGENTS.md](../AGENTS.md#what-approval-gates-depend-on).
+
 ### 1. Discover and verify the executable
 
 For each provider startup, resolve the executable without trusting a possibly

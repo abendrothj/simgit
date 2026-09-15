@@ -85,6 +85,38 @@ Linux and in CI; do not treat them as gates on macOS.
 - A `--json` failure emits no JSON: nonzero exit, empty stdout, one line of
   diagnostic text on stderr.
 
+### What approval gates depend on
+
+Tools that sit in front of simgit and decide which invocations need human
+approval — HOL Guard is the first — classify an argv without running it. That
+only works if the destructive surface is small, named, and stable, so treat
+this as a compatibility contract rather than a description:
+
+- Exactly two flags destroy work that Git cannot give back:
+  `--discard-dirty` (uncommitted and untracked files in a worktree, on `remove`
+  and `gc`) and `--delete-unmerged` (branch deletion past the merged check, on
+  `remove` and `gc`). Never rename them, and never widen what they cover.
+- Any new operation that can destroy uncommitted work or unmerged commits MUST
+  be gated behind one of those two flags. A third destructive flag is a last
+  resort, and adding one means updating this list in the same change.
+- Without those flags no command destroys work. `remove` and `gc` refuse dirty
+  worktrees, `gc` reaps only ephemeral worktrees idle at least `--older-than`
+  and skips locked ones, branch deletion stops at the merged check, `prune`
+  drops only caches that rematerialize, `repair` only remounts, and `unlock`
+  refuses a live owner with no override. Gates classify `doctor`, `list`,
+  `unlock`, `prune`, `repair` and flagless `add`/`remove`/`gc` as automatic on
+  that basis; a change that breaks it silently turns an approved command
+  destructive.
+- `run` is the exception by design: it executes caller-supplied argv after
+  `--`, so the argv, not the `run` invocation, is what a gate must judge.
+- Destructiveness is decidable from argv alone. Never make it depend on
+  configuration, an environment variable, or a prompt simgit answers itself.
+- The tests that pin this are `gc_skips_dirty_worktrees_without_discard_dirty`,
+  `gc_retains_unmerged_branches_without_delete_unmerged`,
+  `running_commands_are_protected_from_gc_and_remove` and
+  `unlock_clears_a_stranded_lock_and_refuses_a_live_one`. They are the
+  guarantee, so never weaken one to accommodate a change.
+
 ### Documentation is part of the change
 
 Each documentation file owns a different audience, and a behavior change must
