@@ -5,11 +5,14 @@
 [![license](https://img.shields.io/crates/l/simgit-cli.svg)](LICENSE)
 [![skills.sh](https://skills.sh/b/abendrothj/simgit)](https://skills.sh/abendrothj/simgit)
 
-**Disk-efficient, separate Git worktrees for running many agents on one repository at once.**
+**Running a handful of coding agents on one repository means a handful of full
+copies of it on disk. simgit removes the copies and keeps the isolation.**
 
-Each agent gets its own separate working tree, but unchanged files share
-physical disk instead of being duplicated. There is no daemon and no server:
-**Git owns the refs, the filesystem owns the data.**
+Each agent gets its own real, separate Git working tree — its own branch, index
+and checkout — but unchanged files share physical disk instead of being
+duplicated, so an extra `microsoft/vscode` worktree costs **10 MiB instead of
+567 MiB**. There is no daemon and no server: **Git owns the refs, the filesystem
+owns the data.**
 
 `simgit` is the canonical executable. Every installation also provides `sg` as
 a fully equivalent short alias; examples below use the alias for brevity.
