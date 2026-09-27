@@ -2,6 +2,7 @@ use super::{run_command, state_dir, RepoContext};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -268,6 +269,25 @@ pub(super) fn repair(repo: &RepoContext, worktree: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Compare the two views exactly without allocating for the size of each edit.
+/// `run` checks this on every overlay reuse, even for large upperdir files.
+fn files_match(upper: &Path, view: &Path) -> std::io::Result<bool> {
+    let mut expected = fs::File::open(upper)?;
+    let mut actual = fs::File::open(view)?;
+    let mut expected_bytes = [0_u8; 16 * 1024];
+    let mut actual_bytes = [0_u8; 16 * 1024];
+    loop {
+        let size = expected.read(&mut expected_bytes)?;
+        if size == 0 {
+            return Ok(actual.read(&mut actual_bytes[..1])? == 0);
+        }
+        actual.read_exact(&mut actual_bytes[..size])?;
+        if expected_bytes[..size] != actual_bytes[..size] {
+            return Ok(false);
+        }
+    }
+}
+
 /// A FUSE mount can remain listed after its userspace connection is gone. A
 /// healthy overlay must expose every normal upperdir entry through the merged
 /// view. Overlay whiteout/special entries are intentionally ignored here.
@@ -286,10 +306,7 @@ pub(super) fn upper_visible(upper: &Path, view: &Path) -> bool {
                 return false;
             }
         } else if kind.is_file() {
-            let matches = fs::read(&upper_path)
-                .and_then(|expected| fs::read(&view_path).map(|actual| actual == expected))
-                .unwrap_or(false);
-            if !matches {
+            if !files_match(&upper_path, &view_path).unwrap_or(false) {
                 return false;
             }
         } else if kind.is_symlink() {

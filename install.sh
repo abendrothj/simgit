@@ -160,6 +160,9 @@ case "$staged_version" in
 simgit\ *) ;;
 *) die "downloaded canonical binary reported an unexpected identity" ;;
 esac
+if [ -n "$VERSION" ] && [ "$staged_version" != "simgit ${VERSION#v}" ]; then
+	die "downloaded simgit version $staged_version does not match requested $VERSION"
+fi
 
 # Stage in the destination directory, then rename each executable into place.
 # Existing processes retain their open executable while the aliases are updated.

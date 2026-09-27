@@ -73,6 +73,70 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// A competing creator can claim a branch after `add` checks that the name is
+/// available, but before Git registers its worktree. Failed allocation must
+/// never delete that creator's commits while cleaning up its own state.
+#[test]
+fn failed_allocation_does_not_delete_a_competing_branch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    git(&fixture.repo, &["checkout", "-qb", "competitor"]);
+    fs::write(fixture.repo.join("competitor.txt"), "unmerged work").unwrap();
+    git(&fixture.repo, &["add", "."]);
+    git(&fixture.repo, &["commit", "-qm", "competitor work"]);
+    let commit = Command::new("git")
+        .current_dir(&fixture.repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    success(&commit);
+    let commit = String::from_utf8(commit.stdout).unwrap().trim().to_owned();
+    git(&fixture.repo, &["checkout", "-q", "-"]);
+
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let wrapper_dir = fixture.root.join("bin");
+    fs::create_dir(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("git");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\n\
+         if [ \"$2\" = worktree ] && [ \"$3\" = add ]; then\n\
+           \"$SIMGIT_TEST_REAL_GIT\" -C \"$SIMGIT_TEST_REPO\" branch agent/race \"$SIMGIT_TEST_COMMIT\" || exit\n\
+         fi\n\
+         exec \"$SIMGIT_TEST_REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(wrapper_dir)
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .env("PATH", path)
+        .env("SIMGIT_TEST_REAL_GIT", real_git)
+        .env("SIMGIT_TEST_REPO", &fixture.repo)
+        .env("SIMGIT_TEST_COMMIT", &commit)
+        .args(["add", "agent/race", "--path"])
+        .arg(&fixture.worktree)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "competing branch must block add");
+    let surviving = Command::new("git")
+        .current_dir(&fixture.repo)
+        .args(["rev-parse", "--verify", "refs/heads/agent/race"])
+        .output()
+        .unwrap();
+    success(&surviving);
+    assert_eq!(String::from_utf8(surviving.stdout).unwrap().trim(), commit);
+    assert!(!fixture.worktree.exists());
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .current_dir(repo)
@@ -651,6 +715,107 @@ fn sparse_worktrees_check_out_only_the_requested_directories() {
     assert!(!rejected.status.success());
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn overlapping_sparse_cones_allocate_clean_worktrees() {
+    let fixture = Fixture::new();
+    fs::create_dir_all(fixture.repo.join("alpha/sub")).unwrap();
+    fs::create_dir_all(fixture.repo.join("beta")).unwrap();
+    fs::write(fixture.repo.join("alpha/sub/result.txt"), "in cone").unwrap();
+    fs::write(fixture.repo.join("beta/other.txt"), "outside cone").unwrap();
+    git(&fixture.repo, &["add", "-A"]);
+    git(&fixture.repo, &["commit", "-qm", "add sparse directories"]);
+
+    let doctor = fixture.run(&["doctor", "--json"]);
+    success(&doctor);
+    let capability: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let mode = if capability["cow_supported"] == true {
+        "reflink"
+    } else {
+        "checkout"
+    };
+    for (branch, cones) in [
+        ("agent/parent-first", ["alpha", "alpha/sub", "alpha"]),
+        ("agent/child-first", ["alpha/sub", "alpha", "alpha/sub"]),
+    ] {
+        let target = fixture.root.join(branch.replace('/', "-"));
+        let mut command = fixture.command();
+        command
+            .env("SIMGIT_POPULATE", mode)
+            .args(["add", branch, "--path"])
+            .arg(&target);
+        for cone in cones {
+            command.args(["--sparse", cone]);
+        }
+        let created = command.output().unwrap();
+        success(&created);
+        assert!(target.join("alpha/sub/result.txt").is_file());
+        assert!(!target.join("beta").exists());
+        let status = Command::new("git")
+            .current_dir(&target)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        success(&status);
+        assert!(status.stdout.is_empty(), "sparse worktree is dirty");
+    }
+}
+
+#[test]
+fn json_failures_leave_stdout_empty_and_one_diagnostic_line() {
+    let fixture = Fixture::new();
+    let absent = fixture.root.join("already-removed");
+    let absent = absent.to_str().unwrap();
+    for (args, expected) in [
+        (
+            vec!["--json", "remove", absent, "--delete-branch"],
+            "pass the branch name",
+        ),
+        (
+            vec!["remove", absent, "--delete-branch", "--json"],
+            "pass the branch name",
+        ),
+        (
+            vec!["--json", "add", "--unknown-option"],
+            "unexpected argument",
+        ),
+        (
+            vec!["add", "--json", "--unknown-option"],
+            "unexpected argument",
+        ),
+        (
+            vec!["--json", "run", "agent/test", "--", "true"],
+            "--json is not supported",
+        ),
+    ] {
+        let result = fixture.run(&args);
+        assert!(!result.status.success(), "unexpected success for {args:?}");
+        assert!(result.stdout.is_empty(), "failure wrote JSON for {args:?}");
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+        assert_eq!(stderr.lines().count(), 1, "{args:?}: {stderr}");
+        assert!(stderr.ends_with('\n'), "{args:?}: {stderr}");
+    }
+
+    // A failed allocation inside the source must not emit its success-only
+    // location warning before returning the JSON-mode error.
+    let inside = fixture.repo.join("new-worktree");
+    let refused = fixture
+        .command()
+        .args(["--json", "add", "agent/invalid", "--path"])
+        .arg(&inside)
+        .args(["--sparse", "../outside"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    let stderr = String::from_utf8(refused.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("must be a path inside"), "{stderr}");
+
+    let human = fixture.run(&["remove", absent, "--delete-branch"]);
+    assert!(String::from_utf8_lossy(&human.stderr).lines().count() > 1);
 }
 
 /// `doctor --json` is the contract an agent reads before it decides whether

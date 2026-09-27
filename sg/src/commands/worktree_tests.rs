@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 use std::sync::{Arc, Barrier};
 
 #[test]
@@ -364,6 +365,24 @@ fn overlay_health_requires_the_view_to_reflect_upperdir_data() -> Result<()> {
     fs::write(view.join("nested/result.txt"), "agent result")?;
     assert!(overlay::upper_visible(&upper, &view));
     fs::write(view.join("nested/result.txt"), "stale result")?;
+    assert!(!overlay::upper_visible(&upper, &view));
+    let original = vec![b'x'; 32 * 1024 + 1];
+    fs::write(upper.join("nested/result.txt"), &original)?;
+    fs::write(view.join("nested/result.txt"), &original)?;
+    assert!(overlay::upper_visible(&upper, &view));
+
+    let mut changed = original.clone();
+    changed[16 * 1024 + 1] = b'y';
+    fs::write(view.join("nested/result.txt"), &changed)?;
+    assert!(!overlay::upper_visible(&upper, &view));
+    fs::write(
+        view.join("nested/result.txt"),
+        &original[..original.len() - 1],
+    )?;
+    assert!(!overlay::upper_visible(&upper, &view));
+    changed = original;
+    changed.push(b'y');
+    fs::write(view.join("nested/result.txt"), &changed)?;
     assert!(!overlay::upper_visible(&upper, &view));
     fs::remove_dir_all(root)?;
     Ok(())

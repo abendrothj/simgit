@@ -116,14 +116,33 @@ fn restore_default_sigpipe() {
     }
 }
 
+/// Preserve error context while keeping machine-facing diagnostics on one line.
+fn one_line(diagnostic: &str) -> String {
+    diagnostic.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Parse this process's arguments and execute the requested command. Both the
 /// canonical `simgit` binary and its `sg` alias are one-line wrappers around
 /// this, so the CLI is compiled and tested once.
 pub fn run_cli() -> Result<()> {
     restore_default_sigpipe();
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|error| {
+        // Clap prints usage and hints on several lines. In JSON mode a failed
+        // invocation has no stdout and exactly one stderr diagnostic instead.
+        let json = std::env::args_os()
+            .skip(1)
+            .take_while(|argument| argument != "--")
+            .any(|argument| argument == "--json");
+        if json && error.use_stderr() {
+            let diagnostic = error.to_string();
+            let primary = diagnostic.split("\n\n").next().unwrap_or(&diagnostic);
+            eprintln!("{}", one_line(primary));
+            std::process::exit(error.exit_code());
+        }
+        error.exit()
+    });
     let json = cli.json;
-    match cli.command {
+    let result = match cli.command {
         Commands::Doctor => commands::worktree::doctor(json),
         Commands::Add(args) => commands::worktree::add(args, json),
         Commands::List => commands::worktree::list(json),
@@ -133,5 +152,10 @@ pub fn run_cli() -> Result<()> {
         Commands::Gc(args) => commands::worktree::gc(args, json),
         Commands::Prune(args) => commands::worktree::prune(args, json),
         Commands::Repair => commands::worktree::repair(json),
+    };
+    if json {
+        result.map_err(|error| anyhow::anyhow!(one_line(&format!("{error:#}"))))
+    } else {
+        result
     }
 }

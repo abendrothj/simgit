@@ -8,7 +8,6 @@
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde_json::json;
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,11 +16,25 @@ use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 mod cow;
+mod doctor;
 mod index;
 mod launch;
+mod locks;
+mod maintenance;
 mod overlay;
 
+pub use doctor::doctor;
 pub use launch::{run_in_worktree, WorktreeRun};
+pub use locks::{unlock, WorktreeUnlock};
+pub use maintenance::{gc, prune, repair, WorktreeGc, WorktreePrune};
+
+use locks::{ensure_unlocked, PathClaim, WorktreeLock};
+use maintenance::{delete_local_branch, prune_git_worktrees};
+
+#[cfg(test)]
+use locks::{lock_owner_of, lock_owner_pid, process_alive, worktree_lock_path};
+#[cfg(test)]
+use maintenance::run_gc;
 
 #[derive(Args)]
 pub struct WorktreeAdd {
@@ -84,46 +97,6 @@ pub struct WorktreeRemove {
     pub delete_unmerged: bool,
 }
 
-#[derive(Args, Default)]
-pub struct WorktreePrune {
-    /// Also delete every cached baseline, including recently used entries.
-    #[arg(long)]
-    pub all: bool,
-}
-
-#[derive(Args, Default)]
-pub struct WorktreeGc {
-    /// Also allow GC to remove persistent worktrees. Without it, only
-    /// ephemeral worktrees are reaped.
-    #[arg(long)]
-    pub include_persistent: bool,
-
-    /// Only reap worktrees whose branch starts with this prefix.
-    #[arg(long)]
-    pub prefix: Option<String>,
-
-    /// Reap worktrees idle at least this long (e.g. 90s, 30m, 24h, 7d).
-    #[arg(long, default_value = "24h")]
-    pub older_than: String,
-
-    /// Reap worktrees with uncommitted changes, discarding those changes.
-    #[arg(long)]
-    pub discard_dirty: bool,
-
-    /// Delete each reaped worktree's branch.
-    #[arg(long)]
-    pub delete_branches: bool,
-
-    /// Permit deleting branches that are not merged. Requires
-    /// --delete-branches.
-    #[arg(long)]
-    pub delete_unmerged: bool,
-
-    /// Report what would be reaped without removing anything.
-    #[arg(long)]
-    pub dry_run: bool,
-}
-
 #[derive(Debug)]
 struct RepoContext {
     pub(super) top_level: PathBuf,
@@ -147,178 +120,6 @@ impl PopulateMode {
             Self::Overlay => "overlay",
             Self::GitCheckout => "git-checkout",
         }
-    }
-}
-
-/// Report repository and platform capabilities without changing Git
-/// registrations or pruning caches.
-///
-/// Being outside a repository is an answer, not a failure: `doctor` is the
-/// command an agent runs to find out whether this directory is usable at all,
-/// so the repository-dependent facts are reported as `null` and the checks
-/// that only need the filesystem still run.
-pub fn doctor(json: bool) -> Result<()> {
-    let cwd = std::env::current_dir()?;
-    match discover_repo(&cwd) {
-        Ok(repo) => doctor_in_repository(&repo, json),
-        Err(_) => doctor_without_repository(&cwd, json),
-    }
-}
-
-fn doctor_in_repository(repo: &RepoContext, json: bool) -> Result<()> {
-    let root = absolute_path(
-        default_worktree_path(&repo.common_git_dir, "doctor-probe")?
-            .parent()
-            .context("default worktree has no root")?
-            .to_path_buf(),
-    )?;
-    let root = lexical_normalize(&root);
-    let probe = nearest_existing_directory(&root)?;
-    let filesystem = filesystem_name(&probe);
-    let cow_supported = cow::clone_supported(&repo.common_git_dir, &probe).ok();
-    let populate_mode = select_populate_mode(repo, &probe, false)?.label();
-    let git_worktree = git_output_common(repo, ["worktree", "list", "--porcelain", "-z"])?;
-    let git_worktree_supported = git_worktree.status.success();
-    let stale = if git_worktree_supported {
-        stale_worktree_registrations(&git_worktree.stdout)
-    } else {
-        Vec::new()
-    };
-    let baselines = cow::baseline_inventory(&repo.common_git_dir)?;
-    let baseline_count = baselines.retained.len();
-    let repository = repo.top_level.display().to_string();
-    let common_git_owner = main_worktree(&repo.common_git_dir);
-    let root_inside_repository = resolved_path(&root)?.starts_with(resolved_path(&repo.top_level)?);
-    let is_main_worktree = resolved_path(&repo.top_level)? == resolved_path(common_git_owner)?;
-
-    if json {
-        emit(&json!({
-            "product": "simgit",
-            "version": env!("CARGO_PKG_VERSION"),
-            "identity": "simgit",
-            "repository": repository,
-            "repository_details": {
-                "top_level": repository,
-                "common_git_dir": repo.common_git_dir.display().to_string(),
-                "common_git_owner": common_git_owner.display().to_string(),
-                "is_main_worktree": is_main_worktree,
-            },
-            "filesystem": filesystem,
-            "cow_supported": cow_supported,
-            "populate_mode": populate_mode,
-            "default_worktree_root": root.display().to_string(),
-            "default_worktree_root_inside_repository": root_inside_repository,
-            "git_worktree_supported": git_worktree_supported,
-            "stale_worktree_registrations": stale,
-            "baseline_cache": {
-                "root": baselines.root.display().to_string(),
-                "retained": baselines.retained,
-                "retained_count": baseline_count,
-                "retained_bytes": baselines.retained_bytes,
-            },
-        }));
-    } else {
-        println!("simgit {}", env!("CARGO_PKG_VERSION"));
-        println!("repository: {}", repo.top_level.display());
-        println!("common git dir: {}", repo.common_git_dir.display());
-        println!("filesystem: {filesystem}");
-        println!("CoW: {}", cow_status(cow_supported));
-        println!("populate mode: {populate_mode}");
-        println!(
-            "worktree root: {} ({})",
-            root.display(),
-            if root_inside_repository {
-                "unsafe: inside repository"
-            } else {
-                "safe"
-            }
-        );
-        println!(
-            "Git worktrees: {} ({} stale registration(s))",
-            if git_worktree_supported {
-                "supported"
-            } else {
-                "unavailable"
-            },
-            stale.len()
-        );
-        println!(
-            "baseline cache: {} retained ({:.1} MiB)",
-            baseline_count,
-            baselines.retained_bytes as f64 / (1024.0 * 1024.0)
-        );
-    }
-    Ok(())
-}
-
-/// Report what can be known without a repository: simgit's identity and
-/// version, and what the current directory's filesystem can do. Everything
-/// derived from Git registrations, the worktree root or the baseline cache is
-/// `null`, since there is nothing to derive it from.
-fn doctor_without_repository(cwd: &Path, json: bool) -> Result<()> {
-    let probe = nearest_existing_directory(cwd)?;
-    let filesystem = filesystem_name(&probe);
-    let cow_supported = cow_supported_without_repository(&probe);
-
-    if json {
-        emit(&json!({
-            "product": "simgit",
-            "version": env!("CARGO_PKG_VERSION"),
-            "identity": "simgit",
-            "repository": null,
-            "repository_details": null,
-            "filesystem": filesystem,
-            "cow_supported": cow_supported,
-            "populate_mode": null,
-            "default_worktree_root": null,
-            "default_worktree_root_inside_repository": null,
-            "git_worktree_supported": null,
-            "stale_worktree_registrations": [],
-            "baseline_cache": null,
-        }));
-    } else {
-        println!("simgit {}", env!("CARGO_PKG_VERSION"));
-        println!(
-            "repository: none ({} is not in a Git working tree)",
-            cwd.display()
-        );
-        println!("filesystem: {filesystem}");
-        println!("CoW: {}", cow_status(cow_supported));
-        println!(
-            "worktree root, populate mode, Git worktree support and baseline cache: \
-             run simgit doctor inside a repository"
-        );
-    }
-    Ok(())
-}
-
-/// Probe filesystem cloning where there is no repository state directory to
-/// hold the probe's source file.
-///
-/// Both probe files go in a scratch directory inside the directory being
-/// probed — they have to share its filesystem for the answer to mean anything
-/// — and the scratch directory takes them with it when it is removed.
-fn cow_supported_without_repository(dir: &Path) -> Option<bool> {
-    let scratch = dir.join(format!(".simgit-doctor-probe-{}", Uuid::new_v4()));
-    if fs::create_dir(&scratch).is_err() {
-        // Nothing was measured: an unwritable directory says something about
-        // this process's permissions, not about what the filesystem can do.
-        return None;
-    }
-    let supported = cow::clone_supported(&scratch, &scratch).ok();
-    let _ = fs::remove_dir_all(&scratch);
-    supported
-}
-
-/// How `doctor` words a copy-on-write verdict. "Unavailable" is a measured
-/// answer, so an unmeasurable one must not borrow it: reporting `filesystem:
-/// apfs, CoW: unavailable` because a probe could not be written contradicts
-/// itself.
-fn cow_status(supported: Option<bool>) -> &'static str {
-    match supported {
-        Some(true) => "supported",
-        Some(false) => "unavailable",
-        None => "unknown (cannot write a probe here)",
     }
 }
 
@@ -419,7 +220,6 @@ fn create_worktree(args: &WorktreeAdd, attach: bool) -> Result<CreatedWorktree> 
         fs::create_dir_all(parent)
             .with_context(|| format!("create worktree parent {}", parent.display()))?;
     }
-    warn_if_inside_repository(&repo, &target);
 
     let target_parent = target.parent().context("worktree path has no parent")?;
     let mode = select_populate_mode(&repo, target_parent, args.require_cow)?;
@@ -443,15 +243,10 @@ fn create_worktree(args: &WorktreeAdd, attach: bool) -> Result<CreatedWorktree> 
             add_git_worktree(&repo, branch_arg, &target, &base, kind, &sparse)
         }
     };
-    if let Err(error) = populated {
-        // `git worktree add` can create the branch and then fail on the
-        // destination, so a refused allocation would otherwise leave an
-        // `agent/<uuid>` ref nobody can attribute.
-        if kind == WorktreeKind::NewBranch {
-            discard_partial_branch(&repo, reference.as_deref());
-        }
-        return Err(error);
-    }
+    // Registration can fail after another process creates the branch. Git can
+    // also leave a branch behind on a partial failure; existence alone cannot
+    // tell which process owns it. Never delete an unproven ref here.
+    populated?;
 
     // Best effort: a worktree that works but cannot report its mode is far
     // better than tearing down a good checkout over a marker file.
@@ -473,6 +268,7 @@ fn create_worktree(args: &WorktreeAdd, attach: bool) -> Result<CreatedWorktree> 
             return Err(error).context("mark worktree ephemeral");
         }
     }
+    warn_if_inside_repository(&repo, &target);
 
     Ok(CreatedWorktree {
         target,
@@ -702,9 +498,9 @@ fn reapply_sparse(target: &Path) -> Result<()> {
         .context("apply sparse patterns to the worktree index")
 }
 
-/// Reject sparse arguments that would escape the worktree or confuse cone mode.
+/// Validate and collapse overlapping cones so no directory is cloned twice.
 fn validate_sparse(sparse: &[String]) -> Result<Vec<String>> {
-    let mut clean = Vec::with_capacity(sparse.len());
+    let mut clean: Vec<String> = Vec::with_capacity(sparse.len());
     for entry in sparse {
         let trimmed = entry.trim().trim_end_matches('/');
         if trimmed.is_empty() {
@@ -714,6 +510,13 @@ fn validate_sparse(sparse: &[String]) -> Result<Vec<String>> {
         if path.is_absolute() || path.components().any(|part| part.as_os_str() == "..") {
             bail!("--sparse {entry} must be a path inside the repository");
         }
+        if clean
+            .iter()
+            .any(|parent| path.starts_with(Path::new(parent)))
+        {
+            continue;
+        }
+        clean.retain(|child| !Path::new(child).starts_with(path));
         clean.push(trimmed.to_owned());
     }
     Ok(clean)
@@ -1004,271 +807,6 @@ fn remove_file_if_present(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
     }
-}
-
-fn worktree_lock_path(repo: &RepoContext, target: &Path) -> Result<PathBuf> {
-    if let Some(admin) = overlay::admin_dir(repo, target) {
-        return Ok(admin.join("locked"));
-    }
-    // Git cannot lock its main worktree, which it already refuses to remove.
-    // Use a separate marker there only to serialize simgit launches.
-    if target.join(".git").exists() && worktree_admin_dir(target)? == repo.common_git_dir {
-        return Ok(repo.common_git_dir.join("simgit-run.lock"));
-    }
-    bail!("cannot find worktree registration for {}", target.display())
-}
-
-fn ensure_unlocked(repo: &RepoContext, target: &Path) -> Result<()> {
-    if worktree_lock_path(repo, target).is_ok_and(|path| path.exists()) {
-        bail!(
-            "worktree is locked (a command may be running): {}",
-            target.display()
-        );
-    }
-    Ok(())
-}
-
-struct WorktreeLock {
-    path: Option<PathBuf>,
-}
-
-/// The lock file's single line. It doubles as Git's lock reason — `git
-/// worktree list` and `simgit list` echo it — so it stays one readable line,
-/// and it names the launching process so a stranded lock can be told apart
-/// from a live one.
-fn lock_contents() -> String {
-    format!("simgit: workspace in use (pid {})\n", std::process::id())
-}
-
-/// The process id recorded in a lock file. Locks written before simgit
-/// recorded one have an unknown owner, and clearing those cannot be refused.
-fn lock_owner_pid(contents: &str) -> Option<i32> {
-    let rest = contents.split_once("(pid ")?.1;
-    rest.split_once(')')?.0.trim().parse().ok()
-}
-
-fn lock_owner_of(path: &Path) -> Option<i32> {
-    fs::read_to_string(path)
-        .ok()
-        .as_deref()
-        .and_then(lock_owner_pid)
-}
-
-/// True while `pid` still names a live process.
-///
-/// `kill(pid, 0)` runs the existence and permission checks without delivering
-/// anything. Success means the process is there; `EPERM` means it is there but
-/// owned by another user, which is still a reason not to steal its lock; only
-/// `ESRCH` means it is gone.
-fn process_alive(pid: i32) -> bool {
-    extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    // SAFETY: `kill` takes two integers and dereferences nothing, and signal 0
-    // delivers no signal, so the call only reports whether the pid is live.
-    if unsafe { kill(pid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().kind() == std::io::ErrorKind::PermissionDenied
-}
-
-impl WorktreeLock {
-    fn acquire(repo: &RepoContext, target: &Path) -> Result<Self> {
-        let path = worktree_lock_path(repo, target)?;
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let owner = lock_owner_of(&path)
-                    .map(|pid| format!(" (pid {pid})"))
-                    .unwrap_or_default();
-                bail!(
-                    "workspace is already in use by a running command{owner}: {}\n\
-                     if nothing is running there, release it with: simgit unlock {}",
-                    target.display(),
-                    target.display()
-                )
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("lock workspace at {}", path.display()))
-            }
-        };
-        use std::io::Write;
-        let lock = Self { path: Some(path) };
-        file.write_all(lock_contents().as_bytes())?;
-        Ok(lock)
-    }
-
-    fn release(mut self) -> Result<()> {
-        if let Some(path) = self.path.take() {
-            remove_file_if_present(&path)?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for WorktreeLock {
-    fn drop(&mut self) {
-        if let Some(path) = &self.path {
-            if let Err(error) = remove_file_if_present(path) {
-                eprintln!("could not unlock worktree: {error:#}");
-            }
-        }
-    }
-}
-
-/// An exclusive claim on one destination path for the length of an allocation.
-///
-/// Creating a worktree is several Git operations, and two `add --path <same>`
-/// runs interleaving through them both used to finish: Git kept two
-/// registrations for one directory, the winner's JSON named the loser's
-/// branch, and afterwards neither allocation could be removed by its token.
-/// The claim is a `create_new` file named for the destination, so the second
-/// allocator fails immediately and changes nothing.
-struct PathClaim {
-    path: PathBuf,
-}
-
-/// The claim file's single line, in the shape `lock_owner_pid` reads, so a
-/// claim left behind by a killed allocator can be told from a live one.
-fn claim_contents() -> String {
-    format!(
-        "simgit: allocating a worktree here (pid {})\n",
-        std::process::id()
-    )
-}
-
-/// A stable file name for one destination path: claims live in a flat
-/// directory, and a worktree path contains separators and may be long.
-fn path_digest(path: &Path) -> String {
-    let hash = path
-        .as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        });
-    format!("{hash:016x}")
-}
-
-impl PathClaim {
-    fn acquire(repo: &RepoContext, target: &Path) -> Result<Self> {
-        let directory = state_dir(&repo.common_git_dir).join("claims");
-        fs::create_dir_all(&directory).context("create the allocation claim directory")?;
-        let digest = path_digest(target);
-        // The claim is published complete. Creating an empty file and then
-        // writing the owner into it leaves an instant where a second
-        // allocator reads an ownerless claim, concludes it is stale, and
-        // takes it — which is the very race this exists to close.
-        let pending = directory.join(format!("{digest}.{}.pending", Uuid::new_v4()));
-        fs::write(&pending, claim_contents())
-            .with_context(|| format!("write {}", pending.display()))?;
-        let claimed = Self::publish(&pending, directory.join(format!("{digest}.claim")), target);
-        let _ = fs::remove_file(&pending);
-        claimed
-    }
-
-    /// Link the prepared claim into place, taking over one left behind by an
-    /// allocator that is no longer running.
-    fn publish(pending: &Path, path: PathBuf, target: &Path) -> Result<Self> {
-        let mut stole = false;
-        loop {
-            match fs::hard_link(pending, &path) {
-                Ok(()) => return Ok(Self { path }),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let owner = lock_owner_of(&path);
-                    if !stole && !owner.is_some_and(process_alive) {
-                        // The allocator that wrote this claim is gone, so it
-                        // is holding nothing; whatever it half-created is
-                        // Git's registration to report, not a live claim.
-                        stole = true;
-                        remove_file_if_present(&path)?;
-                        continue;
-                    }
-                    let owner = owner.map(|pid| format!(" (pid {pid})")).unwrap_or_default();
-                    bail!(
-                        "another simgit is already creating a worktree at {}{owner}\n\
-                         wait for it to finish, or allocate a different path",
-                        target.display()
-                    );
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("claim the worktree path {}", target.display()))
-                }
-            }
-        }
-    }
-}
-
-impl Drop for PathClaim {
-    fn drop(&mut self) {
-        if let Err(error) = remove_file_if_present(&self.path) {
-            eprintln!("could not release the worktree path claim: {error:#}");
-        }
-    }
-}
-
-#[derive(Args)]
-pub struct WorktreeUnlock {
-    /// Worktree path or branch name. Defaults to the worktree containing the
-    /// current directory.
-    pub target: Option<String>,
-}
-
-/// Clear the `run` lock a killed launcher left behind.
-///
-/// The lock names the launching process, so this refuses while that process is
-/// alive: the fix then is to stop it, not to force the lock and let two
-/// commands write the same checkout. That is why there is no override flag.
-/// Unlocking a workspace that is not locked is the state the caller asked for,
-/// so it succeeds — including when the workspace itself is already gone, which
-/// is what a recovery pass that crashed after cleanup sees when it retries.
-pub fn unlock(args: WorktreeUnlock, json: bool) -> Result<()> {
-    let repo = discover_repo(&std::env::current_dir()?)?;
-    let (label, lock_path) = match lookup_worktree_target(&repo, args.target.as_deref())? {
-        TargetLookup::Found(target) => {
-            let path = worktree_lock_path(&repo, &target)?;
-            (target.display().to_string(), Some(path))
-        }
-        TargetLookup::Stray(path) => (path.display().to_string(), None),
-        TargetLookup::Absent(spec) => (spec, None),
-    };
-    let contents = match &lock_path {
-        Some(path) => match fs::read_to_string(path) {
-            Ok(contents) => Some(contents),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
-        },
-        None => None,
-    };
-    let owner_pid = contents.as_deref().and_then(lock_owner_pid);
-    if let Some(pid) = owner_pid.filter(|pid| process_alive(*pid)) {
-        bail!(
-            "workspace is in use by a running command (pid {pid}): {label}\n\
-             stop that process, then run simgit unlock again"
-        );
-    }
-    let was_locked = contents.is_some();
-    if let Some(path) = &lock_path {
-        remove_file_if_present(path)?;
-    }
-
-    if json {
-        emit(&json!({
-            "unlocked": label,
-            "was_locked": was_locked,
-            "owner_pid": owner_pid,
-        }));
-    } else if was_locked {
-        println!("{label}");
-    } else {
-        println!("{label} (was not locked)");
-    }
-    Ok(())
 }
 
 pub fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
@@ -1624,264 +1162,6 @@ pub fn list(json_output: bool) -> Result<()> {
     }
     println!("{}", serde_json::to_string_pretty(&entries)?);
     Ok(())
-}
-
-/// Keep recoverable unmounted overlays registered during native pruning.
-fn prune_git_worktrees(repo: &RepoContext) -> Result<()> {
-    let mut locks = Vec::new();
-    for (path, state) in overlay::registrations(repo) {
-        if state.overlay_dir.is_dir() && ensure_unlocked(repo, &path).is_ok() {
-            locks.push(WorktreeLock::acquire(repo, &path)?);
-        }
-    }
-    run_git_common(repo, ["worktree", "prune"])?;
-    for lock in locks {
-        lock.release()?;
-    }
-    Ok(())
-}
-
-pub fn prune(args: WorktreePrune, json: bool) -> Result<()> {
-    let repo = discover_repo(&std::env::current_dir()?)?;
-    let protected: HashSet<PathBuf> = overlay::registrations(&repo)
-        .into_iter()
-        .filter_map(|(_, state)| state.lower)
-        .collect();
-    // Pruning a registration is a mutation of the Git registry, and it is the
-    // one `doctor` reports as stale, so it has to be reported here too:
-    // "pruned 0 cached baseline(s)" reads as "nothing happened".
-    let before = stale_registrations(&repo)?;
-    prune_git_worktrees(&repo)?;
-    let after = stale_registrations(&repo)?;
-    let pruned_registrations: Vec<String> = before
-        .into_iter()
-        .filter(|path| !after.contains(path))
-        .collect();
-    let outcome = cow::prune_baselines(&repo.common_git_dir, args.all, &protected)?;
-
-    if json {
-        emit(&json!({
-            "pruned": outcome.removed,
-            "pruned_registrations": pruned_registrations,
-            "retained": outcome.retained,
-            "retained_bytes": outcome.retained_bytes,
-        }));
-        return Ok(());
-    }
-    println!(
-        "pruned {} stale registration(s)",
-        pruned_registrations.len()
-    );
-    println!(
-        "pruned {} cached baseline(s); {} retained ({:.1} MiB)",
-        outcome.removed.len(),
-        outcome.retained.len(),
-        outcome.retained_bytes as f64 / (1024.0 * 1024.0)
-    );
-    Ok(())
-}
-
-/// The worktree paths Git currently reports as prunable registrations.
-fn stale_registrations(repo: &RepoContext) -> Result<Vec<String>> {
-    let output = git_output_common(repo, ["worktree", "list", "--porcelain", "-z"])?;
-    if !output.status.success() {
-        return Err(git_failure("git worktree list --porcelain", &output));
-    }
-    Ok(stale_worktree_registrations(&output.stdout)
-        .iter()
-        .filter_map(|entry| entry["worktree"].as_str().map(str::to_owned))
-        .collect())
-}
-
-pub fn gc(args: WorktreeGc, json: bool) -> Result<()> {
-    let repo = discover_repo(&std::env::current_dir()?)?;
-    let outcome = run_gc(&repo, &args)?;
-
-    if json {
-        emit(&json!({
-            "dry_run": args.dry_run,
-            "reaped": outcome.reaped
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>(),
-            "skipped": outcome.skipped
-                .iter()
-                .map(|(p, why)| json!({ "worktree": p.display().to_string(), "reason": why }))
-                .collect::<Vec<_>>(),
-            "retained_branches": outcome.retained_branches,
-            "deleted_branches": outcome.deleted_branches,
-        }));
-    } else {
-        let verb = if args.dry_run { "would reap" } else { "reaped" };
-        for path in &outcome.reaped {
-            println!("{verb}: {}", path.display());
-        }
-        for (path, why) in &outcome.skipped {
-            eprintln!("skipped ({why}): {}", path.display());
-        }
-        for branch in &outcome.retained_branches {
-            eprintln!("retained unmerged branch: {branch}");
-        }
-        for branch in &outcome.deleted_branches {
-            println!("deleted branch: {branch}");
-        }
-        println!("{verb} {} worktree(s)", outcome.reaped.len());
-    }
-    Ok(())
-}
-
-pub fn repair(json_output: bool) -> Result<()> {
-    let repo = discover_repo(&std::env::current_dir()?)?;
-    let mut repaired = Vec::new();
-    let mut healthy = Vec::new();
-    let mut failed = Vec::new();
-    for (worktree, _) in overlay::registrations(&repo) {
-        match overlay::repair(&repo, &worktree) {
-            Ok(true) => repaired.push(worktree),
-            Ok(false) => healthy.push(worktree),
-            Err(error) => failed.push((worktree, error.to_string())),
-        }
-    }
-    if json_output {
-        emit(&json!({
-            "repaired": repaired.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "healthy": healthy.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
-            "failed": failed.iter().map(|(p, error)| json!({
-                "worktree": p.display().to_string(), "error": error
-            })).collect::<Vec<_>>(),
-        }));
-    } else {
-        for path in &repaired {
-            println!("repaired: {}", path.display());
-        }
-        for path in &healthy {
-            println!("healthy: {}", path.display());
-        }
-        for (path, error) in &failed {
-            eprintln!("failed: {}: {error}", path.display());
-        }
-        println!("repaired {} overlay worktree(s)", repaired.len());
-    }
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        bail!("{} overlay worktree(s) could not be repaired", failed.len())
-    }
-}
-
-struct GcOutcome {
-    reaped: Vec<PathBuf>,
-    skipped: Vec<(PathBuf, &'static str)>,
-    retained_branches: Vec<String>,
-    deleted_branches: Vec<String>,
-}
-
-/// Core reaping logic, separated from output for testability. Returns the
-/// worktrees reaped (or that would be, under `--dry-run`) and those skipped.
-fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome> {
-    // Refuse before reaping anything: on its own --delete-unmerged relaxes a
-    // deletion that is never attempted.
-    if args.delete_unmerged && !args.delete_branches {
-        bail!("--delete-unmerged only relaxes branch deletion; pass --delete-branches too");
-    }
-    let older_than = parse_duration(&args.older_than)?;
-    let mut reaped: Vec<PathBuf> = Vec::new();
-    let mut skipped: Vec<(PathBuf, &'static str)> = Vec::new();
-    let mut retained_branches = Vec::new();
-    let mut deleted_branches = Vec::new();
-
-    for entry in list_worktrees(repo)? {
-        if entry.is_main {
-            continue;
-        }
-        let branch = entry.branch.as_deref().unwrap_or("");
-        let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
-        if let Some(prefix) = &args.prefix {
-            if !short.starts_with(prefix) {
-                continue;
-            }
-        }
-        if !args.include_persistent && !is_ephemeral(repo, &entry.path) {
-            skipped.push((entry.path.clone(), "persistent"));
-            continue;
-        }
-        if ensure_unlocked(repo, &entry.path).is_err() {
-            skipped.push((entry.path.clone(), "locked"));
-            continue;
-        }
-        if worktree_idle(&entry.path) < older_than {
-            // Say so: a user who just created and merged a workspace and then
-            // followed the documented `gc --older-than 1h` otherwise sees no
-            // mention of it at all.
-            skipped.push((entry.path.clone(), "recently-active"));
-            continue;
-        }
-        if !args.discard_dirty {
-            match worktree_dirty(&entry.path) {
-                Ok(true) => {
-                    skipped.push((entry.path.clone(), "dirty"));
-                    continue;
-                }
-                Err(_) => {
-                    skipped.push((entry.path.clone(), "status-failed"));
-                    continue;
-                }
-                Ok(false) => {}
-            }
-        }
-        if args.dry_run {
-            reaped.push(entry.path);
-            continue;
-        }
-        match teardown_worktree(repo, &entry.path, args.discard_dirty) {
-            Ok(()) => {
-                if args.delete_branches {
-                    if let Some(branch) = &entry.branch {
-                        if delete_local_branch(repo, branch, args.delete_unmerged).is_err() {
-                            retained_branches.push(short.to_owned());
-                        } else {
-                            deleted_branches.push(short.to_owned());
-                        }
-                    }
-                }
-                reaped.push(entry.path)
-            }
-            Err(_) => skipped.push((entry.path, "remove-failed")),
-        }
-    }
-
-    if !args.dry_run {
-        prune_git_worktrees(repo)?;
-    }
-    Ok(GcOutcome {
-        reaped,
-        skipped,
-        retained_branches,
-        deleted_branches,
-    })
-}
-
-fn delete_local_branch(repo: &RepoContext, branch_ref: &str, force: bool) -> Result<()> {
-    let branch = branch_ref.strip_prefix("refs/heads/").unwrap_or(branch_ref);
-    if branch == "main" || branch == "master" {
-        bail!("refusing to delete primary branch '{branch}'");
-    }
-    let mut command = git_common_command(repo);
-    command.args(["branch", if force { "-D" } else { "-d" }, branch]);
-    let output = command.output().context("delete worktree branch")?;
-    if output.status.success() {
-        return Ok(());
-    }
-    // Git's own refusal names `git branch -D`, which routes the user straight
-    // around simgit's safety flag, and never mentions the flag that exists for
-    // exactly this. Answer in simgit's terms instead.
-    if !force && String::from_utf8_lossy(&output.stderr).contains("not fully merged") {
-        bail!(
-            "branch '{branch}' is not fully merged: deleting it would drop commits\n\
-             merge it first, or delete it with the work by adding --delete-unmerged"
-        );
-    }
-    Err(git_failure("delete worktree branch", &output))
 }
 
 /// A linked worktree as reported by `git worktree list --porcelain`.
@@ -2345,22 +1625,6 @@ fn rollback_created_worktree(
         delete_local_branch(repo, branch, true)?;
     }
     Ok(())
-}
-
-/// Delete a branch a failed allocation may have created, if it is still there.
-///
-/// `git worktree add -b` creates the branch before it validates the
-/// destination, so a refused allocation leaves an `agent/<uuid>` ref that
-/// belongs to nobody. Best effort: the branch outliving a failure is untidy,
-/// while failing the failure path hides the error that caused it.
-fn discard_partial_branch(repo: &RepoContext, reference: Option<&str>) {
-    let Some(reference) = reference else {
-        return;
-    };
-    let exists = git_output_common(repo, ["show-ref", "--verify", "--quiet", reference]);
-    if exists.is_ok_and(|output| output.status.success()) {
-        let _ = delete_local_branch(repo, reference, true);
-    }
 }
 
 fn remove_worktree_force(repo: &RepoContext, target: &Path) -> Result<()> {

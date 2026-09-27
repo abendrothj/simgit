@@ -68,6 +68,13 @@ that branch's worktree, or creates one at its current commit when only the
 branch survives — the situation you are in after a `remove` that retained the
 branch.
 
+If allocation fails after checking that a branch name is available, another
+process may have claimed that name. simgit does not force-delete a branch it
+cannot prove it created. Git may also leave a branch behind after a partial
+`worktree add` failure; inspect any surviving branch before retrying or
+deleting it. After successful registration, a population failure instead
+attempts to roll back that worktree and the branch it created.
+
 Worktrees are deliberately **not** placed inside `.git`: agent harnesses and
 editors treat everything under `.git/` as off-limits or invisible — Claude Code
 refuses to edit files there — so a worktree nested in the git dir is unusable by
@@ -126,9 +133,11 @@ requires `fuse-overlayfs`, so it is Linux-only and fails outright on macOS
 rather than falling back.
 
 `--sparse` is rejected with the overlay backend, where the lower layer is the
-whole baseline and narrowing the view saves nothing. Reusing a workspace keeps
-whatever cone it was created with, and passing `--sparse` again on reuse is
-rejected rather than silently ignored.
+whole baseline and narrowing the view saves nothing. Repeated directories and
+overlapping cones are accepted: an ancestor subsumes its descendants before
+population, so no directory is cloned twice. Reusing a workspace keeps whatever
+cone it was created with, and passing `--sparse` again on reuse is rejected
+rather than silently ignored.
 
 ## Run locks and recovery
 
@@ -155,8 +164,9 @@ disposable workspaces.
 The global `--json` flag gives orchestrators structured output from `doctor`,
 `add`, `remove`, `list`, `unlock`, `gc`, `prune` and `repair`; it is accepted
 before or after the command, and `run` is the one command that rejects it. A
-`--json` failure emits no JSON: nonzero exit, empty stdout, one line of
-diagnostic text on stderr.
+`--json` failure, including an argument-parsing error, emits no JSON: nonzero
+exit, empty stdout, one line of diagnostic text on stderr. `--help` and
+`--version` remain successful human-readable requests, not JSON results.
 
 Every worktree path simgit prints or returns is symlink-resolved and lexically
 normalized, so one worktree always has exactly one string form and orchestrators
@@ -226,7 +236,8 @@ multiplier.
 ```text
 simgit/
 ├── sg/                 the CLI (`simgit`; `sg` is the short alias)
-│   └── src/commands/worktree/   command launch/picker, CoW and overlay backends
+│   ├── src/commands/worktree.rs    registration, allocation, removal, listing
+│   └── src/commands/worktree/      doctor, locks, maintenance, launch, CoW, overlay
 ├── tests/              CoW scaling benchmarks + overlay integration test
 ├── skills/             first-party `simgit-worktrees` agent skill
 ├── packaging/          Homebrew formula (prebuilt-binary install)

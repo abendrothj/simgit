@@ -84,12 +84,14 @@ rm -f "$INSTALLER"
 ```
 
 The installer downloads the matching release archive and `SHA256SUMS`, then
-refuses to install unless the archive's exact entry verifies. It installs both
-`simgit` and `sg` into `~/.local/bin` by default; `SIMGIT_INSTALL_DIR` selects
-another directory. It does not edit shell startup files. Its own comment header
-shows the `curl … | sh` one-liner as a convenience form; ignore it. Reading
-that header is exactly what the inspection step above is for, and the
-download-inspect-run sequence is the supported way to install from a release.
+refuses to install unless the archive's exact entry verifies and the staged
+binary's `--version` equals the requested tag without its leading `v`. It
+installs both `simgit` and `sg` into `~/.local/bin` by default;
+`SIMGIT_INSTALL_DIR` selects another directory. It does not edit shell startup
+files. Its own comment header shows the `curl … | sh` one-liner as a
+convenience form; ignore it. Reading that header is exactly what the
+inspection step above is for, and the download-inspect-run sequence is the
+supported way to install from a release.
 
 Verify the selected executable afterwards with `simgit doctor --json`, which
 runs with or without a repository.
@@ -137,13 +139,14 @@ orchestrate its own infrastructure.
 ## Allocator/provider contract
 
 Every command used below writes its JSON result as a single object on stdout
-and exits 0. Failures are not JSON: the command exits nonzero, writes nothing
-to stdout, and puts one line of diagnostic text on stderr. A provider branches
-on the exit status, parses stdout only on success, and reports the stderr line
-verbatim rather than trying to parse it; empty stdout on a nonzero exit is the
-documented shape, not a malformed response. `run` is the exception to the whole
-contract: it streams the child's output, rejects `--json`, and exits with the
-child's own status (`128 + signal` when a signal killed the child).
+and exits 0. Failures, including invalid arguments, are not JSON: the command
+exits nonzero, writes nothing to stdout, and puts one line of diagnostic text
+on stderr. A provider branches on the exit status, parses stdout only on
+success, and reports the stderr line verbatim rather than trying to parse it;
+empty stdout on a nonzero exit is the documented shape, not a malformed
+response. `run` is the exception to the whole contract: it streams the child's
+output, rejects `--json`, and exits with the child's own status (`128 + signal`
+when a signal killed the child).
 
 A tool that classifies simgit invocations before they run — an approval gate or
 checkpointer, rather than an allocator — depends on a narrower promise: which
@@ -154,19 +157,20 @@ flags can destroy work. That contract lives in
 
 For each provider startup, resolve the executable without trusting a possibly
 colliding command name:
-
-1. Select the absolute result of `command -v simgit` when present.
-2. Otherwise select the absolute result of `command -v sg`.
-3. If neither exists, stop and report that simgit is unavailable; installation
-   still requires the approval described above.
-4. Invoke the selected path with the top-level command `doctor --json`. This
+1. Select `command -v simgit` when present, otherwise `command -v sg`.
+   Reject a shell function or alias; some shells return a path relative to
+   their current directory, so resolve it to an absolute executable path
+   *before* changing directories.
+2. If neither exists or the result is not an executable file, stop and report
+   that simgit is unavailable; installation still requires approval.
+3. Invoke the resolved path with the top-level command `doctor --json`. This
    step needs no repository; run it wherever the provider starts.
-5. Parse JSON and require the top-level field `"identity": "simgit"` and a
+4. Parse JSON and require the top-level field `"identity": "simgit"` and a
    top-level `"version": "<semver>"` containing a valid semantic version.
    Reject malformed output, a missing or different identity, or a missing or
    invalid version. The alias must report the same simgit identity; selecting a
    binary merely named `simgit` or `sg` is not sufficient.
-6. Only then, run `doctor --json` again from the source repository the
+5. Only then, run `doctor --json` again from the source repository the
    allocation will serve, and validate the repository diagnostics below.
 
 A shell provider can express steps 1 through 5 directly:
@@ -180,6 +184,14 @@ else
   echo "simgit is not installed" >&2
   exit 1
 fi
+
+case "$SIMGIT_BIN" in
+  /*) ;;
+  */*) SIMGIT_BIN="$(cd -P "${SIMGIT_BIN%/*}" && pwd -P)/${SIMGIT_BIN##*/}" ;;
+  *) echo "simgit discovery did not return an executable path" >&2; exit 1 ;;
+esac
+[ -f "$SIMGIT_BIN" ] && [ -x "$SIMGIT_BIN" ] ||
+  { echo "simgit is not an executable file: $SIMGIT_BIN" >&2; exit 1; }
 
 doctor_json="$("$SIMGIT_BIN" doctor --json)" || exit
 printf '%s\n' "$doctor_json" | jq -e '.identity == "simgit"' >/dev/null ||
@@ -206,12 +218,12 @@ fields are the contract the provider validates:
 | `baseline_cache` | object or null | `root` (string), `retained` (array of base-commit oids), `retained_count` (integer), `retained_bytes` (integer). |
 
 The first five fields are identity and machine capability. They are always
-present, with or without a repository; steps 4 and 5 above validate the
-identity and version among them. The
-remaining fields are the repository diagnostics, reported when `doctor` runs
-inside a Git worktree: the repository and its common Git ownership, the
-populate mode, the default worktree root and whether it is inside the source
-repository, linked-worktree support, stale registrations, and retained
+present, with or without a repository; steps 3 and 4 above validate the
+identity and version among them. The remaining fields are repository
+diagnostics, reported when `doctor` runs inside a Git worktree: the repository
+and its common Git ownership, the populate mode, the default worktree root
+and whether it is inside the source repository, linked-worktree support,
+stale registrations, and retained
 baseline state.
 
 Outside a Git worktree `doctor` still succeeds: every repository field is JSON
@@ -289,6 +301,10 @@ that relaunches stable-named jobs must choose one of three procedures:
 - Generate a unique branch per run and keep the stable name in the provider's
   own job record rather than in Git.
 
+After a failed allocation, do not delete a branch merely because it exists:
+another process may have created it during allocation. Inspect the ref and
+registration first; see [allocation failure semantics](reference.md#where-worktrees-live).
+
 For disposable work against a historical commit without creating a branch:
 
 ```sh
@@ -361,6 +377,11 @@ Branches, including unmerged branches, remain available for ordinary Git
 integration. Only explicit user or operator authority for that particular
 worktree may permit destructive cleanup; an `--ephemeral` marker alone is
 never that authority.
+
+Do not use `gc --older-than 0s` as a follow-up to one job: GC selects *every*
+clean, unlocked ephemeral worktree in the repository, including a different
+provider's newly allocated job before its worker starts. Use the recorded
+`cleanup_token` for this job; schedule repository-wide GC separately.
 
 Safe cleanup is idempotent. When the target no longer resolves to a worktree —
 an earlier attempt already removed it, or the workspace is gone for some other

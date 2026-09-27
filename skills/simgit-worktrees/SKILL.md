@@ -13,7 +13,13 @@ One disposable workspace for one job is the common case, and this is the whole s
 
 ```sh
 # 1. Discover and verify — see "Discover and verify the executable"
-SIMGIT=$(command -v simgit || command -v sg)
+SIMGIT=$(command -v simgit || command -v sg) || exit 1
+case "$SIMGIT" in
+  /*) ;;
+  */*) SIMGIT="$(cd -P "${SIMGIT%/*}" && pwd -P)/${SIMGIT##*/}" ;;
+  *) echo "simgit discovery did not return an executable path" >&2; exit 1 ;;
+esac
+[ -f "$SIMGIT" ] && [ -x "$SIMGIT" ] || exit 1
 "$SIMGIT" doctor --json     # require top-level "identity": "simgit", or treat it as not installed
 
 # 2. Preflight, run again from the source repository — see "Preflight"
@@ -29,11 +35,9 @@ SIMGIT=$(command -v simgit || command -v sg)
 # 4. Launch the worker with its cwd set to path; it inspects, edits, commits, and integrates with
 #    ordinary git — see "Integrate and clean up"
 
-# 5. Clean up — see "Integrate and clean up"
+# 5. Clean up this job only — see "Integrate and clean up"
 "$SIMGIT" remove --json "$cleanup_token"    # add --delete-branch while the token still resolves,
                                             # once that branch is merged
-"$SIMGIT" gc --json --older-than 0s         # sweep leftovers; --older-than is never optional
-"$SIMGIT" prune --json                      # deregister stale entries, age out baselines
 ```
 
 A nonzero exit is the only failure signal: stdout is empty and stderr carries a one-line reason. Report that text verbatim; never retry a refusal by adding a destructive flag.
@@ -50,10 +54,13 @@ Leave the fast path for the cases that need judgement:
 ## Discover and verify the executable
 
 1. Resolve `command -v simgit`; only if it is absent, resolve `command -v sg`.
-2. Run the selected executable's top-level `doctor --json` command. It needs no repository and can be run from any directory.
-3. Parse the JSON and require the top-level `identity` field to be exactly `simgit`; reject a missing, invalid, or mismatched identity. (`product` also reads `simgit`, but `identity` is the field this contract is written against.) Do not trust a filename, banner, or unrelated command found earlier on `PATH`.
-4. Retain the verified executable path for every subsequent invocation.
-In the commands below, `simgit` means this verified absolute executable path, including when discovery selected the alias.
+2. Require a filesystem executable, not a shell alias or function. Some shells
+   return `./simgit` or `bin/simgit` for relative `PATH` entries; make that path
+   absolute *before* changing directories, as in the fast path above.
+3. Run the selected executable's top-level `doctor --json` command. It needs no repository and can be run from any directory.
+4. Parse the JSON and require the top-level `identity` field to be exactly `simgit`; reject a missing, invalid, or mismatched identity. (`product` also reads `simgit`, but `identity` is the field this contract is written against.) Do not trust a filename, banner, or unrelated command found earlier on `PATH`.
+5. Retain the verified absolute executable path for every subsequent invocation.
+In the commands below, `simgit` means this path, including when discovery selected the alias.
 
 If no candidate passes that identity check, follow **Install safely** below rather than silently changing the user's environment. That includes the common case where `simgit` is absent and the `sg` on `PATH` is a different tool — ast-grep ships an `sg` whose `sg --version` output is deceptively close to simgit's. A command that exists but fails the identity check is not a fallback; treat it as "no simgit installed".
 
@@ -100,11 +107,31 @@ The harness must retain `cleanup_token`, set the agent or benchmark process's cw
 
 The allocated directory is a normal linked Git worktree. Agents inspect, edit, commit, and integrate through ordinary Git; coordinators merge or rebase branches through normal Git workflows.
 
-On completion, give the unchanged `cleanup_token` to the provider's safe cleanup operation. Without a provider cleanup hook, run `simgit remove "$cleanup_token"`; the token is the absolute worktree path. Alternatively, run `simgit gc --older-than <age>`, which selects only ephemeral worktrees unless `--include-persistent` widens it. Always pass `--older-than` explicitly: it is an idle-age filter that defaults to 24h, so a bare `simgit gc` silently reaps nothing belonging to a job that just finished, and exits 0 while doing so. For cleanup right after a job, `--older-than 0s` is the correct value; anything a worktree is skipped for is reported in `skipped` with a reason, including `recently-active` for one that is merely younger than the filter. Prefer plain removal or GC with no destructive flag. Never append `--discard-dirty` or `--delete-unmerged` automatically. Worktree removal normally retains its branch, and cleanup must preserve unmerged branches.
+On completion, give the unchanged `cleanup_token` to the provider's safe cleanup
+operation. Without a provider cleanup hook, run `simgit remove "$cleanup_token"`;
+the token is the absolute worktree path. Removal normally retains its branch.
+Never append `--discard-dirty` or `--delete-unmerged` automatically.
+
+`gc` is a repository-wide sweep, not per-job cleanup: `gc --older-than 0s` can
+reap a *different*, clean ephemeral workspace while its provider is launching
+an agent there. Only run it in a separate maintenance pass that owns the
+repository-wide cleanup decision. Pass `--older-than <age>` explicitly (default
+24h); its `skipped` entries explain persistent, dirty, locked, and recently
+active worktrees. Never use a zero idle-age filter as an automatic follow-up
+to one job's removal.
 
 Delete a merged agent branch while its worktree still exists: `simgit remove --json --delete-branch "$cleanup_token"`. That is a safe operation — it refuses an unmerged branch — but it only works while the token still resolves to a worktree. Once the worktree is gone the path cannot name a branch, so `remove <absent-path> --delete-branch` is an error; use the branch name recorded at allocation instead: `simgit remove --json --delete-branch "$branch"`. Do this for every disposable job whose work was merged, or the generated `agent/<uuid>` branches accumulate in the repository permanently.
 
-Removal and GC do not reclaim the baseline cache, which lives inside the source repository at `.git/simgit/baselines` and holds one full tree per distinct base commit. To actually leave no trace, finish with `simgit prune --json`, which also deregisters stale Git worktree registrations and reports them in `pruned_registrations`. Plain `prune` keeps baselines used in the last seven days; `simgit prune --all --json` drops them all now. `--all` destroys no work — a dropped baseline is rematerialized on the next allocation that needs it — but it makes the next allocation pay full price, so use it when the job is finished rather than between jobs. Confirm with `doctor --json`: `baseline_cache.retained_bytes` is what the source repository is still carrying.
+Removal and GC do not reclaim the baseline cache, which lives inside the
+source repository at `.git/simgit/baselines` and holds one full tree per
+distinct base commit. `simgit prune --json` also deregisters stale Git
+worktree registrations and reports them in `pruned_registrations`; plain
+`prune` keeps baselines used in the last seven days. Run cache pruning as
+separate repository maintenance, not as a per-job cleanup step while other
+jobs may be allocating. `simgit prune --all --json` drops every baseline now;
+those trees rematerialize on future allocations, which then pay the full
+checkout cost. Confirm retained disk use with `doctor --json` and
+`baseline_cache.retained_bytes`.
 
 Never pass `--discard-dirty` for dirty worktrees or in-progress merges/rebases, and never pass `--delete-unmerged` for unmerged branches, unless the user has explicitly authorized discarding that specific work. Neither flag implies the other, and `--delete-unmerged` applies only alongside `--delete-branch` (removal) or `--delete-branches` (GC). If safe cleanup refuses, report the retained path and branch instead of weakening the safety checks. When it refuses because the worktree is dirty, `--commit -m "<message>"` is the preserving alternative: it commits the leftover changes to the workspace's own branch and then removes the worktree, losing nothing. It still writes a commit on the agent's behalf, so ask before using it — but it is the option to offer instead of abandoning the workspace.
 
@@ -121,5 +148,5 @@ Installation is a separate, approval-gated action:
 1. Ask before installing a user-level binary or changing shell configuration or `PATH`.
 2. Select and pin an explicit simgit release; do not install an unpinned latest build.
 3. On macOS, prefer an available Homebrew installation for that pinned release.
-4. Otherwise download the pinned release's installer to a temporary file, inspect it and its release/checksum inputs, then execute that local file only after approval. Never automatically execute a curl-pipe-shell command.
+4. Otherwise download the pinned release's installer to a temporary file, inspect it and its release/checksum inputs, then execute that local file only after approval. With `SIMGIT_VERSION=vX.Y.Z`, the installer verifies that the staged binary reports exactly `simgit X.Y.Z` before installing. Never automatically execute a curl-pipe-shell command.
 5. After installation, repeat executable discovery and require `doctor --json` to report the canonical `simgit` identity before use.
