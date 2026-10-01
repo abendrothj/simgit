@@ -45,12 +45,15 @@ Linux and in CI; do not treat them as gates on macOS.
   registrations) instead of an error. `cow_supported` is `true`/`false` when a
   probe could be written in the current directory and `null` when one could not;
   never report an unprobed directory as `false`.
-- `add` takes an optional branch (omitted means a generated `agent/<uuid>`) and
-  `--detach` for a branchless worktree. `add --json` returns `worktree`, `path`,
-  `cleanup_token`, `branch`, `base`, `mode`, and `ephemeral`. `--path` names the
-  worktree directory itself: an existing empty directory is accepted, a
-  non-empty one is refused, and two concurrent allocations to one path never
-  both succeed.
+- `add` takes an optional branch (omitted means a generated `agent/<uuid>`),
+  `--detach` for a branchless worktree, and `--attach <branch>` to check out an
+  existing branch at its current commit without moving it. `--attach` refuses a
+  missing branch and one already checked out anywhere, so a `cleanup_token`
+  always names a worktree that allocation created. `add --json` returns
+  `worktree`, `path`, `cleanup_token`, `branch`, `base`, `mode`, and
+  `ephemeral`. `--path` names the worktree directory itself: an existing empty
+  directory is accepted, a non-empty one is refused, and two concurrent
+  allocations to one path, or for one branch, never both succeed.
 - Every worktree path simgit prints or returns is symlink-resolved and lexically
   normalized, so one worktree always has exactly one string form. That includes
   `remove`'s `removed` whenever the target resolved to a real worktree. Only
@@ -108,9 +111,10 @@ this as a compatibility contract rather than a description:
   and skips locked ones, branch deletion stops at the merged check, `prune`
   drops only caches that rematerialize, `repair` only remounts, and `unlock`
   refuses a live owner with no override. Gates classify `doctor`, `list`,
-  `unlock`, `prune`, `repair` and flagless `add`/`remove`/`gc` as automatic on
-  that basis; a change that breaks it silently turns an approved command
-  destructive.
+  `unlock`, `prune`, `repair`, flagless `add`/`remove`/`gc`, and `add --attach`
+  (which checks out an existing branch without moving or deleting it) as
+  automatic on that basis; a change that breaks it silently turns an approved
+  command destructive.
 - `run` is the exception by design: it executes caller-supplied argv after
   `--`, so the argv, not the `run` invocation, is what a gate must judge.
 - Destructiveness is decidable from argv alone. Never make it depend on
@@ -149,6 +153,10 @@ second copy.
 - Allocate every agent worktree outside the source repository. Launch the agent
   with its working directory set to the absolute `path` returned by
   `simgit add --json`.
+- Allocate an existing branch, such as an open pull request's, with
+  `simgit add --json --attach <branch>` after fast-forwarding it with
+  `git fetch origin <branch>:<branch>`. Never use `--detach --base <branch>`
+  for it: commits on a detached HEAD move no branch.
 - Mark disposable automation `--ephemeral`. Ephemeral means eligible for safe
   cleanup; it is not permission to discard dirty files or unmerged commits.
 - Inspect the created worktree's JSON `mode`. Use `--require-cow` only when a

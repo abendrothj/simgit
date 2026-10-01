@@ -1,6 +1,6 @@
 ---
 name: simgit-worktrees
-description: Use when allocating or isolating autonomous-agent or benchmark work in Git worktrees, especially when copy-on-write capacity, disposable workspaces, detached historical runs, or safe automated cleanup matters.
+description: Use when allocating or isolating autonomous-agent or benchmark work in Git worktrees, including work on an existing branch such as an open pull request's, especially when copy-on-write capacity, disposable workspaces, detached historical runs, or safe automated cleanup matters.
 ---
 
 # simgit worktrees
@@ -44,11 +44,12 @@ A nonzero exit is the only failure signal: stdout is empty and stderr carries a 
 
 Leave the fast path for the cases that need judgement:
 
+- Work on a branch that already exists, such as an open pull request's — `--attach <branch>`, in **Allocate with JSON**.
 - Detached historical, branchless, or read-only work — `--detach --base <commit>`, in **Allocate with JSON**.
 - A task that a `git-checkout` fallback would invalidate — `--require-cow`, in **Allocate with JSON**.
 - Cleanup refused for a dirty worktree or an unmerged branch — **Integrate and clean up**. `--discard-dirty` and `--delete-unmerged` are never added automatically.
 - Cleanup refused by a stranded `run` lock — `simgit unlock`, in **Integrate and clean up**.
-- The source repository still carrying baselines — `simgit prune --all --json`, in **Integrate and clean up**.
+- The source repository still carrying baselines — `simgit prune --all --json`, in **Integrate and clean up**; `cache_busy: true` or an "in use" refusal means retry later.
 - No candidate passing the identity check — **Install safely**, which is approval-gated.
 
 ## Discover and verify the executable
@@ -92,12 +93,13 @@ Always request machine-readable output with the global `--json` flag and parse i
 
 - Disposable agent or benchmark work: the fast path above. Omitting the branch without `--detach` creates a collision-resistant `agent/<uuid>` branch.
 - Named branch work: add the desired branch argument and normally include `--ephemeral` when the workspace is disposable.
+- Work on a branch that already exists, such as an open pull request's: `simgit add --json --attach <branch> --ephemeral --path <absolute-outside-source-path>`. It checks the branch out at its current local commit without moving it; run `git fetch origin <branch>:<branch>` first to fast-forward it to the remote tip.
 - Historical, branchless build, comparison, or read-only disposable work: run `simgit add --json --detach --base <commit> --ephemeral --path <absolute-outside-source-path>`. This creates no branch.
 - Add `--require-cow` only when falling back to a full checkout would invalidate the task, such as by violating its disk or scaling budget. Otherwise allow the safe fallback.
 
 `--path` is the worktree directory itself, not a parent to allocate inside: generate a fresh unique path per allocation. Missing parents are created, and an existing *empty* directory is accepted, so a harness that pre-creates one directory per job works; a non-empty directory is refused. Reusing one path for two concurrent allocations is never valid — exactly one of them is allowed to proceed. A path inside the source repository is not refused, only warned about on stderr, and that warning never appears in `--json` output: keeping allocations outside the source repository stays your responsibility.
 
-`add` creates a branch and refuses one that already exists, naming `simgit run <branch> -- <command>` as the way to get a worktree for it. That is the situation after a removal that retained the branch, and whenever you are asked to rebase, fix, or update a branch that already exists, such as an open pull request's: use `run`, not a second `add`. Do not reach for `--detach --base <branch>` instead. Commits made on a detached HEAD never move the branch, so you would have to push by naming the remote branch and its old commit by hand, and the stale local branch keeps that old commit's baseline alive.
+`add` without `--attach` creates a branch and refuses one that already exists. For an existing branch use `add --attach`, which returns the same JSON record, or `simgit run <branch> -- <command>`, which reuses the branch's registered worktree but emits no JSON. Do not reach for `--detach --base <branch>`: commits on a detached HEAD never move the branch, so you would have to push by naming the remote branch and its old commit by hand, and the stale local branch keeps that old commit's baseline alive. `--attach` refuses a branch that is already checked out and names that worktree; work there instead of allocating another. Two allocations for one branch never both proceed: the second fails at once with "another simgit is already creating a worktree for branch", so wait for the first and use its worktree. Removing an attached worktree keeps the branch; delete it with `--delete-branch` only if the job owns it.
 
 Require a successful JSON response. `add --json` retains the top-level `worktree` path string and also returns top-level provider fields `path` and `cleanup_token`. Verify that `worktree`, `path`, and `cleanup_token` identify the same absolute removable worktree. Require top-level `branch` to be a string for a branch worktree and `null` for a detached worktree. After creation, inspect top-level `mode`: `cow-clone`, `overlay`, or `git-checkout`. Reject an unexpected mode, and reject `git-checkout` only when the task truly required CoW.
 
@@ -144,6 +146,8 @@ Cleanup is safe to run more than once. `simgit remove` on a target that no longe
 `--commit` removal has a seam worth knowing before you retry one: the commit happens first, and simgit never rolls it back if the removal then fails. Such a failure says which commit it kept — report that line verbatim — and repeating the identical command creates no second commit, because `--commit` only ever commits what the worktree still holds. The same is true of the directory a half-finished teardown leaves behind: an empty one is treated as already absent, while one that still holds files is refused rather than deleted.
 
 If cleanup is refused because the workspace is locked by a `simgit run` whose launcher died, run `simgit unlock <path>` to clear the stranded lock, then retry removal. `unlock` succeeds on a workspace that is not locked and on a target that no longer exists at all, so it is safe to run unconditionally during recovery. It refuses while the PID recorded in the lock still answers `kill(pid, 0)`, and two situations make that PID answer when a naive `ps` finds nothing useful: a killed launcher whose parent has not reaped it yet is a zombie and still answers, and a process the launcher spawned can outlive it in the same process group. So if `ps` on the named PID is empty or shows state `Z` and `unlock` still refuses, stop every surviving process in that launcher's process group (`pkill -g <pid>`; list them first with `ps -eo pid,pgid,stat,command`), let its parent reap it, and unlock again. There is no override flag; do not look for one.
+
+A killed `add`, or a `run` killed while still creating its workspace, needs nothing unlocked: its branch claim and baseline-cache lock are operating-system file locks released with the process, and the next allocation of that path takes over its path claim. It may leave a registered worktree it never finished populating, which shows every tracked file as deleted, so safe removal refuses it as dirty. No agent ever ran there; report the path rather than adding `--discard-dirty` yourself.
 
 ## Install safely
 

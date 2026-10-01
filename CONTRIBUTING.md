@@ -59,6 +59,14 @@ main checkout's `.git/simgit-run.lock`, succeeds on an unlocked target, and
 refuses while the recorded owner PID is still alive. It has no override flag by
 design — the correct answer to a live owner is to stop that process.
 
+Allocation is guarded by locks that need no recovery verb. `PathClaim` and
+`BranchClaim` in `sg/src/commands/worktree/locks.rs` let one allocation at a
+time hold a destination path or a branch, and `BaselineCacheLock` in
+`sg/src/commands/worktree/cow.rs` is held shared by an allocation while it uses
+a baseline and taken exclusively, without waiting, by `prune` to drop one. The
+branch claim and the cache lock are OS file locks that die with their process;
+new locks should follow that pattern or fail fast, never block indefinitely.
+
 `simgit doctor` is the preflight command agents and harnesses read before they
 start work. It runs anywhere: identity, version, filesystem, and CoW support
 are always reported, and the repository-dependent diagnostics are `null`

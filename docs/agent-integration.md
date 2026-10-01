@@ -20,6 +20,10 @@ Paste the following block verbatim into `AGENTS.md`:
 - Allocate every agent worktree outside the source repository. Launch the agent
   with its working directory set to the absolute `path` returned by
   `simgit add --json`.
+- Allocate an existing branch, such as an open pull request's, with
+  `simgit add --json --attach <branch>` after fast-forwarding it with
+  `git fetch origin <branch>:<branch>`. Never use `--detach --base <branch>`
+  for it: commits on a detached HEAD move no branch.
 - Mark disposable automation `--ephemeral`. Ephemeral means eligible for safe
   cleanup; it is not permission to discard dirty files or unmerged commits.
 - Inspect the created worktree's JSON `mode`. Use `--require-cow` only when a
@@ -290,11 +294,21 @@ choose the starting commit.
 A stable name is not automatically reusable. Safe cleanup deliberately retains
 branches, so a stable-named job's branch outlives its worktree and the next
 `add` with that branch fails with `branch '<name>' already exists`. A provider
-that relaunches stable-named jobs must choose one of three procedures:
+that relaunches stable-named jobs must choose one of four procedures:
 
+- Attach a fresh worktree: `simgit add --json --attach <branch> --ephemeral
+  --path "$ALLOCATED_PATH"` checks the existing branch out at its current commit
+  and returns the usual allocation record. It refuses a branch that is already
+  checked out, so the record's `cleanup_token` always names a worktree this
+  allocation created. This is also how to work on a branch the provider did not
+  create, such as an open pull request's: update the local branch first with
+  `git fetch origin <branch>:<branch>`, which only fast-forwards. Removing the
+  worktree keeps the branch; pass `--delete-branch` only for a branch the
+  provider owns.
 - Reuse instead of reallocating: `simgit run <branch> -- <command>` attaches to
   the branch's registered worktree, or creates one at the branch's current
-  commit when only the branch survives. This keeps the job's history.
+  commit when only the branch survives. This keeps the job's history, but `run`
+  emits no JSON record.
 - Delete the branch as part of cleanup, once its work is integrated, with
   `remove --delete-branch` (step 5). Safe deletion refuses an unmerged branch,
   so this never silently discards work.
@@ -383,6 +397,13 @@ clean, unlocked ephemeral worktree in the repository, including a different
 provider's newly allocated job before its worker starts. Use the recorded
 `cleanup_token` for this job; schedule repository-wide GC separately.
 
+Cache pruning is repository maintenance too, but it is safe to run while other
+jobs allocate: `prune` never removes a baseline an allocation is using and
+never waits for one. When an allocation holds the cache, plain
+`prune --json` keeps the baselines it would have dropped and reports
+`"cache_busy": true`, so a scheduled pass simply runs again later;
+`prune --all` fails instead, with a retry message on stderr.
+
 Safe cleanup is idempotent. When the target no longer resolves to a worktree —
 an earlier attempt already removed it, or the workspace is gone for some other
 reason — `remove` exits successfully and reports `"already_absent": true`
@@ -462,3 +483,13 @@ recovery sequence is:
    whose files, index, and branch are exactly as the crashed agent left them —
    or clean it up with the ordinary safe removal of step 5, which retains dirty
    work and unmerged branches instead of discarding what the agent produced.
+
+A killed `add`, or a `run` killed while it was still creating its workspace,
+needs nothing unlocked: the branch claim and the baseline-cache lock it held
+are operating-system file locks released with the process, and the next
+allocation takes over its path claim once the recorded PID is gone. It may
+leave a registered worktree it had not finished populating, which shows every
+tracked file as deleted, so safe removal refuses it as dirty. Since `add`
+never returned, no agent ever ran there and the provider holds no allocation
+record for it; report the path to the operator, whose explicit authority
+`remove --discard-dirty` still requires even though it loses nothing here.

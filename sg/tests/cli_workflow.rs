@@ -269,6 +269,90 @@ fn run_attaches_existing_branch_without_resetting_it() {
 }
 
 #[test]
+fn add_attach_checks_out_an_existing_branch_and_refuses_a_taken_one() {
+    let fixture = Fixture::new();
+    git(&fixture.repo, &["checkout", "-qb", "chat/test"]);
+    fs::write(fixture.repo.join("branch.txt"), "branch content").unwrap();
+    git(&fixture.repo, &["add", "."]);
+    git(&fixture.repo, &["commit", "-qm", "branch work"]);
+    git(&fixture.repo, &["checkout", "-q", "--detach", "HEAD~1"]);
+    let tip = || {
+        let output = Command::new("git")
+            .current_dir(&fixture.repo)
+            .args(["rev-parse", "--verify", "refs/heads/chat/test"])
+            .output()
+            .unwrap();
+        success(&output);
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let branch_tip = tip();
+    let attach = |path: &Path| {
+        fixture
+            .command()
+            .args([
+                "--json",
+                "add",
+                "--attach",
+                "chat/test",
+                "--ephemeral",
+                "--path",
+            ])
+            .arg(path)
+            .output()
+            .unwrap()
+    };
+
+    // --attach never creates the branch it was asked for.
+    let missing_path = fixture.root.join("missing");
+    let missing = fixture
+        .command()
+        .args(["--json", "add", "--attach", "chat/missing", "--path"])
+        .arg(&missing_path)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    assert!(!missing_path.exists());
+
+    let output = attach(&fixture.worktree);
+    success(&output);
+    let added: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let worktree = fixture.worktree.canonicalize().unwrap();
+    assert_eq!(added["branch"], "chat/test");
+    assert_eq!(added["base"], branch_tip.as_str());
+    assert_eq!(added["ephemeral"], true);
+    assert_eq!(added["cleanup_token"], worktree.to_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(worktree.join("branch.txt")).unwrap(),
+        "branch content"
+    );
+    assert_eq!(tip(), branch_tip);
+
+    // A second allocation must not be handed the first one's worktree: its
+    // cleanup token would remove a workspace it never created.
+    let taken_path = fixture.root.join("taken");
+    let taken = attach(&taken_path);
+    assert!(!taken.status.success());
+    assert!(taken.stdout.is_empty());
+    assert!(!taken_path.exists());
+    // The human diagnostic keeps the path verbatim (JSON collapses whitespace,
+    // and this fixture's path contains a tab), so it names where to work.
+    let named = fixture
+        .command()
+        .args(["add", "--attach", "chat/test", "--path"])
+        .arg(&taken_path)
+        .output()
+        .unwrap();
+    assert!(!named.status.success());
+    assert!(String::from_utf8_lossy(&named.stderr).contains(worktree.to_str().unwrap()));
+
+    // Removing an attached worktree keeps the branch it checked out.
+    success(&fixture.run(&["--json", "remove", worktree.to_str().unwrap()]));
+    assert!(!worktree.exists());
+    assert_eq!(tip(), branch_tip);
+}
+
+#[test]
 fn run_rejects_conflicting_options_and_add_remains_strict() {
     let fixture = Fixture::new();
     fixture.create(&[]);
@@ -1302,6 +1386,51 @@ fn concurrent_allocations_to_one_path_leave_one_removable_worktree() {
     success(&fixture.run(&["remove", token, "--delete-branch", "--json"]));
     assert!(!resolved.exists());
     assert!(!local_refs(&fixture.repo).contains("refs/heads/agent/"));
+}
+
+/// Two `add --attach` runs for one branch at different paths both used to
+/// succeed, because the "already checked out" check and the registration were
+/// separate steps: two worktrees then shared a branch, and a commit in one
+/// silently rewrote what the other saw. Exactly one may get the branch.
+#[test]
+fn concurrent_attaches_of_one_branch_leave_one_worktree_on_it() {
+    let fixture = Fixture::new();
+    git(&fixture.repo, &["branch", "chat/contested"]);
+    let racers: Vec<_> = (0..4)
+        .map(|index| {
+            fixture
+                .command()
+                .args(["--json", "add", "--attach", "chat/contested", "--path"])
+                .arg(fixture.root.join(format!("racer-{index}")))
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let outcomes: Vec<_> = racers
+        .into_iter()
+        .map(|racer| racer.wait_with_output().unwrap())
+        .collect();
+
+    let winners = outcomes
+        .iter()
+        .filter(|outcome| outcome.status.success())
+        .count();
+    assert_eq!(winners, 1, "{winners} allocations got one branch");
+    let registrations = Command::new("git")
+        .current_dir(&fixture.repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&registrations.stdout)
+            .lines()
+            .filter(|line| *line == "branch refs/heads/chat/contested")
+            .count(),
+        1,
+        "one branch is checked out in more than one worktree"
+    );
 }
 
 /// Harnesses pre-create one directory per job and pass it as `--path`. An

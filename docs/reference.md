@@ -57,23 +57,34 @@ already-safe name like `feature-x` is used as-is. Script against the
 Missing parents are created. The directory may already exist if it is empty —
 harnesses that pre-create one directory per job work — but a non-empty directory
 is refused, and two concurrent allocations to the same path can never both
-succeed. A destination inside the source repository is allowed but warned about
-on stderr: it becomes untracked clutter in `git status` and `git clean` can
-delete it, so pass a path outside the repository or set
-`SIMGIT_WORKTREE_ROOT`.
+succeed. Neither can two for the same branch, whether they create it or attach
+it: the second fails at once instead of waiting. A destination inside the
+source repository is allowed but warned about on stderr: it becomes untracked
+clutter in `git status` and `git clean` can delete it, so pass a path outside
+the repository or set `SIMGIT_WORKTREE_ROOT`.
 
-`add` creates a branch, so it refuses one that already exists and points at the
-command that does the right thing: `sg run <branch> -- <command>` attaches to
-that branch's worktree, or creates one at its current commit when only the
-branch survives — the situation you are in after a `remove` that retained the
-branch.
+`add` creates a branch, so it refuses one that already exists and names the two
+commands that get a worktree for it. `sg add --attach <branch>` checks the
+existing branch out at its current commit in a new worktree, with the same
+`--json` record as any `add`; it never moves the branch, and it refuses a branch
+that does not exist or that is already checked out in another worktree, naming
+that worktree, because a cleanup token must never name a workspace the caller
+did not create. `sg run <branch> -- <command>` attaches to the branch's
+registered worktree instead, or creates one when only the branch survives — the
+situation you are in after a `remove` that retained the branch.
 
-If allocation fails after checking that a branch name is available, another
-process may have claimed that name. simgit does not force-delete a branch it
-cannot prove it created. Git may also leave a branch behind after a partial
-`worktree add` failure; inspect any surviving branch before retrying or
-deleting it. After successful registration, a population failure instead
-attempts to roll back that worktree and the branch it created.
+Both use the local branch as it stands. To start from a newer remote tip, update
+the local branch first: `git fetch origin <branch>:<branch>` fast-forwards it and
+refuses when the two have diverged, rather than discarding local commits.
+
+If allocation fails after checking that a branch name is available, something
+outside simgit, such as a plain `git branch`, may have created that name;
+another simgit allocating the same branch fails at once instead. simgit does
+not force-delete a branch it cannot prove it created. Git may also leave a
+branch behind after a partial `worktree add` failure; inspect any surviving
+branch before retrying or deleting it. After successful registration, a
+population failure instead attempts to roll back that worktree and the branch
+it created.
 
 Worktrees are deliberately **not** placed inside `.git`: agent harnesses and
 editors treat everything under `.git/` as off-limits or invisible — Claude Code
@@ -154,6 +165,18 @@ It clears the lock wherever it lives: a linked worktree's lock is Git's own
 the recorded owner is still alive and names that PID — stop that process instead
 of looking for an override flag, because there is none. A lock file written
 before locks recorded a PID counts as unknown-owner and can be cleared.
+
+Allocating takes three more locks, and none of them needs `unlock`. An `add`,
+or a `run` that creates its workspace, claims the destination path and, when
+it names a branch, the branch, so two allocations for one path or one branch
+never both proceed; the second fails at once rather than waiting. While it
+uses a baseline it also holds the baseline cache lock shared, which keeps
+`prune` from removing that baseline (see [Baselines and `prune`](#baselines-and-prune)).
+The branch claims (`.git/simgit/claims/branches/`) and the cache lock
+(`.git/simgit/baselines.lock`) are operating-system file locks on files that
+are never deleted, so the kernel releases them when the process exits, however
+it exits. A path claim left by a killed allocator is taken over by the next
+allocation of that path once the PID it records is gone.
 
 Commands launched outside `sg run` are not tracked. Idle age uses index and
 directory modification time, so it is only a cleanup heuristic for explicitly

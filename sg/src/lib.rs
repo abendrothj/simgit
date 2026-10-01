@@ -20,7 +20,8 @@
 //!   worktree it still succeeds, reporting the repository-dependent fields as
 //!   null
 //! - `simgit add [branch]` — create a CoW linked worktree. Omitting the branch
-//!   generates a unique `agent/<uuid>` branch; `--detach` creates a detached
+//!   generates a unique `agent/<uuid>` branch; `--attach` checks out an
+//!   existing branch instead; `--detach` creates a detached
 //!   worktree and no ref at all (`--ephemeral` marks it for automatic `gc`,
 //!   `--json` reports `path`/`worktree`/`cleanup_token` and `branch`, which is
 //!   null when detached)

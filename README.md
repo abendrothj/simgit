@@ -96,13 +96,13 @@ rejects it, because it owns the child's stdout. Location is always `--path`.
 | Command | What it does |
 |---|---|
 | `sg doctor` | Identity, version, filesystem, `cow_supported`, worktree root, baseline cache, stale registrations. Exits 0 outside a repository, reporting every repository-dependent field as `null`. |
-| `sg add [BRANCH]` | Create a linked worktree on a new branch and print its path. Omit `BRANCH` for a generated `agent/<uuid>`; `--detach` for a branchless one. `--path`, `--base`, `--sparse <DIR>`, `--require-cow`, `--ephemeral`. |
+| `sg add [BRANCH]` | Create a linked worktree on a new branch and print its path. Omit `BRANCH` for a generated `agent/<uuid>`; `--detach` for a branchless one; `--attach` to check out an existing branch instead. `--path`, `--base`, `--sparse <DIR>`, `--require-cow`, `--ephemeral`. |
 | `sg list` | Every linked worktree with branch, path, persistence, lock state, and populate `mode`. |
 | `sg run [BRANCH] -- <cmd>` | Run a command inside a workspace, creating or reusing it. Omit `BRANCH` for an interactive picker. `--persistent`/`--ephemeral`; `--path`, `--base`, `--sparse`, `--require-cow` apply only when creating. |
 | `sg remove [TARGET]` | Remove a worktree by path or branch. `--commit -m <msg>`, `--delete-branch`, and the authority-gated `--discard-dirty` / `--delete-unmerged`. |
 | `sg unlock [TARGET]` | Clear a `run` lock stranded by a killed launcher. |
 | `sg gc` | Reap idle ephemeral worktrees. `--older-than <90s\|30m\|24h\|7d>` (default 24h), `--prefix`, `--delete-branches`, `--include-persistent`, `--discard-dirty`, `--delete-unmerged`, `--dry-run`. |
-| `sg prune` | Drop stale Git registrations, and cached baselines that are expired or that no ref reaches any more; `--all` reclaims every baseline now. |
+| `sg prune` | Drop stale Git registrations, and cached baselines that are expired or that no ref reaches any more, never one an allocation is using; `--all` reclaims every baseline now. |
 | `sg repair` | Remount overlay-backed worktrees after a reboot or interrupted mount (Linux). |
 
 There is no `--force`: the two operations that can destroy work name what they
@@ -125,6 +125,13 @@ git merge feat/my-feature
 
 # Remove the workspace, and the merged branch with it
 sg remove feat/my-feature --delete-branch
+```
+
+```bash
+# Work on a branch that already exists, such as an open pull request's:
+# fast-forward it from the remote, then check it out without moving it
+git fetch origin fix/login:fix/login
+cd "$(sg add --attach fix/login)"
 ```
 
 That was a real `.git/worktrees` linked checkout on its own branch, whose
@@ -197,6 +204,12 @@ Everything here is deliberate, and none of it is guessable:
   `add --json` returns, never against a formula.
 - **`--base`, `--sparse` and `--require-cow` are creation-only** and are
   rejected on reuse rather than silently ignored.
+- **`add` never touches an existing branch.** Plain `add` refuses one; `--attach`
+  checks it out at its current local commit and refuses one already checked out
+  anywhere. `git fetch origin <branch>:<branch>` first if you want the remote tip.
+- **`prune` never waits.** While another allocation is using the baseline cache,
+  plain `prune` keeps what it would have dropped and reports `cache_busy`, and
+  `prune --all` fails; run it again once the allocation finishes.
 
 > **Scope of isolation:** simgit separates Git branches, indexes, and working
 > trees. It is not a security sandbox and does not isolate processes, network,

@@ -28,7 +28,7 @@ pub use launch::{run_in_worktree, WorktreeRun};
 pub use locks::{unlock, WorktreeUnlock};
 pub use maintenance::{gc, prune, repair, WorktreeGc, WorktreePrune};
 
-use locks::{ensure_unlocked, PathClaim, WorktreeLock};
+use locks::{ensure_unlocked, BranchClaim, PathClaim, WorktreeLock};
 use maintenance::{delete_local_branch, prune_git_worktrees};
 
 #[cfg(test)]
@@ -39,12 +39,18 @@ use maintenance::{prune_baseline_cache, run_gc};
 #[derive(Args)]
 pub struct WorktreeAdd {
     /// Branch name to create (for example, feat/my-feature). When omitted,
-    /// creates a unique `agent/<uuid>` branch unless --detach is used.
+    /// creates a unique `agent/<uuid>` branch unless --detach is used. With
+    /// --attach, an existing branch to check out instead.
     pub branch: Option<String>,
 
     /// Create a detached worktree without creating or deleting a branch.
     #[arg(long, conflicts_with = "branch")]
     pub detach: bool,
+
+    /// Check out an existing branch at its current commit instead of creating
+    /// one. Refused when the branch is missing or already checked out.
+    #[arg(long, requires = "branch", conflicts_with = "base")]
+    pub attach: bool,
 
     /// Worktree path. Defaults to a slug of the branch under
     /// `../.simgit/<repo>/`.
@@ -127,7 +133,7 @@ pub fn add(mut args: WorktreeAdd, json: bool) -> Result<()> {
     if !args.detach && args.branch.is_none() {
         args.branch = Some(format!("agent/{}", Uuid::new_v4()));
     }
-    let created = create_worktree(&args, false)?;
+    let created = create_worktree(&args)?;
 
     if json {
         let path = created.target.display().to_string();
@@ -161,26 +167,38 @@ enum WorktreeKind {
     Detached,
 }
 
-fn create_worktree(args: &WorktreeAdd, attach: bool) -> Result<CreatedWorktree> {
+fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     let repo = discover_repo(&std::env::current_dir()?)?;
-    if attach && args.detach {
+    if args.attach && args.detach {
         bail!("cannot attach an existing branch with --detach");
     }
     let kind = if args.detach {
         WorktreeKind::Detached
-    } else if attach {
+    } else if args.attach {
         WorktreeKind::ExistingBranch
     } else {
         WorktreeKind::NewBranch
     };
     let branch = args.branch.as_deref();
+    // Checked and registered under one claim, so two allocations can never
+    // both find the branch free; see `BranchClaim`.
+    let _branch_claim = match branch {
+        Some(name) if kind != WorktreeKind::Detached => Some(BranchClaim::acquire(&repo, name)?),
+        _ => None,
+    };
     if kind == WorktreeKind::NewBranch {
         validate_new_branch(
             &repo,
             branch.context("branch is required unless --detach is used")?,
         )?;
-    } else if kind == WorktreeKind::ExistingBranch && args.base.is_some() {
-        bail!("--base cannot be used with an existing branch");
+    } else if kind == WorktreeKind::ExistingBranch {
+        if args.base.is_some() {
+            bail!("--base cannot be used with an existing branch");
+        }
+        validate_existing_branch(
+            &repo,
+            branch.context("existing worktree requires a branch")?,
+        )?;
     }
     if kind == WorktreeKind::Detached && branch.is_some() {
         bail!("a branch cannot be combined with --detach");
@@ -338,10 +356,37 @@ fn validate_new_branch(repo: &RepoContext, branch: &str) -> Result<()> {
         Some(1) => Ok(()),
         Some(0) => bail!(
             "branch '{branch}' already exists\n\
-             get a worktree for it with: simgit run {branch} -- <command>"
+             check it out with: simgit add --attach {branch}, \
+             or run a command in it with: simgit run {branch} -- <command>"
         ),
         _ => Err(git_failure("git show-ref --verify", &exists)),
     }
+}
+
+/// An attached branch must exist and must not be checked out anywhere yet:
+/// Git allows one worktree per branch, and the cleanup token `add` returns has
+/// to name a worktree this allocation created, never someone else's.
+fn validate_existing_branch(repo: &RepoContext, branch: &str) -> Result<()> {
+    let reference = format!("refs/heads/{branch}");
+    let exists = git_output_common(repo, ["show-ref", "--verify", "--quiet", &reference])?;
+    match exists.status.code() {
+        Some(0) => {}
+        Some(1) => bail!(
+            "branch '{branch}' does not exist\n\
+             create it with: simgit add {branch}"
+        ),
+        _ => return Err(git_failure("git show-ref --verify", &exists)),
+    }
+    if let Some(path) = worktree_path_for_branch(repo, branch)?
+        .or_else(|| overlay::worktree_for_branch(repo, branch))
+    {
+        bail!(
+            "branch '{branch}' is already checked out at {}\n\
+             run a command in it with: simgit run {branch} -- <command>",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn register_worktree(

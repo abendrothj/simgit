@@ -147,13 +147,13 @@ fn claim_contents() -> String {
 /// A stable file name for one destination path: claims live in a flat
 /// directory, and a worktree path contains separators and may be long.
 fn path_digest(path: &Path) -> String {
-    let hash = path
-        .as_os_str()
-        .as_encoded_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        });
+    key_digest(path.as_os_str().as_encoded_bytes())
+}
+
+fn key_digest(key: &[u8]) -> String {
+    let hash = key.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
     format!("{hash:016x}")
 }
 
@@ -211,6 +211,45 @@ impl Drop for PathClaim {
     fn drop(&mut self) {
         if let Err(error) = remove_file_if_present(&self.path) {
             eprintln!("could not release the worktree path claim: {error:#}");
+        }
+    }
+}
+
+/// An exclusive claim on one branch for the length of an allocation.
+///
+/// Checking that a branch is not checked out anywhere and then registering a
+/// worktree on it are separate steps, and Git's own check between them is no
+/// lock either: two allocations for one branch at different paths both used
+/// to finish, leaving two worktrees on one branch. The claim is an OS lock on
+/// a per-branch file that is never deleted, so a second allocator fails at
+/// once, a killed one releases it with its process, and there is no stale
+/// claim to take over.
+pub(super) struct BranchClaim {
+    _file: fs::File,
+}
+
+impl BranchClaim {
+    pub(super) fn acquire(repo: &RepoContext, branch: &str) -> Result<Self> {
+        let directory = state_dir(&repo.common_git_dir)
+            .join("claims")
+            .join("branches");
+        fs::create_dir_all(&directory).context("create the branch claim directory")?;
+        let path = directory.join(format!("{}.lock", key_digest(branch.as_bytes())));
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => bail!(
+                "another simgit is already creating a worktree for branch '{branch}'\n\
+                 wait for it to finish, then work in that worktree"
+            ),
+            Err(fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("claim the branch '{branch}'"))
+            }
         }
     }
 }

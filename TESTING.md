@@ -12,8 +12,10 @@ cargo clippy     # lint
 cargo fmt -- --check
 ```
 
-The CLI checks cover create/reuse/attach, persistence and GC selection, active
-workspace locks, failed launches, option validation, and argument passthrough.
+The CLI checks cover create/reuse/attach (including concurrent attaches of one
+branch), persistence and GC selection, active workspace locks, failed launches,
+option validation, and argument passthrough; the unit tests cover baseline
+pruning, including `prune` keeping a baseline an allocation holds.
 For the numbered picker, run the stdlib-only PTY test on macOS or Linux:
 
 ```bash
@@ -48,6 +50,11 @@ git init -q && git commit -q --allow-empty -m init
 "$sg" gc --older-than 0s --discard-dirty  # persistent workspace remains
 "$sg" remove feature-x --discard-dirty --delete-branch
 "$sg" --json remove feature-x           # already gone: exits 0, already_absent true
+git branch pr-x                         # stands in for an open pull request's branch
+"$sg" --json add --attach pr-x --ephemeral --path "$tmp-pr-x"  # existing branch, not moved
+"$sg" --json add --attach pr-x --path "$tmp-pr-y"  # refused: already checked out, names $tmp-pr-x
+"$sg" --json remove "$tmp-pr-x"         # the branch stays
+"$sg" --json prune                      # cache_busy false: no allocation is running
 ```
 
 In a script or CI, drop the two picker lines and pass the branch explicitly.

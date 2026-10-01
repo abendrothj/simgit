@@ -113,18 +113,16 @@ pub fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
             Some(1) => false,
             _ => return Err(git_failure("look up branch", &exists)),
         };
-        let created = create_worktree(
-            &WorktreeAdd {
-                branch: Some(branch.clone()),
-                detach: false,
-                path: args.path,
-                sparse: args.sparse,
-                base: args.base,
-                require_cow: args.require_cow,
-                ephemeral: args.ephemeral,
-            },
+        let created = create_worktree(&WorktreeAdd {
+            branch: Some(branch.clone()),
+            detach: false,
             attach,
-        )?;
+            path: args.path,
+            sparse: args.sparse,
+            base: args.base,
+            require_cow: args.require_cow,
+            ephemeral: args.ephemeral,
+        })?;
         eprintln!("mode: {}", created.mode.label());
         created.target
     };
