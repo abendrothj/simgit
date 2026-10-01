@@ -148,17 +148,25 @@ pub fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         branch.as_deref().unwrap_or("(detached)")
     );
     let (program, command_args) = args.command.split_first().context("command is required")?;
-    let status = match Command::new(program)
+    let spawned = Command::new(program)
         .args(command_args)
         .current_dir(&target)
-        .status()
-    {
+        .status();
+    lock.release()?;
+    let status = match spawned {
         Ok(status) => status,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => bail!(
-            "command not found: {}\nworkspace retained at {}",
-            program.to_string_lossy(),
-            target.display()
-        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Exit the way a shell does for a missing command, so a caller
+            // can tell "not found" from a command that ran and failed.
+            eprintln!(
+                "Error: command not found: {}\nworkspace retained at {}",
+                program.to_string_lossy(),
+                target.display()
+            );
+            io::stdout().flush()?;
+            io::stderr().flush()?;
+            std::process::exit(127);
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
@@ -169,10 +177,9 @@ pub fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
             })
         }
     };
-    lock.release()?;
     if !status.success() {
         // Collapsing every failure to 1 defeats `simgit run … && git merge …`
-        // and hides 127 (command not found). The lock is released and nothing
+        // and hides a child shell's 127. The lock is released and nothing
         // else is outstanding, so this process can adopt the child's status;
         // the retained-workspace notice stays on stderr.
         eprintln!(
@@ -198,12 +205,12 @@ fn child_exit_code(status: &ExitStatus) -> i32 {
 fn pick_worktree(repo: &RepoContext) -> Result<WorktreeEntry> {
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         bail!(
-            "workspace selection requires a terminal; pass a branch: sg run <branch> -- <command>"
+            "workspace selection requires a terminal; pass a branch: simgit run <branch> -- <command>"
         );
     }
     let mut entries = list_worktrees(repo)?;
     if entries.is_empty() {
-        bail!("no workspaces found; create one with sg run <branch> -- <command>");
+        bail!("no workspaces found; create one with simgit run <branch> -- <command>");
     }
     eprintln!("Choose a workspace:");
     for (index, entry) in entries.iter().enumerate() {

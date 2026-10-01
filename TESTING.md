@@ -34,27 +34,27 @@ selection from the tty and refuse to run without one (`workspace selection
 requires a terminal`). Every other line is safe to paste into a script.
 
 ```bash
-sg=$(pwd)/target/debug/simgit
+simgit=$(pwd)/target/debug/simgit
 tmp=$(mktemp -d) && cd "$tmp"
 git init -q && git commit -q --allow-empty -m init
 
-"$sg" doctor                            # identity, filesystem, CoW, worktree root
-(cd / && "$sg" --json doctor)           # outside a repo: repository fields null; cow_supported null (unwritable cwd)
-"$sg" run feature-x -- sh -c 'echo unfinished > scratch.txt'
-"$sg" run feature-x -- cat scratch.txt  # same workspace and files
-"$sg" run -- pwd                        # TTY ONLY: choose a workspace by number
-"$sg" run -- sh                         # TTY ONLY: choose any workspace for another harness/shell
-"$sg" list                              # branches, paths, persistence, locks
-"$sg" --json list                       # machine-readable
-"$sg" unlock feature-x                  # clear a stranded run lock; success when unlocked
-"$sg" gc --older-than 0s --discard-dirty  # persistent workspace remains
-"$sg" remove feature-x --discard-dirty --delete-branch
-"$sg" --json remove feature-x           # already gone: exits 0, already_absent true
-git branch pr-x                         # stands in for an open pull request's branch
-"$sg" --json add --attach pr-x --ephemeral --path "$tmp-pr-x"  # existing branch, not moved
-"$sg" --json add --attach pr-x --path "$tmp-pr-y"  # refused: already checked out, names $tmp-pr-x
-"$sg" --json remove "$tmp-pr-x"         # the branch stays
-"$sg" --json prune                      # cache_busy false: no allocation is running
+"$simgit" doctor                            # identity, filesystem, CoW, worktree root
+(cd / && "$simgit" --json doctor)           # outside a repo: repository fields null; cow_supported null (unwritable cwd)
+"$simgit" run feature-x -- sh -c 'echo unfinished > scratch.txt'
+"$simgit" run feature-x -- cat scratch.txt  # same workspace and files
+"$simgit" run -- pwd                        # TTY ONLY: choose a workspace by number
+"$simgit" run -- sh                         # TTY ONLY: choose any workspace for another harness/shell
+"$simgit" list                              # branches, paths, persistence, locks
+"$simgit" --json list                       # machine-readable
+"$simgit" unlock feature-x                  # clear a stranded run lock; success when unlocked
+"$simgit" gc --older-than 0s --discard-dirty  # persistent workspace remains
+"$simgit" remove feature-x --discard-dirty --delete-branch
+"$simgit" --json remove feature-x           # already gone: exits 0, already_absent true
+git branch pr-x                             # stands in for an open pull request's branch
+"$simgit" --json add --attach pr-x --ephemeral --path "$tmp-pr-x"  # existing branch, not moved
+"$simgit" --json add --attach pr-x --path "$tmp-pr-y"  # refused: already checked out, names $tmp-pr-x
+"$simgit" --json remove "$tmp-pr-x"         # the branch stays
+"$simgit" --json prune                      # cache_busy false: no allocation is running
 ```
 
 In a script or CI, drop the two picker lines and pass the branch explicitly.

@@ -61,8 +61,9 @@ Linux and in CI; do not treat them as gates on macOS.
   the target verbatim; never invent a resolved form for a worktree that is gone.
 - Every `git` child process is spawned with an explicit working directory, never
   an inherited one: these commands routinely delete the caller's cwd.
-- `run` exits with the child's exit status, or `128 + signal` when a signal
-  killed the child. The retained-workspace notice goes to stderr.
+- `run` exits with the child's exit status, `128 + signal` when a signal
+  killed the child, or `127` when the command cannot be found. The
+  retained-workspace notice goes to stderr.
 - `gc` explains itself: every worktree it considered but did not reap appears in
   `skipped` with a reason — `persistent`, `dirty`, `locked`, or
   `recently-active`. `--older-than` is an idle-age filter defaulting to 24h.

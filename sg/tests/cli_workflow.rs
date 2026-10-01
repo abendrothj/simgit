@@ -402,9 +402,9 @@ fn require_cow_rejects_forced_checkout_before_creating_branch() {
 fn failed_commands_retain_workspace_and_release_lock() {
     let fixture = Fixture::new();
     fixture.create(&[]);
-    for command in [
-        vec!["simgit-command-that-does-not-exist"],
-        vec!["sh", "-c", "exit 7"],
+    for (command, code) in [
+        (vec!["simgit-command-that-does-not-exist"], 127),
+        (vec!["sh", "-c", "exit 7"], 7),
     ] {
         let output = fixture
             .command()
@@ -412,7 +412,7 @@ fn failed_commands_retain_workspace_and_release_lock() {
             .args(command)
             .output()
             .unwrap();
-        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(code));
         assert!(fixture.worktree.is_dir());
         assert!(fixture.listed().get("locked").is_none());
     }

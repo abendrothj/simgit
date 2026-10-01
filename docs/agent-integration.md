@@ -170,7 +170,7 @@ success, and reports the stderr line verbatim rather than trying to parse it;
 empty stdout on a nonzero exit is the documented shape, not a malformed
 response. `run` is the exception to the whole contract: it streams the child's
 output, rejects `--json`, and exits with the child's own status (`128 + signal`
-when a signal killed the child).
+when a signal killed the child, `127` when the command cannot be found).
 
 A tool that classifies simgit invocations before they run — an approval gate or
 checkpointer, rather than an allocator — depends on a narrower promise: which

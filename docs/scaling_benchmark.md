@@ -1,6 +1,6 @@
 # Scaling benchmark — native CoW simgit worktrees vs `git worktree`
 
-`sg add` is now a thin wrapper around real Git linked worktrees. It uses
+`simgit add` is now a thin wrapper around real Git linked worktrees. It uses
 the same local filesystem and Git code paths as `git worktree`, but populates
 each checkout from one immutable baseline using APFS clones or Linux reflinks.
 There is no daemon, mount, synthetic `.git`, delta capture, or second commit.
@@ -25,26 +25,30 @@ disk figures. The simgit figure includes its one cached baseline and all linked
 worktrees. `tests/bench_worktree_io.py` separately warms both trees, alternates
 measurement order, and compares ordinary file operations.
 
-## Current native-worktree results
+## Per-file clone results (July 2026)
+
+These runs predate whole-tree cloning and index adoption (September 2026), so
+their setup times are superseded by the vscode results below; the disk figures
+still hold.
 
 macOS/APFS, 400 files, **67.2 MiB per checkout**, July 2, 2026:
 
-| Worktrees | Git `du` | `sg` `du` | Git setup | `sg` setup |
+| Worktrees | Git `du` | `simgit` `du` | Git setup | `simgit` setup |
 |---:|---:|---:|---:|---:|
 | 1 | 67.2 MiB | 134.4 MiB | 0.25 s | 0.74 s |
 | 2 | 134.4 MiB | 201.6 MiB | 0.45 s | 1.23 s |
 | 4 | 268.8 MiB | 336.0 MiB | 0.86 s | 2.24 s |
 | 8 | 537.5 MiB | 604.7 MiB | 1.66 s | 4.06 s |
 
-The `sg` `du` total is approximately `(N + 1) × tree`: N worktree paths plus
+The `simgit` `du` total is approximately `(N + 1) × tree`: N worktree paths plus
 one baseline path. That is expected clone accounting, not N+1 physical copies.
 Cold creation is slower because the first add creates one native checkout for
 the baseline and each add performs both Git registration and a recursive clone
 operation. The trade is setup latency for steady-state disk reduction; agents
 do not pay an I/O virtualization tax after creation.
 
-The same run's `df` deltas ranged from 46–51 MiB for `sg` and 46–530 MiB for
-Git. The non-monotonic `sg` values demonstrate the noise floor of volume-wide
+The same run's `df` deltas ranged from 46–51 MiB for `simgit` and 46–530 MiB for
+Git. The non-monotonic `simgit` values demonstrate the noise floor of volume-wide
 accounting; use the larger dedicated run below for the disk ratio.
 
 ### Physical allocation
@@ -78,7 +82,7 @@ tracked content** — with 8 worktrees on APFS, two runs each, September 8, 2026
 | Git worktrees | 4534–4536 MiB | 567 MiB | 14.0–14.2 s |
 | simgit worktrees | 640–650 MiB | 9.8–10.8 MiB after the baseline | 6.4–7.0 s |
 
-The `sg` figure is one materialized baseline (553 MiB) plus ~10 MiB of
+The `simgit` figure is one materialized baseline (553 MiB) plus ~10 MiB of
 per-worktree metadata, so total disk is `tree + N × 10 MiB` against
 `N × 567 MiB` here. That per-worktree constant is repository-specific — see
 [what a worktree actually costs](#what-a-worktree-actually-costs) — and
@@ -122,7 +126,7 @@ identical to the index `git update-index --really-refresh` writes** — pinned
 by `adopted_stat_data_equals_gits_own_refresh` — and Git's strict staleness
 checks are left untouched. Per worktree on vscode, warm baseline:
 
-| Path | `sg add` | First `git status` |
+| Path | `simgit add` | First `git status` |
 |---|---:|---:|
 | per-file clone + `read-tree` | 5.87 s | 0.10 s |
 | whole-tree clone + adopted index | 0.56 s | 0.11 s |
@@ -130,7 +134,7 @@ checks are left untouched. Per worktree on vscode, warm baseline:
 ### What a worktree actually costs
 
 The marginal worktree is filesystem and Git-index metadata. Measured end to
-end (`sg add`, warm baseline, `df` deltas over four worktrees, twice
+end (`simgit add`, warm baseline, `df` deltas over four worktrees, twice
 for the real repositories):
 
 | Repository | Entries | Avg path | Per worktree | B/entry | Index B/entry | % of tree |
@@ -180,7 +184,7 @@ technique pays least.
 > An earlier revision of this section reported ~0.30 KiB per path from
 > `clonefile`-only measurements, which omitted the per-worktree Git index copy
 > — 20–26% of the real cost — and did not test path length. The figures above
-> measure `sg add` end to end.
+> measure `simgit add` end to end.
 
 Baselines published before stat adoption carry no index and fall back to the
 per-file path, as does Linux, which has no directory-level reflink.
@@ -231,7 +235,7 @@ order in which `sparse-checkout set` materializes files itself.
 
 Hot-cache microbenchmark, 1,000 files × 16 KiB, six alternating rounds:
 
-| Operation | Git worktree | native CoW `sg` | Interpretation |
+| Operation | Git worktree | native CoW `simgit` | Interpretation |
 |---|---:|---:|---|
 | `stat()` | 1.45–2.03 µs/file | 1.66–2.05 µs/file | overlapping ranges |
 | open + read 4 KiB | 10.81–12.25 µs/file | 10.91–12.56 µs/file | overlapping ranges |
@@ -246,10 +250,10 @@ converge toward the Git worktree result.
 ## Disk model after edits
 
 ```text
-Git physical disk ≈ N × full tree
-sg physical disk  ≈ one cached baseline
-                    + private blocks changed in each worktree
-                    + compressed Git objects created by commits
+Git physical disk    ≈ N × full tree
+simgit physical disk ≈ one cached baseline
+                       + private blocks changed in each worktree
+                       + compressed Git objects created by commits
 ```
 
 There is no daemon delta store and no full-file commit capture in the native
@@ -262,7 +266,7 @@ of the sharing.
 | Approach | Agent I/O | Physical disk | Git/tool integration | Operational complexity | Best fit |
 |---|---|---|---|---|---|
 | Plain Git worktrees | Native; no first-write split | `N × tree` | Exact | Lowest | Few worktrees or small repos |
-| **Native CoW linked worktrees (`sg add`)** | Native reads; first write splits extents | `1 × baseline + changed extents` | Exact; real `.git/worktrees` entries | Low | Default for many local agents |
+| **Native CoW linked worktrees (`simgit add`)** | Native reads; first write splits extents | `1 × baseline + changed extents` | Exact; real `.git/worktrees` entries | Low | Default for many local agents |
 | Daemon native-CoW sessions | Native reads; capture/commit overhead | Baseline + changed extents + captured deltas | Synthetic Git proxy | Medium | Path leases, RPC lifecycle, telemetry |
 | Linux overlayfs | Lookup/overlay tax; whole-file copy-up | One lower + changed upper files | Good but mount-sensitive | Medium/high; privileges and whiteouts | Controlled Linux hosts |
 | FUSE/NFS/WinFSP VFS | Every operation crosses userspace/RPC | Git objects + deltas | Requires proxy behavior | Highest | Synchronous write-time rejection |
@@ -277,7 +281,7 @@ platform and latency costs.
 
 ## Platform behavior
 
-| OS/filesystem | `sg add` population | Result |
+| OS/filesystem | `simgit add` population | Result |
 |---|---|---|
 | macOS on APFS | `cp -c` clonefile | CoW disk sharing |
 | Linux on reflink-capable Btrfs/XFS | `cp --reflink=always` | CoW disk sharing |
@@ -285,8 +289,8 @@ platform and latency costs.
 | Linux without reflinks or `fuse-overlayfs` | capability probes fail | normal Git checkout fallback |
 | Windows | intentionally unsupported (ordinary NTFS lacks the required general reflink primitive) | use Git worktrees or WSL |
 
-Use `sg add --require-cow ...` in automation when falling back to N
-full checkouts would violate a disk budget. `sg prune` removes baselines unused
+Use `simgit add --require-cow ...` in automation when falling back to N full
+checkouts would violate a disk budget. `simgit prune` removes baselines unused
 for seven days or whose commit no ref reaches any more; active overlay lowerdirs
 remain protected even with `--all`.
 
@@ -306,7 +310,7 @@ cargo build -p simgit-cli
 bash tests/bench_scaling.sh
 
 # For the I/O comparison, create equivalent untouched git and simgit worktrees:
-python3 tests/bench_worktree_io.py /path/to/git-wt /path/to/sg-wt
+python3 tests/bench_worktree_io.py /path/to/git-wt /path/to/simgit-wt
 ```
 
 Use a tree of several hundred MiB for meaningful physical-allocation deltas and

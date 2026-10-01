@@ -14,15 +14,15 @@ duplicated, so an extra `microsoft/vscode` worktree costs **10 MiB instead of
 567 MiB**. There is no daemon and no server: **Git owns the refs, the filesystem
 owns the data.**
 
-`simgit` is the canonical executable. Every installation also provides `sg` as
-a fully equivalent short alias; examples below use the alias for brevity.
+`simgit` is the canonical executable, used in every example below. Every
+installation also provides `sg` as a fully equivalent short alias.
 
 ## What a worktree costs
 
 Plain `git worktree` gives each agent a full copy of the working tree — N
-agents × repo size on disk. `sg add` keeps the isolation and drops the
-duplication: every worktree is a real `.git/worktrees` checkout whose unchanged
-data is copy-on-write shared with one cached baseline (reflink, or a
+agents × repo size on disk. `simgit add` keeps the isolation and drops the
+duplication: every worktree is a real `.git/worktrees` checkout whose
+unchanged data is copy-on-write shared with one cached baseline (reflink, or a
 fuse-overlayfs mount where reflink is unavailable).
 
 The number that matters is the **marginal cost of one more worktree**, not a
@@ -38,8 +38,9 @@ APFS, `df` deltas, four worktrees per run:
 | 100k × 4 KiB files | 100,000 | 390 MiB | 398 MiB | **37.5–38.3 MiB** (9.4%) |
 | 200 × 8 MiB files | 200 | 1600 MiB | 1608 MiB | **107 KiB** (0.007%) |
 
-Roughly `60 KiB + 0.4 KiB × tracked-paths` per worktree, so 5k paths cost
-~2 MiB and 250k cost ~110 MiB. Estimate yours:
+Roughly `60 KiB + 0.4–0.6 KiB × tracked-paths` per worktree, the upper end for
+long, deeply nested paths, so 5k paths cost 2–3 MiB and 250k cost 100–150 MiB.
+Estimate yours:
 
 ```bash
 git ls-files | wc -l
@@ -57,7 +58,7 @@ one `clonefile(2)` call and the worktree adopts the baseline's index.
 > clonefile/reflink block sharing, so a CoW worktree looks like a full copy to
 > it. Only `df` shows what a worktree actually allocated.
 
-Method, hardware, and full results:
+Method and full results:
 [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
 
 ## Install
@@ -95,15 +96,15 @@ rejects it, because it owns the child's stdout. Location is always `--path`.
 
 | Command | What it does |
 |---|---|
-| `sg doctor` | Identity, version, filesystem, `cow_supported`, worktree root, baseline cache, stale registrations. Exits 0 outside a repository, reporting every repository-dependent field as `null`. |
-| `sg add [BRANCH]` | Create a linked worktree on a new branch and print its path. Omit `BRANCH` for a generated `agent/<uuid>`; `--detach` for a branchless one; `--attach` to check out an existing branch instead. `--path`, `--base`, `--sparse <DIR>`, `--require-cow`, `--ephemeral`. |
-| `sg list` | Every linked worktree with branch, path, persistence, lock state, and populate `mode`. |
-| `sg run [BRANCH] -- <cmd>` | Run a command inside a workspace, creating or reusing it. Omit `BRANCH` for an interactive picker. `--persistent`/`--ephemeral`; `--path`, `--base`, `--sparse`, `--require-cow` apply only when creating. |
-| `sg remove [TARGET]` | Remove a worktree by path or branch. `--commit -m <msg>`, `--delete-branch`, and the authority-gated `--discard-dirty` / `--delete-unmerged`. |
-| `sg unlock [TARGET]` | Clear a `run` lock stranded by a killed launcher. |
-| `sg gc` | Reap idle ephemeral worktrees. `--older-than <90s\|30m\|24h\|7d>` (default 24h), `--prefix`, `--delete-branches`, `--include-persistent`, `--discard-dirty`, `--delete-unmerged`, `--dry-run`. |
-| `sg prune` | Drop stale Git registrations, and cached baselines that are expired or that no ref reaches any more, never one an allocation is using; `--all` reclaims every baseline now. |
-| `sg repair` | Remount overlay-backed worktrees after a reboot or interrupted mount (Linux). |
+| `simgit doctor` | Identity, version, filesystem, `cow_supported`, worktree root, baseline cache, stale registrations. Exits 0 outside a repository, reporting every repository-dependent field as `null`. |
+| `simgit add [BRANCH]` | Create a linked worktree on a new branch and print its path. Omit `BRANCH` for a generated `agent/<uuid>`; `--detach` for a branchless one; `--attach` to check out an existing branch instead. `--path`, `--base`, `--sparse <DIR>`, `--require-cow`, `--ephemeral`. |
+| `simgit list` | Every linked worktree with branch, path, persistence, lock state, and populate `mode`. |
+| `simgit run [BRANCH] -- <cmd>` | Run a command inside a workspace, creating or reusing it. Omit `BRANCH` for an interactive picker. `--persistent`/`--ephemeral`; `--path`, `--base`, `--sparse`, `--require-cow` apply only when creating. |
+| `simgit remove [TARGET]` | Remove a worktree by path or branch. `--commit -m <msg>`, `--delete-branch`, and the authority-gated `--discard-dirty` / `--delete-unmerged`. |
+| `simgit unlock [TARGET]` | Clear a `run` lock stranded by a killed launcher. |
+| `simgit gc` | Reap idle ephemeral worktrees. `--older-than <90s\|30m\|24h\|7d>` (default 24h), `--prefix`, `--delete-branches`, `--include-persistent`, `--discard-dirty`, `--delete-unmerged`, `--dry-run`. |
+| `simgit prune` | Drop stale Git registrations, and cached baselines that are expired or that no ref reaches any more, never one an allocation is using; `--all` reclaims every baseline now. |
+| `simgit repair` | Remount overlay-backed worktrees after a reboot or interrupted mount (Linux). |
 
 There is no `--force`: the two operations that can destroy work name what they
 destroy, and `--delete-unmerged` requires `--delete-branch`/`--delete-branches`
@@ -113,7 +114,7 @@ beside it.
 
 ```bash
 # Create a CoW linked worktree on a new branch and cd into it
-cd "$(sg add feat/my-feature)"
+cd "$(simgit add feat/my-feature)"
 
 # It's a standard linked checkout — every git command and hook just works
 git add -A
@@ -124,40 +125,40 @@ cd -
 git merge feat/my-feature
 
 # Remove the workspace, and the merged branch with it
-sg remove feat/my-feature --delete-branch
+simgit remove feat/my-feature --delete-branch
 ```
 
 ```bash
 # Work on a branch that already exists, such as an open pull request's:
 # fast-forward it from the remote, then check it out without moving it
 git fetch origin fix/login:fix/login
-cd "$(sg add --attach fix/login)"
+cd "$(simgit add --attach fix/login)"
 ```
 
 That was a real `.git/worktrees` linked checkout on its own branch, whose
 unchanged files shared physical disk with one cached baseline instead of being
-copied. `sg run` does not emulate Git or intercept commands: it sets the child's
-working directory to that checkout, and Git does the rest.
+copied. `simgit run` does not emulate Git or intercept commands: it sets the
+child's working directory to that checkout, and Git does the rest.
 
 ## Running agents
 
 ```bash
 # Launch an agent's normal terminal interface in its own workspace
-sg run chat/auth -- claude
-sg run chat/api -- codex
+simgit run chat/auth -- claude
+simgit run chat/api -- codex
 
 # Return to the same workspace and let the agent resume its conversation
-sg run chat/auth -- claude --continue
-sg run chat/api -- codex resume --last
+simgit run chat/auth -- claude --continue
+simgit run chat/api -- codex resume --last
 
 # Or pick the workspace interactively, independently of the agent
-sg run -- claude --continue
+simgit run -- claude --continue
 
 # Disposable automation: `run` exits with the child's status, so `&&` gates the
 # merge on the agent actually succeeding, and `0s` reaps a just-used workspace
-sg run agent/test --ephemeral -- codex exec "implement the API" &&
+simgit run agent/test --ephemeral -- codex exec "implement the API" &&
   git merge agent/test &&
-  sg gc --prefix agent/test --older-than 0s --delete-branches
+  simgit gc --prefix agent/test --older-than 0s --delete-branches
 ```
 
 Omitting the branch opens a numbered picker over existing workspaces, including
@@ -170,26 +171,26 @@ A workspace stores no preferred agent: the same one can be selected for Claude,
 Codex, a shell, or anything else. Those tools' `--continue` and `resume --last`
 select *conversations*; simgit's picker selects *files and branches*.
 
-`run` retains the worktree after the child exits and exits with the child's own
-status — the child's code normally, `128 + signal` when a signal killed it, so
-`127` still means "command not found". The notice naming the retained workspace
-goes to stderr, never into the child's stdout. `--ephemeral` only makes a
-workspace *eligible* for GC; it is never authority to discard dirty files or
-unmerged commits.
+`run` retains the worktree after the child exits and exits the way a shell
+would: with the child's own code, `128 + signal` when a signal killed it, and
+`127` when the command cannot be found. The notice naming the retained
+workspace goes to stderr, never into the child's stdout.
+`--ephemeral` only makes a workspace *eligible* for GC; it is never authority to
+discard dirty files or unmerged commits.
 
 ## Sharp edges
 
 Everything here is deliberate, and none of it is guessable:
 
 - **`run` workspaces are persistent by default.** GC reaps only ephemeral ones
-  unless you pass `--include-persistent`. Automation that relied on `run`
-  creating disposable workspaces must now pass `--ephemeral`.
+  unless you pass `--include-persistent`. Automation that wants disposable
+  workspaces must pass `--ephemeral`.
 - **`--older-than` is an idle-age filter, not a delay.** It selects workspaces
   untouched for at least that long and defaults to 24h, so reaping a workspace
   you just used takes an explicit `0s`.
-- **A killed launcher keeps its lock on purpose.** `sg unlock [TARGET]` clears
-  it, refuses while the recorded owner PID is alive and names that PID, and
-  there is no override flag.
+- **A killed launcher keeps its lock on purpose.** `simgit unlock [TARGET]`
+  clears it, refuses while the recorded owner PID is alive and names that PID,
+  and there is no override flag.
 - **Cleanup is idempotent.** `remove` on an absent target exits 0 with
   `already_absent: true`, and `unlock` on an unlocked or absent target exits 0
   with `was_locked: false`, so retried cleanup is safe. Two cases still error:
@@ -217,20 +218,20 @@ Everything here is deliberate, and none of it is guessable:
 
 ## Keeping the cost down
 
-- **Check out only what the agent needs:** `sg add agent/api --sparse
+- **Check out only what the agent needs:** `simgit add agent/api --sparse
   services/api --sparse libs/shared`, repeatable, Git cone-mode. Both the files
   and the index shrink with the cone — on the 100k × 4 KiB tree, one directory
   of ten costs **3.8 MiB per worktree instead of 37.9 MiB**. Paths outside the
   cone are `skip-worktree`, so status, commits and merges behave normally, but
   the agent cannot see or build against them.
 - **On Linux with `fuse-overlayfs`, prefer overlay mode:**
-  `SIMGIT_POPULATE=overlay sg add …`. Its `upperdir` starts empty, so it pays no
-  per-file metadata regardless of entry count, trading that for FUSE overhead on
-  every read. The magnitude is unmeasured; the direction is sound.
+  `SIMGIT_POPULATE=overlay simgit add …`. Its `upperdir` starts empty, so it
+  pays no per-file metadata regardless of entry count, trading that for FUSE
+  overhead on every read. The magnitude is unmeasured; the direction is sound.
 - **Keep worktrees on one base commit.** A second *baseline* is a whole tree;
-  `sg prune` reports and reclaims that cache.
-- **Reuse workspaces instead of creating them.** `sg run <branch>` attaches to
-  an existing worktree, so a stable set of agent workspaces costs a stable
+  `simgit prune` reports and reclaims that cache.
+- **Reuse workspaces instead of creating them.** `simgit run <branch>` attaches
+  to an existing worktree, so a stable set of agent workspaces costs a stable
   amount of disk.
 
 ## Platform support

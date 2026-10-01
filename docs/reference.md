@@ -4,7 +4,7 @@ Detailed semantics for the flat command surface
 (`simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair`).
 [README.md](../README.md) is the overview; this file is the contract each
 command actually implements. `simgit` is the canonical executable and `sg` is an
-equivalent alias; examples use `sg`.
+equivalent alias; examples use `simgit`.
 
 ## Removal and unlock semantics
 
@@ -64,12 +64,12 @@ clutter in `git status` and `git clean` can delete it, so pass a path outside
 the repository or set `SIMGIT_WORKTREE_ROOT`.
 
 `add` creates a branch, so it refuses one that already exists and names the two
-commands that get a worktree for it. `sg add --attach <branch>` checks the
+commands that get a worktree for it. `simgit add --attach <branch>` checks the
 existing branch out at its current commit in a new worktree, with the same
 `--json` record as any `add`; it never moves the branch, and it refuses a branch
 that does not exist or that is already checked out in another worktree, naming
 that worktree, because a cleanup token must never name a workspace the caller
-did not create. `sg run <branch> -- <command>` attaches to the branch's
+did not create. `simgit run <branch> -- <command>` attaches to the branch's
 registered worktree instead, or creates one when only the branch survives — the
 situation you are in after a `remove` that retained the branch.
 
@@ -96,10 +96,10 @@ normal `.git/worktrees/` registry, and the cached baseline stays internal in
 
 ## What the agent sees
 
-`sg run` does not emulate Git or intercept Git commands. It launches the child
-with its working directory set to a real, registered linked worktree. From the
-agent's perspective it is an ordinary repository: `git status`, `diff`, `add`,
-`commit`, `restore`, `switch`, `merge`, `rebase`, `cherry-pick`, hooks,
+`simgit run` does not emulate Git or intercept Git commands. It launches the
+child with its working directory set to a real, registered linked worktree.
+From the agent's perspective it is an ordinary repository: `git status`, `diff`,
+`add`, `commit`, `restore`, `switch`, `merge`, `rebase`, `cherry-pick`, hooks,
 attributes and ignores work through Git itself. The files are ordinary local
 files; copy-on-write is handled below Git by the filesystem.
 
@@ -118,7 +118,7 @@ or rebase it:
 ```bash
 git log agent/auth
 git merge agent/auth
-sg gc --older-than 0s --delete-branches
+simgit gc --older-than 0s --delete-branches
 ```
 
 ## Reuse, persistence, and populate backends
@@ -156,7 +156,7 @@ While a command launched by `run` is active, its linked worktree is locked
 against removal and GC, including `--discard-dirty`. A second `run` in the same
 workspace is refused until the first exits. The lock file records the launcher's
 PID. If the launcher is killed the lock is deliberately retained; recover it
-with `sg unlock [TARGET]`, where TARGET is a workspace path or branch that
+with `simgit unlock [TARGET]`, where TARGET is a workspace path or branch that
 defaults to the workspace containing the current directory.
 
 It clears the lock wherever it lives: a linked worktree's lock is Git's own
@@ -178,7 +178,7 @@ are never deleted, so the kernel releases them when the process exits, however
 it exits. A path claim left by a killed allocator is taken over by the next
 allocation of that path once the PID it records is gone.
 
-Commands launched outside `sg run` are not tracked. Idle age uses index and
+Commands launched outside `simgit run` are not tracked. Idle age uses index and
 directory modification time, so it is only a cleanup heuristic for explicitly
 disposable workspaces.
 
