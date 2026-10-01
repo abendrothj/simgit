@@ -33,7 +33,9 @@
 //!   launcher that was killed, unless the process holding it is still alive
 //! - `simgit gc` — reap idle/ephemeral worktrees and optionally branches
 //! - `simgit repair` — remount interrupted Linux overlay worktrees
-//! - `simgit prune` — prune stale worktree administrative entries
+//! - `simgit prune` — prune stale worktree registrations and cached baselines
+//!   unused for seven days or whose commit nothing reaches, never one an
+//!   allocation is using
 //!
 //! `--json` is a global flag: it is accepted before or after the command name.
 //!
@@ -86,7 +88,7 @@ enum Commands {
     Unlock(commands::worktree::WorktreeUnlock),
     /// Reap idle/ephemeral worktrees (e.g. abandoned agent sandboxes).
     Gc(commands::worktree::WorktreeGc),
-    /// Prune stale Git registrations and old cached baselines.
+    /// Prune stale Git registrations and old or unreachable cached baselines.
     Prune(commands::worktree::WorktreePrune),
     /// Remount overlay-backed worktrees after a reboot or interrupted mount.
     Repair,

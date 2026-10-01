@@ -97,7 +97,7 @@ Always request machine-readable output with the global `--json` flag and parse i
 
 `--path` is the worktree directory itself, not a parent to allocate inside: generate a fresh unique path per allocation. Missing parents are created, and an existing *empty* directory is accepted, so a harness that pre-creates one directory per job works; a non-empty directory is refused. Reusing one path for two concurrent allocations is never valid — exactly one of them is allowed to proceed. A path inside the source repository is not refused, only warned about on stderr, and that warning never appears in `--json` output: keeping allocations outside the source repository stays your responsibility.
 
-`add` creates a branch and refuses one that already exists, naming `simgit run <branch> -- <command>` as the way to get a worktree for it. That is the situation after a removal that retained the branch: use `run`, not a second `add`.
+`add` creates a branch and refuses one that already exists, naming `simgit run <branch> -- <command>` as the way to get a worktree for it. That is the situation after a removal that retained the branch, and whenever you are asked to rebase, fix, or update a branch that already exists, such as an open pull request's: use `run`, not a second `add`. Do not reach for `--detach --base <branch>` instead. Commits made on a detached HEAD never move the branch, so you would have to push by naming the remote branch and its old commit by hand, and the stale local branch keeps that old commit's baseline alive.
 
 Require a successful JSON response. `add --json` retains the top-level `worktree` path string and also returns top-level provider fields `path` and `cleanup_token`. Verify that `worktree`, `path`, and `cleanup_token` identify the same absolute removable worktree. Require top-level `branch` to be a string for a branch worktree and `null` for a detached worktree. After creation, inspect top-level `mode`: `cow-clone`, `overlay`, or `git-checkout`. Reject an unexpected mode, and reject `git-checkout` only when the task truly required CoW.
 
@@ -126,11 +126,15 @@ Removal and GC do not reclaim the baseline cache, which lives inside the
 source repository at `.git/simgit/baselines` and holds one full tree per
 distinct base commit. `simgit prune --json` also deregisters stale Git
 worktree registrations and reports them in `pruned_registrations`; plain
-`prune` keeps baselines used in the last seven days. Run cache pruning as
-separate repository maintenance, not as a per-job cleanup step while other
-jobs may be allocating. `simgit prune --all --json` drops every baseline now;
-those trees rematerialize on future allocations, which then pay the full
-checkout cost. Confirm retained disk use with `doctor --json` and
+`prune` drops a baseline unused for seven days, or one whose commit no ref or
+detached worktree reaches any more. It never removes a baseline another job's
+allocation is using and never waits for one: plain `prune` then keeps every
+baseline it would have dropped and reports `cache_busy: true`, so run it again
+later, and `simgit prune --all --json` fails instead, to be retried. Still run
+cache pruning as repository maintenance rather than after every job, because
+`simgit prune --all --json` drops every baseline now; those trees rematerialize
+on future allocations, which then pay the full checkout cost. Confirm retained
+disk use with `doctor --json` and
 `baseline_cache.retained_bytes`.
 
 Never pass `--discard-dirty` for dirty worktrees or in-progress merges/rebases, and never pass `--delete-unmerged` for unmerged branches, unless the user has explicitly authorized discarding that specific work. Neither flag implies the other, and `--delete-unmerged` applies only alongside `--delete-branch` (removal) or `--delete-branches` (GC). If safe cleanup refuses, report the retained path and branch instead of weakening the safety checks. When it refuses because the worktree is dirty, `--commit -m "<message>"` is the preserving alternative: it commits the leftover changes to the workspace's own branch and then removes the worktree, losing nothing. It still writes a commit on the agent's behalf, so ask before using it — but it is the option to offer instead of abandoning the workspace.

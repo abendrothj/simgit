@@ -286,9 +286,9 @@ platform and latency costs.
 | Windows | intentionally unsupported (ordinary NTFS lacks the required general reflink primitive) | use Git worktrees or WSL |
 
 Use `sg add --require-cow ...` in automation when falling back to N
-full checkouts would violate a disk budget. Baselines unused for seven days are
-removed by `sg prune`; active overlay lowerdirs remain protected even
-with `--all`.
+full checkouts would violate a disk budget. `sg prune` removes baselines unused
+for seven days or whose commit no ref reaches any more; active overlay lowerdirs
+remain protected even with `--all`.
 
 ## Historical benchmark note
 

@@ -186,7 +186,7 @@ one exists.
 | `remove` | `removed`, `already_absent`, `branch_deleted`, `committed`, `commit` |
 | `unlock` | `unlocked`, `was_locked`, `owner_pid` |
 | `gc` | `reaped`, `skipped`, `deleted_branches`, `retained_branches`, `dry_run` |
-| `prune` | `pruned`, `pruned_registrations`, `retained`, `retained_bytes` |
+| `prune` | `pruned`, `pruned_registrations`, `retained`, `retained_bytes`, `cache_busy` |
 
 `doctor` exits 0 outside a Git worktree: identity, version and filesystem are
 always reported, and every repository-dependent field is `null` rather than an
@@ -222,11 +222,26 @@ registrations — entries whose directory is gone — listing their paths in
 reclaims the baseline cache, reporting what that cache still costs in both
 formats (`retained_bytes` in JSON).
 
-One baseline is materialized per distinct base commit and kept for seven days,
-so branching from several commits costs one full tree each until pruned;
-`prune --all` drops every cached baseline immediately, including recently used
-ones, and is the way to reclaim that space without waiting out the seven-day
-window. A dropped baseline is rematerialized on the next `add` that needs it.
+One baseline is materialized per distinct base commit, so branching from several
+commits costs one full tree each until pruned. Plain `prune` drops a baseline
+once it has gone unused for seven days, or as soon as no ref and no detached
+worktree HEAD reaches its commit any more — the leftover of a rebase and
+force-push, or of a deleted branch, which only an explicit object id could ask
+for again. `prune --all` drops every cached baseline immediately, including
+recently used and still-reachable ones. A dropped baseline is rematerialized on
+the next `add` that needs it.
+
+Neither form removes a baseline an allocation is using, and neither waits for
+one. An `add` or `run` that is creating a worktree holds the cache lock from
+the moment it uses a baseline until it has finished populating the worktree,
+and `prune` removes baselines only while it holds that lock itself. When an
+allocation holds it, plain `prune` keeps every baseline it would have dropped,
+reports `cache_busy: true` (and a line saying so in human output), and should
+simply be run again later; `prune --all` fails instead, because it promises an
+empty cache, and can be retried once the allocation finishes. Building a
+baseline for the first time happens before the lock is taken, so a slow first
+checkout does not hold `prune` off.
+
 Compare the retained baseline cost directly with the marginal cost of each
 additional worktree; the savings depend on repository shape, not a fixed
 multiplier.

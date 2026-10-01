@@ -422,7 +422,7 @@ fn concurrent_baseline_creation_publishes_one_complete_tree() -> Result<()> {
         handles.push(std::thread::spawn(move || -> Result<PathBuf> {
             let repo = discover_repo(&repo_path)?;
             barrier.wait();
-            cow::ensure_baseline(&repo, &commit)
+            cow::ensure_baseline(&repo, &commit).map(|baseline| baseline.tree)
         }));
     }
     let paths = handles
@@ -450,13 +450,60 @@ fn incomplete_published_baseline_is_not_deleted_implicitly() -> Result<()> {
 }
 
 #[test]
+fn prune_leaves_a_baseline_an_allocation_holds() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let output = git_output_common(
+        &repo,
+        ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "orphan"],
+    )?;
+    if !output.status.success() {
+        return Err(git_failure("git commit-tree", &output));
+    }
+    let orphan = String::from_utf8(output.stdout)?.trim().to_owned();
+
+    // An allocation using a baseline holds the cache lock shared, so even one
+    // nothing reaches is kept, plain prune says why, and --all refuses.
+    let in_use = cow::ensure_baseline(&repo, &orphan)?;
+    let tree = in_use.tree.clone();
+    let busy = prune_baseline_cache(&repo, false, &HashSet::new)?;
+    assert!(busy.cache_busy);
+    assert!(busy.removed.is_empty(), "{:?}", busy.removed);
+    assert!(prune_baseline_cache(&repo, true, &HashSet::new).is_err());
+    assert!(tree.join("file.txt").is_file());
+
+    drop(in_use);
+    let freed = prune_baseline_cache(&repo, false, &HashSet::new)?;
+    assert!(!freed.cache_busy);
+    assert_eq!(freed.removed, vec![orphan]);
+    assert!(!tree.exists());
+    Ok(())
+}
+
+#[test]
+fn prune_finishes_deleting_what_a_killed_prune_moved_aside() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    // A fresh `ready` must not make it look like a build in progress.
+    let moved = state_dir(&repo.common_git_dir)
+        .join("baselines")
+        .join(format!(".doomed-{}-1", "a".repeat(40)));
+    fs::create_dir_all(moved.join("tree"))?;
+    fs::write(moved.join("ready"), "a")?;
+    let outcome = prune_baseline_cache(&repo, false, &HashSet::new)?;
+    assert!(!moved.exists());
+    assert!(outcome.retained.is_empty(), "{:?}", outcome.retained);
+    Ok(())
+}
+
+#[test]
 fn pruning_preserves_baselines_used_by_active_overlays() -> Result<()> {
     let fixture = Fixture::new()?;
     let repo = discover_repo(&fixture.repo)?;
     let commit = resolve_commit(&repo, "HEAD")?;
-    let baseline = cow::ensure_baseline(&repo, &commit)?;
-    let protected = HashSet::from([baseline.clone()]);
-    let protected_run = cow::prune_baselines(&repo.common_git_dir, true, &protected)?;
+    let baseline = cow::ensure_baseline(&repo, &commit)?.tree;
+    let protected = || HashSet::from([baseline.clone()]);
+    let protected_run = prune_baseline_cache(&repo, true, &protected)?;
     assert!(protected_run.removed.is_empty());
     assert_eq!(protected_run.retained.len(), 1);
     assert!(
@@ -464,10 +511,82 @@ fn pruning_preserves_baselines_used_by_active_overlays() -> Result<()> {
         "a retained baseline must report its disk cost"
     );
     assert!(baseline.is_dir());
-    let full_run = cow::prune_baselines(&repo.common_git_dir, true, &HashSet::new())?;
+    let full_run = prune_baseline_cache(&repo, true, &HashSet::new)?;
     assert_eq!(full_run.removed.len(), 1);
     assert_eq!(full_run.retained_bytes, 0);
     assert!(!baseline.exists());
+    Ok(())
+}
+
+#[test]
+fn pruning_drops_baselines_nothing_reaches_any_more() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let new_commit = |message: &str| -> Result<String> {
+        let output = git_output_common(
+            &repo,
+            ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", message],
+        )?;
+        if !output.status.success() {
+            return Err(git_failure("git commit-tree", &output));
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    };
+    let on_branch = resolve_commit(&repo, "HEAD")?;
+    // What a force-push leaves behind: a commit no ref points at any more.
+    let rewritten = new_commit("rewritten")?;
+    let detached = new_commit("detached")?;
+    let detached_path = fixture.root.join("detached");
+    add_git_worktree(
+        &repo,
+        "",
+        &detached_path,
+        &detached,
+        WorktreeKind::Detached,
+        &[],
+    )?;
+    for commit in [&on_branch, &rewritten, &detached] {
+        cow::ensure_baseline(&repo, commit)?;
+    }
+    // A baseline whose commit Git has since collected.
+    let collected = "1".repeat(on_branch.len());
+    let collected_dir = state_dir(&repo.common_git_dir)
+        .join("baselines")
+        .join(&collected);
+    fs::create_dir_all(collected_dir.join("tree"))?;
+    fs::write(collected_dir.join("ready"), &collected)?;
+    // The branch moves on: its old tip is still reachable, as an ancestor.
+    git(
+        &fixture.repo,
+        ["commit", "-q", "--allow-empty", "-m", "advance"],
+    )?;
+
+    let sorted = |mut names: Vec<String>| {
+        names.sort();
+        names
+    };
+    let first = prune_baseline_cache(&repo, false, &HashSet::new)?;
+    assert_eq!(
+        sorted(first.removed),
+        sorted(vec![rewritten.clone(), collected])
+    );
+    assert_eq!(
+        sorted(first.retained),
+        sorted(vec![on_branch.clone(), detached.clone()])
+    );
+
+    // Once the detached worktree is gone, nothing reaches its commit.
+    git(
+        &fixture.repo,
+        [
+            "worktree",
+            "remove",
+            detached_path.to_str().context("utf-8 path")?,
+        ],
+    )?;
+    let second = prune_baseline_cache(&repo, false, &HashSet::new)?;
+    assert_eq!(second.removed, vec![detached]);
+    assert_eq!(second.retained, vec![on_branch]);
     Ok(())
 }
 
@@ -590,7 +709,7 @@ fn adopted_stat_data_equals_gits_own_refresh() -> Result<()> {
         return Ok(());
     }
     let base = resolve_commit(&repo, "HEAD")?;
-    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let baseline = cow::ensure_baseline(&repo, &base)?.tree;
     let published = cow::baseline_index(&baseline).context("baseline publishes an index")?;
 
     let clone = fixture.root.join("clone");
@@ -640,7 +759,7 @@ fn root_clone_failure_restores_empty_worktree_before_fallback() -> Result<()> {
         return Ok(());
     }
     let base = resolve_commit(&repo, "HEAD")?;
-    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let baseline = cow::ensure_baseline(&repo, &base)?.tree;
     let published = cow::baseline_index(&baseline).context("baseline publishes an index")?;
     fs::write(published, b"corrupt index")?;
 
@@ -669,7 +788,7 @@ fn per_file_adopted_stat_data_matches_git_refresh() -> Result<()> {
         return Ok(());
     }
     let base = resolve_commit(&repo, "HEAD")?;
-    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let baseline = cow::ensure_baseline(&repo, &base)?.tree;
     let target = fixture.root.join("per-file-index");
     register_worktree(
         &repo,
@@ -714,7 +833,7 @@ fn per_file_population_is_clean_and_preserves_file_kinds() -> Result<()> {
         return Ok(());
     }
     let base = resolve_commit(&repo, "HEAD")?;
-    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let baseline = cow::ensure_baseline(&repo, &base)?.tree;
     let target = fixture.root.join("per-file");
     register_worktree(
         &repo,
@@ -756,7 +875,7 @@ fn per_file_population_survives_a_baseline_without_published_index() -> Result<(
         return Ok(());
     }
     let base = resolve_commit(&repo, "HEAD")?;
-    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let baseline = cow::ensure_baseline(&repo, &base)?.tree;
     let published = cow::baseline_index(&baseline).context("baseline publishes an index")?;
     fs::remove_file(published)?;
     let target = fixture.root.join("pre-index");
@@ -796,7 +915,7 @@ fn cow_attachment_and_failed_population_preserve_existing_branch() -> Result<()>
     remove_worktree_force(&repo, &target)?;
 
     // Corrupt only the disposable fixture's baseline to force verification failure.
-    let baseline = cow::ensure_baseline(&repo, &base)?;
+    let baseline = cow::ensure_baseline(&repo, &base)?.tree;
     fs::write(baseline.join("file.txt"), "incorrect baseline")?;
     assert!(add_cow_worktree(
         &repo,

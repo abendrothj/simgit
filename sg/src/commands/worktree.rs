@@ -34,7 +34,7 @@ use maintenance::{delete_local_branch, prune_git_worktrees};
 #[cfg(test)]
 use locks::{lock_owner_of, lock_owner_pid, process_alive, worktree_lock_path};
 #[cfg(test)]
-use maintenance::run_gc;
+use maintenance::{prune_baseline_cache, run_gc};
 
 #[derive(Args)]
 pub struct WorktreeAdd {
@@ -381,13 +381,14 @@ fn add_cow_worktree(
     kind: WorktreeKind,
     sparse: &[String],
 ) -> Result<()> {
+    // The guard keeps `prune` off the baseline until population is done.
     let baseline = cow::ensure_baseline(repo, base)?;
     register_worktree(repo, branch, target, base, false, kind)?;
 
     let populate_result = if sparse.is_empty() {
-        populate_cow_worktree(target, &baseline)
+        populate_cow_worktree(target, &baseline.tree)
     } else {
-        populate_sparse_cow_worktree(target, &baseline, sparse)
+        populate_sparse_cow_worktree(target, &baseline.tree, sparse)
     };
 
     if let Err(error) = populate_result {
@@ -680,6 +681,8 @@ fn add_overlay_worktree(
     base: &str,
     kind: WorktreeKind,
 ) -> Result<()> {
+    // The guard keeps `prune` off the baseline until the marker below names it
+    // as this overlay's lower; from then on the marker protects it.
     let baseline = cow::ensure_baseline(repo, base)?;
 
     let overlay_dir = overlay::root(&repo.common_git_dir).join(Uuid::new_v4().to_string());
@@ -698,7 +701,7 @@ fn add_overlay_worktree(
         // the directory view), so stage it into the upperdir before mounting.
         fs::rename(target.join(".git"), upper.join(".git"))
             .context("stage worktree gitlink into overlay upperdir")?;
-        overlay::mount(&baseline, &upper, &work, target)?;
+        overlay::mount(&baseline.tree, &upper, &work, target)?;
         run_git_at(target, ["read-tree", "HEAD"]).context("initialize overlay worktree index")?;
         ensure_clean(target).context("verify overlay worktree")?;
         let admin = worktree_admin_dir(target)?;
@@ -706,7 +709,7 @@ fn add_overlay_worktree(
             &admin,
             &overlay::State {
                 overlay_dir: overlay_dir.clone(),
-                lower: Some(baseline.clone()),
+                lower: Some(baseline.tree.clone()),
             },
         )?;
         Ok(())
@@ -1167,6 +1170,7 @@ pub fn list(json_output: bool) -> Result<()> {
 /// A linked worktree as reported by `git worktree list --porcelain`.
 struct WorktreeEntry {
     path: PathBuf,
+    head: Option<String>,
     branch: Option<String>,
     is_main: bool,
 }
@@ -1179,6 +1183,7 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
     let text = String::from_utf8_lossy(&output.stdout);
     let mut entries = Vec::new();
     let mut path: Option<PathBuf> = None;
+    let mut head: Option<String> = None;
     let mut branch: Option<String> = None;
     for line in text.split('\0') {
         if line.is_empty() {
@@ -1186,13 +1191,17 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
                 let is_main = entries.is_empty();
                 entries.push(WorktreeEntry {
                     path,
+                    head: head.take(),
                     branch: branch.take(),
                     is_main,
                 });
             }
+            head = None;
             branch = None;
         } else if let Some(rest) = line.strip_prefix("worktree ") {
             path = Some(PathBuf::from(rest));
+        } else if let Some(rest) = line.strip_prefix("HEAD ") {
+            head = Some(rest.to_owned());
         } else if let Some(rest) = line.strip_prefix("branch ") {
             branch = Some(rest.to_owned());
         }
@@ -1201,6 +1210,7 @@ fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
         let is_main = entries.is_empty();
         entries.push(WorktreeEntry {
             path,
+            head,
             branch,
             is_main,
         });

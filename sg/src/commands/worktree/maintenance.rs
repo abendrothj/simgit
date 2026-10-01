@@ -12,7 +12,9 @@ use std::path::PathBuf;
 
 #[derive(Args, Default)]
 pub struct WorktreePrune {
-    /// Also delete every cached baseline, including recently used entries.
+    /// Also delete every cached baseline, including recently used and
+    /// still-reachable entries. Fails, to be retried, while an allocation is
+    /// using the cache.
     #[arg(long)]
     pub all: bool,
 }
@@ -67,10 +69,6 @@ pub(super) fn prune_git_worktrees(repo: &RepoContext) -> Result<()> {
 
 pub fn prune(args: WorktreePrune, json: bool) -> Result<()> {
     let repo = discover_repo(&std::env::current_dir()?)?;
-    let protected: HashSet<PathBuf> = overlay::registrations(&repo)
-        .into_iter()
-        .filter_map(|(_, state)| state.lower)
-        .collect();
     // Pruning a registration is a mutation of the Git registry, and it is the
     // one `doctor` reports as stale, so it has to be reported here too:
     // "pruned 0 cached baseline(s)" reads as "nothing happened".
@@ -81,7 +79,7 @@ pub fn prune(args: WorktreePrune, json: bool) -> Result<()> {
         .into_iter()
         .filter(|path| !after.contains(path))
         .collect();
-    let outcome = cow::prune_baselines(&repo.common_git_dir, args.all, &protected)?;
+    let outcome = prune_baseline_cache(&repo, args.all, &|| overlay_lowers(&repo))?;
 
     if json {
         emit(&json!({
@@ -89,6 +87,7 @@ pub fn prune(args: WorktreePrune, json: bool) -> Result<()> {
             "pruned_registrations": pruned_registrations,
             "retained": outcome.retained,
             "retained_bytes": outcome.retained_bytes,
+            "cache_busy": outcome.cache_busy,
         }));
         return Ok(());
     }
@@ -102,7 +101,75 @@ pub fn prune(args: WorktreePrune, json: bool) -> Result<()> {
         outcome.retained.len(),
         outcome.retained_bytes as f64 / (1024.0 * 1024.0)
     );
+    if outcome.cache_busy {
+        println!("baseline cache in use by an allocation; run prune again once it finishes");
+    }
     Ok(())
+}
+
+/// The baselines mounted overlays use as their lower layer.
+fn overlay_lowers(repo: &RepoContext) -> HashSet<PathBuf> {
+    overlay::registrations(repo)
+        .into_iter()
+        .filter_map(|(_, state)| state.lower)
+        .collect()
+}
+
+/// Prune the baseline cache, treating a baseline as live while a ref or a
+/// worktree still reaches its commit. `protected` is read under the cache
+/// lock; see `cow::prune_baselines`.
+pub(super) fn prune_baseline_cache(
+    repo: &RepoContext,
+    all: bool,
+    protected: &dyn Fn() -> HashSet<PathBuf>,
+) -> Result<cow::PruneOutcome> {
+    // Branch worktrees are reached through their branch ref; only detached
+    // HEADs need checking on their own.
+    let detached_heads: Vec<String> = list_worktrees(repo)?
+        .into_iter()
+        .filter(|entry| entry.branch.is_none())
+        .filter_map(|entry| entry.head)
+        .collect();
+    let reachable = |commit: &str| commit_reachable(repo, commit, &detached_heads);
+    cow::prune_baselines(&repo.common_git_dir, all, protected, &reachable)
+}
+
+/// Whether a ref or a detached worktree HEAD still reaches `commit`. One that
+/// nothing reaches, or that Git has already collected, can only be reused by
+/// naming its object id.
+fn commit_reachable(repo: &RepoContext, commit: &str, detached_heads: &[String]) -> Result<bool> {
+    let spec = format!("{commit}^{{commit}}");
+    let exists = git_output_common(repo, ["rev-parse", "--verify", "--quiet", &spec])?;
+    match exists.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(false),
+        _ => return Err(git_failure("git rev-parse --verify", &exists)),
+    }
+    let refs = git_output_common(
+        repo,
+        [
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "--contains",
+            commit,
+        ],
+    )?;
+    if !refs.status.success() {
+        return Err(git_failure("git for-each-ref --contains", &refs));
+    }
+    if !refs.stdout.is_empty() {
+        return Ok(true);
+    }
+    for head in detached_heads {
+        let ancestor = git_output_common(repo, ["merge-base", "--is-ancestor", commit, head])?;
+        match ancestor.status.code() {
+            Some(0) => return Ok(true),
+            Some(1) => {}
+            _ => return Err(git_failure("git merge-base --is-ancestor", &ancestor)),
+        }
+    }
+    Ok(false)
 }
 
 /// The worktree paths Git currently reports as prunable registrations.

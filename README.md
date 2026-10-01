@@ -102,7 +102,7 @@ rejects it, because it owns the child's stdout. Location is always `--path`.
 | `sg remove [TARGET]` | Remove a worktree by path or branch. `--commit -m <msg>`, `--delete-branch`, and the authority-gated `--discard-dirty` / `--delete-unmerged`. |
 | `sg unlock [TARGET]` | Clear a `run` lock stranded by a killed launcher. |
 | `sg gc` | Reap idle ephemeral worktrees. `--older-than <90s\|30m\|24h\|7d>` (default 24h), `--prefix`, `--delete-branches`, `--include-persistent`, `--discard-dirty`, `--delete-unmerged`, `--dry-run`. |
-| `sg prune` | Drop stale Git registrations and expired cached baselines; `--all` reclaims every baseline now. |
+| `sg prune` | Drop stale Git registrations, and cached baselines that are expired or that no ref reaches any more; `--all` reclaims every baseline now. |
 | `sg repair` | Remount overlay-backed worktrees after a reboot or interrupted mount (Linux). |
 
 There is no `--force`: the two operations that can destroy work name what they

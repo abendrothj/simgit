@@ -64,7 +64,11 @@ Linux and in CI; do not treat them as gates on macOS.
   `skipped` with a reason — `persistent`, `dirty`, `locked`, or
   `recently-active`. `--older-than` is an idle-age filter defaulting to 24h.
 - `prune` reports the stale Git registrations it removed in
-  `pruned_registrations`; `--all` reclaims every cached baseline immediately.
+  `pruned_registrations`. Plain `prune` drops a cached baseline that has gone
+  unused for seven days, or whose commit no ref and no detached worktree HEAD
+  reaches; `--all` reclaims every cached baseline immediately. Neither removes
+  a baseline an allocation is using or waits for one: plain `prune` then keeps
+  the cache and reports `cache_busy: true`, and `--all` fails, to be retried.
 - `unlock [TARGET]` clears a stranded `run` lock. A linked worktree's lock is
   Git's own `.git/worktrees/<slug>/locked`; `.git/simgit-run.lock` is used only
   when `run` targets the main checkout. It succeeds on a target that is not
