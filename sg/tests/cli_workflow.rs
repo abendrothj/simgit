@@ -335,16 +335,10 @@ fn add_attach_checks_out_an_existing_branch_and_refuses_a_taken_one() {
     assert!(!taken.status.success());
     assert!(taken.stdout.is_empty());
     assert!(!taken_path.exists());
-    // The human diagnostic keeps the path verbatim (JSON collapses whitespace,
-    // and this fixture's path contains a tab), so it names where to work.
-    let named = fixture
-        .command()
-        .args(["add", "--attach", "chat/test", "--path"])
-        .arg(&taken_path)
-        .output()
-        .unwrap();
-    assert!(!named.status.success());
-    assert!(String::from_utf8_lossy(&named.stderr).contains(worktree.to_str().unwrap()));
+    // The one-line JSON diagnostic names that worktree verbatim, tab and all.
+    let stderr = String::from_utf8(taken.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains(worktree.to_str().unwrap()), "{stderr}");
 
     // Removing an attached worktree keeps the branch it checked out.
     success(&fixture.run(&["--json", "remove", worktree.to_str().unwrap()]));

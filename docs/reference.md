@@ -188,8 +188,11 @@ The global `--json` flag gives orchestrators structured output from `doctor`,
 `add`, `remove`, `list`, `unlock`, `gc`, `prune` and `repair`; it is accepted
 before or after the command, and `run` is the one command that rejects it. A
 `--json` failure, including an argument-parsing error, emits no JSON: nonzero
-exit, empty stdout, one line of diagnostic text on stderr. `--help` and
-`--version` remain successful human-readable requests, not JSON results.
+exit, empty stdout, one line of diagnostic text on stderr. That line replaces
+each line break with one space, drops blank lines, and keeps all other
+whitespace, so a path it names appears verbatim unless the path itself
+contains a line break. `--help` and `--version` remain successful
+human-readable requests, not JSON results.
 
 Every worktree path simgit prints or returns is symlink-resolved and lexically
 normalized, so one worktree always has exactly one string form and orchestrators

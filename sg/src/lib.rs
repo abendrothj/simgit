@@ -120,8 +120,16 @@ fn restore_default_sigpipe() {
 }
 
 /// Preserve error context while keeping machine-facing diagnostics on one line.
+///
+/// Only line breaks are replaced, each by one space, and blank lines dropped;
+/// all other whitespace is kept, because it can be part of a path the
+/// diagnostic names, and a path is only useful verbatim.
 fn one_line(diagnostic: &str) -> String {
-    diagnostic.split_whitespace().collect::<Vec<_>>().join(" ")
+    diagnostic
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Parse this process's arguments and execute the requested command. Both the
