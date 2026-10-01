@@ -20,7 +20,7 @@ case "$SIMGIT" in
   *) echo "simgit discovery did not return an executable path" >&2; exit 1 ;;
 esac
 [ -f "$SIMGIT" ] && [ -x "$SIMGIT" ] || exit 1
-"$SIMGIT" doctor --json     # require top-level "identity": "simgit", or treat it as not installed
+"$SIMGIT" doctor --json     # require top-level "identity": "simgit" and "version" >= 0.4.0 — see "Preflight"
 
 # 2. Preflight, run again from the source repository — see "Preflight"
 "$SIMGIT" doctor --json     # require git_worktree_supported; read cow_supported, repository owner,
@@ -86,6 +86,11 @@ Second, repository readiness, reported when `doctor` runs inside the source repo
 Outside a Git worktree those repository fields are `null` and the stale-registration list is empty, while identity, version, filesystem, and CoW support are still reported. A null repository means "not in a repository here"; it is never evidence that the executable is wrong or broken, and the harness must not reject the binary for it.
 
 Stop on an identity mismatch, unsupported Git worktrees, or an ownership problem. Treat stale registrations and retained baselines as state to review, not permission to delete work. Never allocate inside the source repository: override an unsafe default and choose an explicit absolute allocation root outside the source repository.
+
+This skill describes simgit 0.4.0. Compare `doctor --json`'s `version` with it before relying on anything below:
+
+- Older than 0.4.0: `add --attach`, the per-branch allocation claim, and `prune`'s `cache_busy` field do not exist, and `prune` may delete a baseline an allocation is using. Tell the user, and either get approval to upgrade (see **Install safely**) or limit yourself to what the installed version documents in its `--help`; for an existing branch, `simgit run <branch> -- <command>` works on older versions.
+- Newer than 0.4.0: this copy of the skill may be stale. Ask the user to refresh it (`npx skills update simgit-worktrees -g`, or a fresh copy for a manual install) before depending on behavior it does not describe.
 
 ## Allocate with JSON
 

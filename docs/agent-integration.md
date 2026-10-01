@@ -130,6 +130,26 @@ npx skills use abendrothj/simgit@simgit-worktrees
 Installing this way sends the skill name to the skills.sh leaderboard as
 anonymous telemetry; `DISABLE_TELEMETRY=1` opts out.
 
+Installed skills never update themselves. The skills CLI installs the skill as
+it stands on this repository's default branch, not at a release tag, and a
+manual copy is whatever the source checkout held.
+A binary upgrade therefore does not update the skill, and a skill update can
+describe a newer simgit than the one installed. The skill names the version it
+describes and has the agent compare it with `doctor --json`'s `version`; keep
+them in step after each simgit upgrade, again with the user's approval:
+
+```sh
+# Installed with the skills CLI: reinstalls any skill whose folder changed upstream.
+npx skills update simgit-worktrees -g
+
+# Installed by copying: the snippet above refuses to overwrite, so replace it explicitly.
+rm -rf "$HOME/.agents/skills/simgit-worktrees"
+cp -R skills/simgit-worktrees "$HOME/.agents/skills/"
+```
+
+`npx skills use abendrothj/simgit@simgit-worktrees` installs nothing and always
+reads the current default branch.
+
 A Claude-specific installation may instead use
 `$HOME/.claude/skills/simgit-worktrees/SKILL.md`. Follow the harness's documented
 skill root if it differs. Do not make either user-level change without approval.

@@ -119,6 +119,9 @@ Published as `simgit-cli` on crates.io. The crate ships two binaries: `simgit`
 (canonical) and `sg`, an equivalent alias built from the same code.
 
 1. Bump `version` in the workspace `Cargo.toml`, `cargo build` to refresh the lockfile, commit.
+   If `skills/simgit-worktrees/SKILL.md` now relies on behavior new in this
+   release, raise the version its Preflight section names in the same commit:
+   the skill is installed from `main`, so agents read it before users upgrade.
 2. Tag and push: `git tag -a vX.Y.Z -m "…" && git push origin main vX.Y.Z`.
    The `v*` tag triggers `.github/workflows/release.yml`, which reruns the gates
    above, builds the four targets (`aarch64`/`x86_64` × macOS/Linux), packages
