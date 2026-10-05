@@ -174,8 +174,7 @@ when a signal killed the child, `127` when the command cannot be found).
 
 A tool that classifies simgit invocations before they run — an approval gate or
 checkpointer, rather than an allocator — depends on a narrower promise: which
-flags can destroy work. That contract lives in
-[AGENTS.md](../AGENTS.md#what-approval-gates-depend-on).
+flags can destroy work. See [For agent guard tools](#for-agent-guard-tools).
 
 ### 1. Discover and verify the executable
 
@@ -513,3 +512,55 @@ tracked file as deleted, so safe removal refuses it as dirty. Since `add`
 never returned, no agent ever ran there and the provider holds no allocation
 record for it; report the path to the operator, whose explicit authority
 `remove --discard-dirty` still requires even though it loses nothing here.
+
+## For agent guard tools
+
+A guard that decides from argv alone which simgit invocations need approval
+can write its own rule from this section. The promise behind it — that this
+surface stays small and stable — is in
+[AGENTS.md](../AGENTS.md#what-approval-gates-depend-on).
+
+Two flags destroy work Git cannot give back, and only two subcommands take
+them:
+
+| Flag | Subcommands | Destroys |
+|---|---|---|
+| `--discard-dirty` | `remove`, `gc` | Uncommitted and untracked files in the removed worktrees. |
+| `--delete-unmerged` | `remove`, `gc` | Branches past the merged check; it only takes effect beside `--delete-branch` (`remove`) or `--delete-branches` (`gc`). |
+
+Everything else is safe to auto-approve without them, except `run`, whose
+argv after `--` is the command a guard must judge — including a nested
+`simgit` there. Nothing in configuration or the environment makes a command
+destructive.
+
+Matching is exact-word: the executable's basename is `simgit` or `sg`, the
+subcommand is its first non-option word (the only global option is `--json`),
+and a destructive flag is a word equal to the flag that appears before any
+`--`. simgit accepts no abbreviation such as `--discard` and no `=value` form,
+and a word after `--` is a positional target. A guard can exempt `--help` or
+`-h` anywhere and `gc --dry-run`, which change nothing.
+
+The pitfalls are words whose final value the guard cannot see; review them
+wherever a flag could land:
+
+- **Unquoted expansions** such as `$FLAGS`, `$(cmd)`, or `` `cmd` `` split into
+  any number of words, so `simgit gc $FLAGS` or `simgit gc --prefix $PREFIX`
+  can carry either flag.
+- **`"$@"` and `"${array[@]}"`** are quoted yet still expand to several words.
+- **A quoted single word** is still one word that can *be* a flag:
+  `X=--discard-dirty; simgit remove "$X"` discards the dirty worktree
+  containing the current directory. `simgit remove -- "$X"` cannot, because
+  the word is after `--`; that is the form a caller can write so a guard can
+  prove an expanded target is not a flag.
+- **`xargs`** supplies words from stdin: `xargs simgit gc` splits input into
+  flags, and `xargs -I {} simgit remove {}` substitutes each whole input line,
+  which can be `--discard-dirty`. To find the nested `simgit` at all, the
+  guard must know which `xargs` options take a value (`-I {}`, `-a FILE`,
+  `-L 1`, `-P 4`); options are case-sensitive, and `-i` does not take a
+  separate value where `-I` does, so never case-fold argv.
+- **Wrappers** such as `env`, `command`, `exec`, `timeout`, `nice`, `sudo`,
+  `sh -c '…'`, and `simgit run -- …` put the real invocation further along;
+  `eval` and `sh -c "$CMD"` hide it entirely.
+
+When a guard cannot resolve one of these, it should require approval rather
+than assume the flag is absent.
