@@ -119,6 +119,17 @@ operation. Without a provider cleanup hook, run `simgit remove "$cleanup_token"`
 the token is the absolute worktree path. Removal normally retains its branch.
 Never append `--discard-dirty` or `--delete-unmerged` automatically.
 
+Removal reclaims only what is inside the worktree. CoW shares the source tree,
+but build output and caches (`target/`, `node_modules`, virtualenvs) are
+written per worktree and are usually most of its disk use. Keep them inside the
+worktree: a build pointed at a directory elsewhere, such as a per-job
+`CARGO_TARGET_DIR`, outlives the worktree and is the job's to delete. On a
+worktree that lives on, delete build output once it has served its purpose.
+
+A worktree allocated without `--ephemeral`, such as one attached to a pull
+request's branch for the length of its review, is never reaped by `gc`.
+Remove it when the branch merges or closes; removal keeps the branch.
+
 `gc` is a repository-wide sweep, not per-job cleanup: `gc --older-than 0s` can
 reap a *different*, clean ephemeral workspace while its provider is launching
 an agent there. Only run it in a separate maintenance pass that owns the
