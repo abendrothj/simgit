@@ -1,6 +1,6 @@
 ---
 name: simgit-worktrees
-description: Use when allocating or isolating autonomous-agent or benchmark work in Git worktrees, including work on an existing branch such as an open pull request's, especially when copy-on-write capacity, disposable workspaces, detached historical runs, or safe automated cleanup matters.
+description: Use when autonomous-agent, parallel, or benchmark work needs its own Git worktree, including on an existing branch such as an open pull request's, especially when copy-on-write capacity, disposable workspaces, detached historical runs, or safe automated cleanup matters. Not for interactive work the user follows in their own checkout.
 ---
 
 # simgit worktrees

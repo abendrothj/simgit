@@ -11,6 +11,10 @@ Paste the following block verbatim into `AGENTS.md`:
 ```markdown
 ## simgit worktrees for autonomous agents
 
+- Use a worktree when work must run isolated from the user's checkout:
+  autonomous or parallel agents, background jobs, benchmarks, and base-vs-head
+  comparisons. Interactive work the user follows in their editor stays in
+  their checkout.
 - The agent harness owns simgit executable discovery, identity preflight,
   worktree allocation, agent launch, and cleanup. Agents must not orchestrate
   this infrastructure when the harness provides the simgit allocator/provider.
