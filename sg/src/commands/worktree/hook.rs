@@ -384,9 +384,16 @@ fn on_worktree_remove(payload: &serde_json::Value, discard_dirty: bool) -> Resul
 /// stderr line and the result is always `Ok`.
 fn on_subagent_stop(payload: &serde_json::Value) -> Result<()> {
     if let Err(error) = remove_finished_subagent(payload) {
-        eprintln!("simgit: SubagentStop: {error:#}");
+        eprintln!("{}", subagent_stop_note(&error));
     }
     Ok(())
+}
+
+fn subagent_stop_note(error: &anyhow::Error) -> String {
+    format!(
+        "simgit: SubagentStop: {}",
+        crate::one_line(&format!("{error:#}"))
+    )
 }
 
 fn remove_finished_subagent(payload: &serde_json::Value) -> Result<()> {
@@ -447,6 +454,17 @@ fn remove_finished_subagent(payload: &serde_json::Value) -> Result<()> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    // Git's own messages can span lines (Linux adds "Stopping at filesystem
+    // boundary ..."); the stop note must still be one stderr line.
+    #[test]
+    fn subagent_stop_note_is_one_line_for_a_multi_line_git_error() {
+        let error = anyhow!("fatal: not a git repository\nStopping at filesystem boundary.")
+            .context("not in a Git working tree");
+        let note = subagent_stop_note(&error);
+        assert_eq!(note.lines().count(), 1, "{note}");
+        assert!(note.contains("Stopping at filesystem boundary."), "{note}");
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
