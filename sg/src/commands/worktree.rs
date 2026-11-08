@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 mod cow;
 mod doctor;
+mod hook;
 mod index;
 mod launch;
 mod locks;
@@ -24,11 +25,12 @@ mod maintenance;
 mod overlay;
 
 pub use doctor::doctor;
+pub use hook::{hook, WorktreeHook};
 pub use launch::{run_in_worktree, WorktreeRun};
 pub use locks::{unlock, WorktreeUnlock};
 pub use maintenance::{gc, prune, repair, WorktreeGc, WorktreePrune};
 
-use locks::{ensure_unlocked, BranchClaim, PathClaim, WorktreeLock};
+use locks::{ensure_unlocked, BranchClaim, PathClaim, RegistryLock, WorktreeLock};
 use maintenance::{delete_local_branch, prune_git_worktrees};
 
 #[cfg(test)]
@@ -133,7 +135,9 @@ pub fn add(mut args: WorktreeAdd, json: bool) -> Result<()> {
     if !args.detach && args.branch.is_none() {
         args.branch = Some(format!("agent/{}", Uuid::new_v4()));
     }
-    let created = create_worktree(&args)?;
+    let cwd = std::env::current_dir()?;
+    let repo = discover_repo(&cwd)?;
+    let created = create_worktree(&repo, &cwd, &args, None)?;
 
     if json {
         let path = created.target.display().to_string();
@@ -167,8 +171,15 @@ enum WorktreeKind {
     Detached,
 }
 
-fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
-    let repo = discover_repo(&std::env::current_dir()?)?;
+/// Create a worktree for `args`, resolving a relative `--path` against `cwd`.
+/// A `claim` the caller already holds on the branch is used as is; with
+/// `None`, one is acquired without waiting.
+fn create_worktree(
+    repo: &RepoContext,
+    cwd: &Path,
+    args: &WorktreeAdd,
+    claim: Option<BranchClaim>,
+) -> Result<CreatedWorktree> {
     if args.attach && args.detach {
         bail!("cannot attach an existing branch with --detach");
     }
@@ -182,30 +193,30 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     let branch = args.branch.as_deref();
     // Checked and registered under one claim, so two allocations can never
     // both find the branch free; see `BranchClaim`.
-    let _branch_claim = match branch {
-        Some(name) if kind != WorktreeKind::Detached => Some(BranchClaim::acquire(&repo, name)?),
+    let _branch_claim = match (claim, branch) {
+        (Some(claim), _) => Some(claim),
+        (None, Some(name)) if kind != WorktreeKind::Detached => {
+            Some(BranchClaim::acquire(repo, name)?)
+        }
         _ => None,
     };
     if kind == WorktreeKind::NewBranch {
         validate_new_branch(
-            &repo,
+            repo,
             branch.context("branch is required unless --detach is used")?,
         )?;
     } else if kind == WorktreeKind::ExistingBranch {
         if args.base.is_some() {
             bail!("--base cannot be used with an existing branch");
         }
-        validate_existing_branch(
-            &repo,
-            branch.context("existing worktree requires a branch")?,
-        )?;
+        validate_existing_branch(repo, branch.context("existing worktree requires a branch")?)?;
     }
     if kind == WorktreeKind::Detached && branch.is_some() {
         bail!("a branch cannot be combined with --detach");
     }
     let reference = branch.map(|name| format!("refs/heads/{name}"));
     let base = resolve_commit(
-        &repo,
+        repo,
         if kind == WorktreeKind::ExistingBranch {
             reference
                 .as_deref()
@@ -218,16 +229,16 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
         .map(str::to_owned)
         .unwrap_or_else(|| format!("detached-{}", Uuid::new_v4()));
     let requested = args.path.clone();
-    let target = canonical_path(&absolute_path(match requested {
+    let target = canonical_path(&cwd.join(match requested {
         Some(path) => path,
         None => default_worktree_path(&repo.common_git_dir, &path_label)?,
-    })?);
+    }));
 
     // One allocation at a time per destination. Two `add --path <same>` runs
     // interleaving through `git worktree add` both used to succeed, leaving
     // two registrations for one directory and a reported branch that was not
     // the one checked out there.
-    let _claim = PathClaim::acquire(&repo, &target)?;
+    let _claim = PathClaim::acquire(repo, &target)?;
 
     // An empty directory holds nothing to lose, and harnesses routinely
     // pre-create one per job; anything else is someone's data.
@@ -240,7 +251,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
     }
 
     let target_parent = target.parent().context("worktree path has no parent")?;
-    let mode = select_populate_mode(&repo, target_parent, args.require_cow)?;
+    let mode = select_populate_mode(repo, target_parent, args.require_cow)?;
 
     let sparse = validate_sparse(&args.sparse)?;
     if !sparse.is_empty() && mode == PopulateMode::Overlay {
@@ -253,12 +264,10 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
 
     let branch_arg = branch.unwrap_or("");
     let populated = match mode {
-        PopulateMode::CowClone => {
-            add_cow_worktree(&repo, branch_arg, &target, &base, kind, &sparse)
-        }
-        PopulateMode::Overlay => add_overlay_worktree(&repo, branch_arg, &target, &base, kind),
+        PopulateMode::CowClone => add_cow_worktree(repo, branch_arg, &target, &base, kind, &sparse),
+        PopulateMode::Overlay => add_overlay_worktree(repo, branch_arg, &target, &base, kind),
         PopulateMode::GitCheckout => {
-            add_git_worktree(&repo, branch_arg, &target, &base, kind, &sparse)
+            add_git_worktree(repo, branch_arg, &target, &base, kind, &sparse)
         }
     };
     // Registration can fail after another process creates the branch. Git can
@@ -272,11 +281,11 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
 
     if args.ephemeral {
         if let Err(error) = mark_ephemeral(&target) {
-            teardown_worktree(&repo, &target, true)
+            teardown_worktree(repo, &target, true)
                 .context("cleanup after ephemeral marker failure")?;
             if kind == WorktreeKind::NewBranch {
                 delete_local_branch(
-                    &repo,
+                    repo,
                     reference
                         .as_deref()
                         .context("new branch has no reference")?,
@@ -286,7 +295,7 @@ fn create_worktree(args: &WorktreeAdd) -> Result<CreatedWorktree> {
             return Err(error).context("mark worktree ephemeral");
         }
     }
-    warn_if_inside_repository(&repo, &target);
+    warn_if_inside_repository(repo, &target);
 
     Ok(CreatedWorktree {
         target,
@@ -389,19 +398,17 @@ fn validate_existing_branch(repo: &RepoContext, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Register an empty worktree. Population happens afterwards, outside the
+/// registry lock, so allocations still fill their worktrees in parallel.
 fn register_worktree(
     repo: &RepoContext,
     branch: &str,
     target: &Path,
     base: &str,
-    checkout: bool,
     kind: WorktreeKind,
 ) -> Result<()> {
     let mut command = git_common_command(repo);
-    command.args(["worktree", "add"]);
-    if !checkout {
-        command.arg("--no-checkout");
-    }
+    command.args(["worktree", "add", "--no-checkout"]);
     match kind {
         WorktreeKind::NewBranch => {
             command.args(["-b", branch]);
@@ -415,6 +422,7 @@ fn register_worktree(
         WorktreeKind::ExistingBranch => branch,
         WorktreeKind::NewBranch | WorktreeKind::Detached => base,
     });
+    let _registry = RegistryLock::exclusive(repo)?;
     run_command(&mut command, "create linked worktree")
 }
 
@@ -428,7 +436,7 @@ fn add_cow_worktree(
 ) -> Result<()> {
     // The guard keeps `prune` off the baseline until population is done.
     let baseline = cow::ensure_baseline(repo, base)?;
-    register_worktree(repo, branch, target, base, false, kind)?;
+    register_worktree(repo, branch, target, base, kind)?;
 
     let populate_result = if sparse.is_empty() {
         populate_cow_worktree(target, &baseline.tree)
@@ -692,7 +700,20 @@ fn add_git_worktree(
     // Without CoW there is nothing to clone, so Git does the whole job. The
     // index is built first and the cone configured after it, which is the
     // order in which `sparse-checkout set` materializes the cone itself.
-    register_worktree(repo, branch, target, base, sparse.is_empty(), kind)?;
+    register_worktree(repo, branch, target, base, kind)?;
+    if sparse.is_empty() {
+        // The checkout `git worktree add` itself would have run.
+        if let Err(error) = run_git_at(
+            target,
+            ["reset", "--hard", "--no-recurse-submodules", "--quiet"],
+        ) {
+            rollback_created_worktree(repo, target, branch, kind == WorktreeKind::NewBranch)?;
+            return Err(error).context("check out linked worktree");
+        }
+        // As with `git worktree add`, a failing hook fails the allocation but
+        // keeps the worktree.
+        run_post_checkout_hook(target)?;
+    }
     let populate = (|| -> Result<()> {
         if !sparse.is_empty() {
             run_git_at(target, ["read-tree", "HEAD"])
@@ -716,6 +737,56 @@ fn add_git_worktree(
     Ok(())
 }
 
+/// Run the `post-checkout` hook the way `git worktree add` does after its own
+/// checkout: from the new worktree, with a null old HEAD and the branch flag.
+/// `git hook run` also runs hooks defined in config and does nothing when there
+/// are none; Git before 2.36 has no `git hook`, so there the hook file runs
+/// directly.
+fn run_post_checkout_hook(target: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut command = if git_has_hook_command(target)? {
+        let mut command = Command::new("git");
+        command.args(["hook", "run", "--ignore-missing", "post-checkout", "--"]);
+        command
+    } else {
+        let hook = target.join(git_path_output(
+            target,
+            ["rev-parse", "--git-path", "hooks/post-checkout"],
+        )?);
+        let installed = fs::metadata(&hook)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
+        if !installed {
+            return Ok(());
+        }
+        Command::new(&hook)
+    };
+    let head = git_path_output(target, ["rev-parse", "HEAD"])?;
+    let null = "0".repeat(head.len());
+    command.current_dir(target).args([&null, &head, "1"]);
+    run_command(&mut command, "post-checkout hook")
+}
+
+/// Whether this Git has `git hook`, which arrived in 2.36. An unreadable
+/// version is taken as a modern Git, whose own error then names the problem.
+fn git_has_hook_command(cwd: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .arg("version")
+        .output()
+        .context("run git version")?;
+    let version = String::from_utf8_lossy(&output.stdout);
+    let mut parts = version
+        .trim()
+        .trim_start_matches("git version ")
+        .split('.')
+        .map(|part| part.parse::<u32>());
+    Ok(match (parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => (major, minor) >= (2, 36),
+        _ => true,
+    })
+}
+
 /// Create a linked worktree whose files are served by a fuse-overlayfs mount:
 /// `lowerdir` is the shared read-only baseline, and a per-worktree `upperdir`
 /// captures writes. Unchanged files cost no disk, on any Linux filesystem.
@@ -736,7 +807,7 @@ fn add_overlay_worktree(
     fs::create_dir_all(&upper).context("create overlay upperdir")?;
     fs::create_dir_all(&work).context("create overlay workdir")?;
 
-    if let Err(error) = register_worktree(repo, branch, target, base, false, kind) {
+    if let Err(error) = register_worktree(repo, branch, target, base, kind) {
         fs::remove_dir_all(&overlay_dir).context("cleanup unused overlay state")?;
         return Err(error);
     }
@@ -800,14 +871,9 @@ fn teardown_worktree(repo: &RepoContext, target: &Path, discard_dirty: bool) -> 
     } else if discard_dirty {
         remove_worktree_force(repo, target)
     } else {
-        run_git_common(
-            repo,
-            [
-                OsStr::new("worktree"),
-                OsStr::new("remove"),
-                target.as_os_str(),
-            ],
-        )
+        let mut command = git_common_command(repo);
+        command.args(["worktree", "remove"]).arg(target);
+        run_retrying_half_written_registration(&mut command, "git worktree remove")
     };
     if result.is_ok() {
         prune_empty_worktree_dirs(repo, target);
@@ -1171,7 +1237,7 @@ pub fn list(json_output: bool) -> Result<()> {
         return Ok(());
     }
 
-    let output = git_output_common(&repo, ["worktree", "list", "--porcelain", "-z"])?;
+    let output = git_worktree_list(&repo)?;
     if !output.status.success() {
         return Err(git_failure("git worktree list --porcelain", &output));
     }
@@ -1220,8 +1286,14 @@ struct WorktreeEntry {
     is_main: bool,
 }
 
+/// `git worktree list --porcelain -z`, which reads every registration.
+fn git_worktree_list(repo: &RepoContext) -> Result<Output> {
+    let _registry = RegistryLock::shared(repo)?;
+    git_output_common(repo, ["worktree", "list", "--porcelain", "-z"])
+}
+
 fn list_worktrees(repo: &RepoContext) -> Result<Vec<WorktreeEntry>> {
-    let output = git_output_common(repo, ["worktree", "list", "--porcelain", "-z"])?;
+    let output = git_worktree_list(repo)?;
     if !output.status.success() {
         return Err(git_failure("git worktree list --porcelain", &output));
     }
@@ -1685,7 +1757,38 @@ fn rollback_created_worktree(
 fn remove_worktree_force(repo: &RepoContext, target: &Path) -> Result<()> {
     let mut command = git_common_command(repo);
     command.args(["worktree", "remove", "--force"]).arg(target);
-    run_command(&mut command, "git worktree remove --force")
+    run_retrying_half_written_registration(&mut command, "git worktree remove --force")
+}
+
+/// Run a Git command that reads every worktree registration without the
+/// registry lock, retrying when it died on one another allocation was half-way
+/// through writing. Used where holding the lock would stall every allocation
+/// (a network fetch, a large removal); a Git that skips half-written
+/// registrations would make it unnecessary.
+fn output_retrying_half_written_registration(command: &mut Command) -> Result<Output> {
+    // Untranslated messages: the match below, and callers, read them.
+    command.env("LC_ALL", "C");
+    let mut backoff = [50, 100].into_iter();
+    loop {
+        let output = command.output().context("run git")?;
+        let complaint = String::from_utf8_lossy(&output.stderr);
+        let raced = !output.status.success()
+            && complaint.contains("failed to read")
+            && complaint.contains("commondir");
+        match backoff.next() {
+            Some(millis) if raced => std::thread::sleep(Duration::from_millis(millis)),
+            _ => return Ok(output),
+        }
+    }
+}
+
+fn run_retrying_half_written_registration(command: &mut Command, description: &str) -> Result<()> {
+    let output = output_retrying_half_written_registration(command)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(git_failure(description, &output))
+    }
 }
 
 /// A `git` invocation against the repository's common git dir, anchored in a

@@ -1427,6 +1427,329 @@ fn concurrent_attaches_of_one_branch_leave_one_worktree_on_it() {
     );
 }
 
+/// While Git registers a worktree its `.git/worktrees/<name>/` is briefly
+/// half-written, and any other `git worktree add` or `list` that reads it then
+/// dies with "failed to read .../commondir". Agents allocate in parallel, so
+/// allocations for different branches, and listings beside them, must all
+/// succeed. The wrapper stretches Git's window from microseconds to 200ms so
+/// the race fails every time instead of once in hundreds of adds.
+#[test]
+fn concurrent_allocations_of_different_branches_all_succeed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let wrapper_dir = fixture.root.join("bin");
+    fs::create_dir(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("git");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\n\
+         if [ \"$2\" = worktree ] && [ \"$3\" = add ]; then\n\
+           pending=\"${1#--git-dir=}/worktrees/pending-$$\"\n\
+           mkdir -p \"$pending\" || exit\n\
+           echo initializing > \"$pending/locked\"\n\
+           echo \"$pending/.git\" > \"$pending/gitdir\"\n\
+           : > \"$pending/commondir\"\n\
+           sleep 0.2\n\
+           rm -rf \"$pending\"\n\
+         fi\n\
+         exec \"$SIMGIT_TEST_REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(wrapper_dir)
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let command = || {
+        let mut command = fixture.command();
+        command
+            .env("PATH", &path)
+            .env("SIMGIT_TEST_REAL_GIT", &real_git)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        command
+    };
+
+    // Staggered so each racer's own Git runs while a later racer's
+    // registration is half-written.
+    let racers: Vec<_> = (0..8)
+        .map(|index| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            command()
+                .args(["add", &format!("agent/racer-{index}"), "--path"])
+                .arg(fixture.root.join(format!("racer-{index}")))
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let listings = std::thread::scope(|scope| {
+        let lister = scope.spawn(|| {
+            let mut listings = Vec::new();
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                listings.push(command().args(["list", "--json"]).output().unwrap());
+            }
+            listings
+        });
+        let outcomes: Vec<_> = racers
+            .into_iter()
+            .map(|racer| racer.wait_with_output().unwrap())
+            .collect();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        for outcome in &outcomes {
+            success(outcome);
+        }
+        lister.join().unwrap()
+    });
+    for listing in &listings {
+        success(listing);
+    }
+
+    let registrations = Command::new("git")
+        .current_dir(&fixture.repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
+    let registrations = String::from_utf8_lossy(&registrations.stdout);
+    for index in 0..8 {
+        assert_eq!(
+            registrations
+                .lines()
+                .filter(|line| *line == format!("branch refs/heads/agent/racer-{index}"))
+                .count(),
+            1,
+            "agent/racer-{index} is not registered once: {registrations}"
+        );
+    }
+}
+
+/// Put a `git` wrapper running `script` ahead of the real Git on `PATH`. The
+/// script reaches the real Git as `$SIMGIT_TEST_REAL_GIT`; returns the
+/// environment a command needs to run under the wrapper.
+fn git_wrapper(fixture: &Fixture, script: &str) -> [(&'static str, std::ffi::OsString); 2] {
+    use std::os::unix::fs::PermissionsExt;
+
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let wrapper_dir = fixture.root.join("bin");
+    fs::create_dir(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("git");
+    fs::write(
+        &wrapper,
+        format!("#!/bin/sh\n{script}exec \"$SIMGIT_TEST_REAL_GIT\" \"$@\"\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(wrapper_dir)
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    [("PATH", path), ("SIMGIT_TEST_REAL_GIT", real_git.into())]
+}
+
+/// `git worktree remove` reads every registration, so it dies on one another
+/// allocation is half-way through writing. Removal holds no registry lock, so
+/// it must retry; the wrapper fails each first `worktree remove` that way.
+#[test]
+fn removal_is_retried_after_a_half_written_registration() {
+    let fixture = Fixture::new();
+    let failed = fixture.root.join("remove-failed");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "if [ \"$2\" = worktree ] && [ \"$3\" = remove ] && [ ! -e '{failed}' ]; then\n\
+               : > '{failed}'\n\
+               echo \"fatal: failed to read ${{1#--git-dir=}}/worktrees/other/commondir: Undefined error: 0\" >&2\n\
+               exit 128\n\
+             fi\n",
+            failed = failed.display(),
+        ),
+    );
+
+    for discard in [&[][..], &["--discard-dirty"][..]] {
+        let _ = fs::remove_file(&failed);
+        fixture.create(&[]);
+        let removed = fixture
+            .command()
+            .envs(env.clone())
+            .args(["remove", "chat/test"])
+            .args(discard)
+            .output()
+            .unwrap();
+        success(&removed);
+        assert!(failed.exists(), "the wrapper never failed a removal");
+        assert!(!fixture.worktree.exists(), "{discard:?}");
+    }
+}
+
+/// Removing a large worktree spends seconds deleting files, and allocations
+/// for other branches must not wait for it. The wrapper holds `worktree
+/// remove` until the test releases it, so the create finishing first is an
+/// ordering check, not a timing one.
+#[test]
+fn creates_do_not_wait_for_a_removal_in_progress() {
+    let fixture = Fixture::new();
+    fixture.create(&[]);
+    let started = fixture.root.join("remove-started");
+    let release = fixture.root.join("remove-release");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "if [ \"$2\" = worktree ] && [ \"$3\" = remove ]; then\n\
+               : > '{started}'\n\
+               tries=0\n\
+               while [ ! -e '{release}' ] && [ $tries -lt 200 ]; do sleep 0.05; tries=$((tries + 1)); done\n\
+             fi\n",
+            started = started.display(),
+            release = release.display(),
+        ),
+    );
+
+    let mut removal = fixture
+        .command()
+        .envs(env.clone())
+        .args(["remove", "chat/test"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    while !started.exists() {
+        assert!(
+            removal.try_wait().unwrap().is_none(),
+            "removal exited early"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let created = fixture
+        .command()
+        .envs(env)
+        .args(["add", "agent/other", "--path"])
+        .arg(fixture.root.join("other"))
+        .output()
+        .unwrap();
+    let still_removing = removal.try_wait().unwrap().is_none();
+    fs::write(&release, "").unwrap();
+    success(&created);
+    success(&removal.wait_with_output().unwrap());
+    assert!(
+        still_removing,
+        "the create waited for the removal to finish"
+    );
+}
+
+/// A checkout-mode allocation runs the repository's `post-checkout` hook once,
+/// with the arguments `git worktree add` passes: a null old HEAD, the new HEAD
+/// and the branch-checkout flag.
+#[test]
+fn checkout_allocation_runs_the_post_checkout_hook() {
+    let fixture = Fixture::new();
+    let hook = fixture.repo.join(".git/hooks/post-checkout");
+    assert_checkout_runs_post_checkout_hook(&fixture, &mut fixture.command(), &hook);
+}
+
+/// Git also runs hooks defined in configuration, with no file in `hooks/`.
+#[test]
+fn checkout_allocation_runs_a_config_defined_post_checkout_hook() {
+    let fixture = Fixture::new();
+    let hook = fixture.root.join("marker-hook");
+    git(
+        &fixture.repo,
+        &["config", "hook.marker.command", hook.to_str().unwrap()],
+    );
+    git(
+        &fixture.repo,
+        &["config", "hook.marker.event", "post-checkout"],
+    );
+    let listed = Command::new("git")
+        .current_dir(&fixture.repo)
+        .args(["hook", "list", "post-checkout"])
+        .output()
+        .unwrap();
+    if !String::from_utf8_lossy(&listed.stdout).contains("marker") {
+        eprintln!("skipped: this Git has no config-defined hooks");
+        return;
+    }
+    assert_checkout_runs_post_checkout_hook(&fixture, &mut fixture.command(), &hook);
+}
+
+/// Git before 2.36 has no `git hook`. Ubuntu 22.04 ships 2.34, ext4 sends
+/// allocations to checkout mode, and git-lfs installs a `post-checkout` hook,
+/// so the hook must still run there. The wrapper answers like Git 2.34.
+#[test]
+fn checkout_allocation_runs_the_post_checkout_hook_without_git_hook() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let wrapper_dir = fixture.root.join("bin");
+    fs::create_dir(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("git");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+           version) echo 'git version 2.34.1'; exit 0 ;;\n\
+           hook) echo \"git: 'hook' is not a git command. See 'git --help'.\" >&2; exit 1 ;;\n\
+         esac\n\
+         exec \"$SIMGIT_TEST_REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(wrapper_dir)
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let mut command = fixture.command();
+    command
+        .env("PATH", path)
+        .env("SIMGIT_TEST_REAL_GIT", real_git);
+    let hook = fixture.repo.join(".git/hooks/post-checkout");
+    assert_checkout_runs_post_checkout_hook(&fixture, &mut command, &hook);
+}
+
+/// Install a hook script at `hook` that logs its arguments, allocate in
+/// checkout mode with `command`, and check the hook ran once as Git runs it.
+fn assert_checkout_runs_post_checkout_hook(fixture: &Fixture, command: &mut Command, hook: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let marker = fixture.root.join("post-checkout.log");
+    fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    fs::write(
+        hook,
+        format!("#!/bin/sh\necho \"$@\" >> '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let target = fixture.root.join("hooked");
+
+    success(
+        &command
+            .args(["add", "agent/hooked", "--path"])
+            .arg(&target)
+            .output()
+            .unwrap(),
+    );
+
+    let head = rev_parse(&target, "HEAD");
+    assert_eq!(
+        fs::read_to_string(&marker).expect("the hook did not run"),
+        format!("{} {head} 1\n", "0".repeat(head.len()))
+    );
+}
+
 /// Harnesses pre-create one directory per job and pass it as `--path`. An
 /// empty one holds nothing to lose; anything else is someone's data.
 #[test]

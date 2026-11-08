@@ -105,6 +105,9 @@ rejects it, because it owns the child's stdout. Location is always `--path`.
 | `simgit gc` | Reap idle ephemeral worktrees. `--older-than <90s\|30m\|24h\|7d>` (default 24h), `--prefix`, `--delete-branches`, `--include-persistent`, `--discard-dirty`, `--delete-unmerged`, `--dry-run`. |
 | `simgit prune` | Drop stale Git registrations, and cached baselines that are expired or that no ref reaches any more, never one an allocation is using; `--all` reclaims every baseline now. |
 | `simgit repair` | Remount overlay-backed worktrees after a reboot or interrupted mount (Linux). |
+| `simgit hook claude-code --requires <v>` | Store Claude Code's worktrees with simgit. Run by the Claude Code plugin, not by hand; rejects `--json`. |
+
+To use simgit as Claude Code's worktree storage, install the plugin: see [Claude Code](docs/agent-integration.md#claude-code).
 
 There is no `--force`: the two operations that can destroy work name what they
 destroy, and `--delete-unmerged` requires `--delete-branch`/`--delete-branches`

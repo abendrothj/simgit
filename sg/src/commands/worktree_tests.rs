@@ -630,6 +630,122 @@ fn branch_exists(repo: &RepoContext, branch: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
+#[test]
+fn create_worktree_accepts_a_claim_its_caller_holds() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let claim = BranchClaim::acquire(&repo, "held/branch")?;
+    let args = WorktreeAdd {
+        branch: Some("held/branch".to_owned()),
+        detach: false,
+        attach: false,
+        path: Some(fixture.root.join("held")),
+        sparse: Vec::new(),
+        base: None,
+        require_cow: false,
+        ephemeral: false,
+    };
+    let created = create_worktree(&repo, &fixture.repo, &args, Some(claim))?;
+    assert_eq!(created.branch.as_deref(), Some("held/branch"));
+    Ok(())
+}
+
+#[test]
+fn a_blocking_claim_waits_for_the_holder() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = Arc::new(discover_repo(&fixture.repo)?);
+    let held = BranchClaim::acquire(&repo, "b")?;
+    let started = std::time::Instant::now();
+    let waiter = {
+        let repo = Arc::clone(&repo);
+        std::thread::spawn(move || {
+            let claim = BranchClaim::acquire_blocking(&repo, "b");
+            (claim.is_ok(), started.elapsed())
+        })
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    drop(held);
+    let (acquired, elapsed) = waiter.join().expect("waiter thread");
+    assert!(acquired);
+    assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+    Ok(())
+}
+
+#[test]
+fn resolve_reuses_a_worktree_named_by_a_path_relative_to_cwd() -> Result<()> {
+    let _load = SpawnLoad::start();
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let template = |path: Option<PathBuf>| WorktreeAdd {
+        branch: Some("rel/branch".to_owned()),
+        detach: false,
+        attach: false,
+        path,
+        sparse: Vec::new(),
+        base: None,
+        require_cow: false,
+        ephemeral: false,
+    };
+    let existing = fixture.root.join("rel-worktree");
+    let claim = BranchClaim::acquire(&repo, "rel/branch")?;
+    let created = create_worktree(
+        &repo,
+        &fixture.root,
+        &template(Some(existing.clone())),
+        Some(claim),
+    )?;
+
+    // The process cwd is not fixture.root, so only `cwd` can resolve this.
+    // Blocking: a child forked by a parallel test holds the first claim's
+    // lock until it execs, so a fail-fast acquire can lose that race.
+    let claim = BranchClaim::acquire_blocking(&repo, "rel/branch")?;
+    let resolved = launch::resolve_branch_worktree(
+        &repo,
+        &fixture.root,
+        template(Some(PathBuf::from("rel-worktree"))),
+        claim,
+    )?;
+    match resolved {
+        launch::Resolved::Existing(path) => assert_eq!(path, created.target),
+        launch::Resolved::Created(_) => panic!("expected the existing worktree"),
+    }
+    Ok(())
+}
+
+/// Threads that keep spawning children, as parallel tests and a busy
+/// machine do. A child forked while a claim's file is open keeps its lock
+/// until it execs, even after the claim is dropped.
+struct SpawnLoad {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl SpawnLoad {
+    fn start() -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let threads = (0..6)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        Self { stop, threads }
+    }
+}
+
+impl Drop for SpawnLoad {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     repo: PathBuf,
@@ -769,7 +885,6 @@ fn root_clone_failure_restores_empty_worktree_before_fallback() -> Result<()> {
         "root-fallback",
         &target,
         &base,
-        false,
         WorktreeKind::NewBranch,
     )?;
     populate_cow_worktree(&target, &baseline)?;
@@ -795,7 +910,6 @@ fn per_file_adopted_stat_data_matches_git_refresh() -> Result<()> {
         "per-file-index",
         &target,
         &base,
-        false,
         WorktreeKind::NewBranch,
     )?;
     populate_by_file(&target, &baseline)?;
@@ -835,14 +949,7 @@ fn per_file_population_is_clean_and_preserves_file_kinds() -> Result<()> {
     let base = resolve_commit(&repo, "HEAD")?;
     let baseline = cow::ensure_baseline(&repo, &base)?.tree;
     let target = fixture.root.join("per-file");
-    register_worktree(
-        &repo,
-        "per-file",
-        &target,
-        &base,
-        false,
-        WorktreeKind::NewBranch,
-    )?;
+    register_worktree(&repo, "per-file", &target, &base, WorktreeKind::NewBranch)?;
     populate_by_file(&target, &baseline)?;
     assert_eq!(fs::read_to_string(target.join("file.txt"))?, "content\n");
     assert_eq!(
@@ -879,14 +986,7 @@ fn per_file_population_survives_a_baseline_without_published_index() -> Result<(
     let published = cow::baseline_index(&baseline).context("baseline publishes an index")?;
     fs::remove_file(published)?;
     let target = fixture.root.join("pre-index");
-    register_worktree(
-        &repo,
-        "pre-index",
-        &target,
-        &base,
-        false,
-        WorktreeKind::NewBranch,
-    )?;
+    register_worktree(&repo, "pre-index", &target, &base, WorktreeKind::NewBranch)?;
     populate_by_file(&target, &baseline)?;
     assert_eq!(fs::read_to_string(target.join("file.txt"))?, "content\n");
     Ok(())

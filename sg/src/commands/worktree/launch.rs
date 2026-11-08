@@ -3,15 +3,15 @@
 use super::{
     create_worktree, discover_repo, ensure_unlocked, git_failure, git_output_common,
     list_worktrees, mark_ephemeral, overlay, remove_file_if_present, worktree_admin_dir,
-    worktree_description, worktree_path_for_branch, RepoContext, WorktreeAdd, WorktreeEntry,
-    WorktreeLock,
+    worktree_description, worktree_path_for_branch, BranchClaim, CreatedWorktree, RepoContext,
+    WorktreeAdd, WorktreeEntry, WorktreeLock,
 };
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
 #[derive(Args)]
@@ -50,19 +50,108 @@ pub struct WorktreeRun {
     pub command: Vec<OsString>,
 }
 
+/// What `resolve_branch_worktree` found or made for a branch.
+pub(super) enum Resolved {
+    Existing(PathBuf),
+    Created(CreatedWorktree),
+}
+
+/// Reject creation-only options on a reused workspace, and a `--path` that
+/// names a different directory than the one registered.
+fn check_reuse(
+    cwd: &Path,
+    template: &WorktreeAdd,
+    branch: Option<&str>,
+    target: &Path,
+) -> Result<()> {
+    if template.base.is_some() || template.require_cow || !template.sparse.is_empty() {
+        bail!("--base, --require-cow and --sparse apply only when creating a worktree");
+    }
+    if let Some(path) = &template.path {
+        // The given path is often the mistake being reported, so it may
+        // not exist at all: compare resolved forms where possible and fall
+        // back to the literal ones rather than failing with a bare errno.
+        let path = &cwd.join(path);
+        let given = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let registered = target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
+        if given != registered {
+            let owner = match branch {
+                Some(name) => format!("branch '{name}'"),
+                None => "that workspace".to_owned(),
+            };
+            bail!(
+                "--path {} does not match the workspace registered for {owner}: {}\n\
+                 pass --path {} instead, or omit --path to reuse it",
+                path.display(),
+                target.display(),
+                target.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reuse the worktree registered for `template.branch`, or create one, all
+/// under `claim` so that a concurrent caller cannot create it in between.
+pub(super) fn resolve_branch_worktree(
+    repo: &RepoContext,
+    cwd: &Path,
+    template: WorktreeAdd,
+    claim: BranchClaim,
+) -> Result<Resolved> {
+    let branch = template
+        .branch
+        .clone()
+        .context("branch is required to create a workspace")?;
+    let existing = worktree_path_for_branch(repo, &branch)?
+        .or_else(|| overlay::worktree_for_branch(repo, &branch));
+    if let Some(target) = existing {
+        check_reuse(cwd, &template, Some(&branch), &target)?;
+        return Ok(Resolved::Existing(target));
+    }
+    let reference = format!("refs/heads/{branch}");
+    let exists = git_output_common(repo, ["show-ref", "--verify", "--quiet", &reference])?;
+    let attach = match exists.status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        _ => return Err(git_failure("look up branch", &exists)),
+    };
+    let created = create_worktree(repo, cwd, &WorktreeAdd { attach, ..template }, Some(claim))?;
+    Ok(Resolved::Created(created))
+}
+
 pub fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
     if json {
         bail!("--json is not supported with `run` because command output is streamed");
     }
-    let repo = discover_repo(&std::env::current_dir()?)?;
-    let (branch, existing) = match args.branch {
+    let cwd = std::env::current_dir()?;
+    let repo = discover_repo(&cwd)?;
+    let template = WorktreeAdd {
+        branch: args.branch,
+        detach: false,
+        attach: false,
+        path: args.path,
+        sparse: args.sparse,
+        base: args.base,
+        require_cow: args.require_cow,
+        ephemeral: args.ephemeral,
+    };
+    let (branch, target) = match template.branch.clone() {
         Some(branch) => {
-            let path = worktree_path_for_branch(&repo, &branch)?
-                .or_else(|| overlay::worktree_for_branch(&repo, &branch));
-            (Some(branch), path)
+            let claim = BranchClaim::acquire(&repo, &branch)?;
+            let target = match resolve_branch_worktree(&repo, &cwd, template, claim)? {
+                Resolved::Existing(path) => path,
+                Resolved::Created(created) => {
+                    eprintln!("mode: {}", created.mode.label());
+                    created.target
+                }
+            };
+            (Some(branch), target)
         }
         None => {
-            if args.base.is_some() || args.require_cow || !args.sparse.is_empty() {
+            if template.base.is_some() || template.require_cow || !template.sparse.is_empty() {
                 bail!(
                     "--base, --require-cow and --sparse require an explicit branch to create a worktree"
                 );
@@ -74,57 +163,9 @@ pub fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
                     .unwrap_or(&reference)
                     .to_owned()
             });
-            (branch, Some(entry.path))
+            check_reuse(&cwd, &template, branch.as_deref(), &entry.path)?;
+            (branch, entry.path)
         }
-    };
-    let target = if let Some(target) = existing {
-        if args.base.is_some() || args.require_cow || !args.sparse.is_empty() {
-            bail!("--base, --require-cow and --sparse apply only when creating a worktree");
-        }
-        if let Some(path) = &args.path {
-            // The given path is often the mistake being reported, so it may
-            // not exist at all: compare resolved forms where possible and fall
-            // back to the literal ones rather than failing with a bare errno.
-            let given = path.canonicalize().unwrap_or_else(|_| path.clone());
-            let registered = target.canonicalize().unwrap_or_else(|_| target.clone());
-            if given != registered {
-                let owner = match branch.as_deref() {
-                    Some(name) => format!("branch '{name}'"),
-                    None => "that workspace".to_owned(),
-                };
-                bail!(
-                    "--path {} does not match the workspace registered for {owner}: {}\n\
-                     pass --path {} instead, or omit --path to reuse it",
-                    path.display(),
-                    target.display(),
-                    target.display()
-                );
-            }
-        }
-        target
-    } else {
-        let branch = branch
-            .as_ref()
-            .context("branch is required to create a workspace")?;
-        let reference = format!("refs/heads/{branch}");
-        let exists = git_output_common(&repo, ["show-ref", "--verify", "--quiet", &reference])?;
-        let attach = match exists.status.code() {
-            Some(0) => true,
-            Some(1) => false,
-            _ => return Err(git_failure("look up branch", &exists)),
-        };
-        let created = create_worktree(&WorktreeAdd {
-            branch: Some(branch.clone()),
-            detach: false,
-            attach,
-            path: args.path,
-            sparse: args.sparse,
-            base: args.base,
-            require_cow: args.require_cow,
-            ephemeral: args.ephemeral,
-        })?;
-        eprintln!("mode: {}", created.mode.label());
-        created.target
     };
     // Git's lock also protects against native `git worktree remove/prune`.
     // A killed launcher leaves the lock in place; `simgit unlock` clears it,

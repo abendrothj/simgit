@@ -1,8 +1,8 @@
 use super::{
     cow, discover_repo, emit, ensure_unlocked, git_common_command, git_failure, git_output_common,
-    is_ephemeral, list_worktrees, overlay, parse_duration, run_git_common,
-    stale_worktree_registrations, teardown_worktree, worktree_dirty, worktree_idle, RepoContext,
-    WorktreeLock,
+    git_worktree_list, is_ephemeral, list_worktrees, overlay, parse_duration, run_git_common,
+    stale_worktree_registrations, teardown_worktree, worktree_dirty, worktree_idle, RegistryLock,
+    RepoContext, WorktreeLock,
 };
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -60,7 +60,10 @@ pub(super) fn prune_git_worktrees(repo: &RepoContext) -> Result<()> {
             locks.push(WorktreeLock::acquire(repo, &path)?);
         }
     }
-    run_git_common(repo, ["worktree", "prune"])?;
+    {
+        let _registry = RegistryLock::exclusive(repo)?;
+        run_git_common(repo, ["worktree", "prune"])?;
+    }
     for lock in locks {
         lock.release()?;
     }
@@ -174,7 +177,7 @@ fn commit_reachable(repo: &RepoContext, commit: &str, detached_heads: &[String])
 
 /// The worktree paths Git currently reports as prunable registrations.
 fn stale_registrations(repo: &RepoContext) -> Result<Vec<String>> {
-    let output = git_output_common(repo, ["worktree", "list", "--porcelain", "-z"])?;
+    let output = git_worktree_list(repo)?;
     if !output.status.success() {
         return Err(git_failure("git worktree list --porcelain", &output));
     }
@@ -359,7 +362,11 @@ pub(super) fn delete_local_branch(repo: &RepoContext, branch_ref: &str, force: b
     }
     let mut command = git_common_command(repo);
     command.args(["branch", if force { "-D" } else { "-d" }, branch]);
-    let output = command.output().context("delete worktree branch")?;
+    // Git refuses to delete a checked-out branch, so this reads every registration.
+    let output = {
+        let _registry = RegistryLock::shared(repo)?;
+        command.output().context("delete worktree branch")?
+    };
     if output.status.success() {
         return Ok(());
     }

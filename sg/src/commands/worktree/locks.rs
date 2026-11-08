@@ -229,18 +229,22 @@ pub(super) struct BranchClaim {
 }
 
 impl BranchClaim {
-    pub(super) fn acquire(repo: &RepoContext, branch: &str) -> Result<Self> {
+    fn open(repo: &RepoContext, branch: &str) -> Result<fs::File> {
         let directory = state_dir(&repo.common_git_dir)
             .join("claims")
             .join("branches");
         fs::create_dir_all(&directory).context("create the branch claim directory")?;
         let path = directory.join(format!("{}.lock", key_digest(branch.as_bytes())));
-        let file = fs::OpenOptions::new()
+        fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
+            .with_context(|| format!("open {}", path.display()))
+    }
+
+    pub(super) fn acquire(repo: &RepoContext, branch: &str) -> Result<Self> {
+        let file = Self::open(repo, branch)?;
         match file.try_lock() {
             Ok(()) => Ok(Self { _file: file }),
             Err(fs::TryLockError::WouldBlock) => bail!(
@@ -251,6 +255,76 @@ impl BranchClaim {
                 Err(error).with_context(|| format!("claim the branch '{branch}'"))
             }
         }
+    }
+
+    /// Like `acquire`, but waits for the holder instead of failing.
+    pub(super) fn acquire_blocking(repo: &RepoContext, branch: &str) -> Result<Self> {
+        let file = Self::open(repo, branch)?;
+        file.lock()
+            .with_context(|| format!("claim the branch '{branch}'"))?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// A repository-wide lock on Git's worktree registry, `.git/worktrees/`.
+///
+/// While `git worktree add` registers a worktree its admin directory is
+/// half-written, and any Git command that reads every registration then dies
+/// with "failed to read .../commondir". simgit holds this exclusively around
+/// `git worktree add` and `prune`, and shared around the quick Git commands
+/// that read all registrations (`list`, `branch -d`), each only for that one
+/// command. `worktree remove` and `fetch` can take seconds, so they run
+/// unlocked and retry that failure instead.
+///
+/// Lock order: `BranchClaim`, then `PathClaim`, then this. It is taken last
+/// and never held while acquiring anything else, so it cannot deadlock.
+pub(super) struct RegistryLock {
+    _file: Option<fs::File>,
+}
+
+impl RegistryLock {
+    fn path(repo: &RepoContext) -> PathBuf {
+        state_dir(&repo.common_git_dir)
+            .join("claims")
+            .join("registry.lock")
+    }
+
+    fn create(path: &Path) -> std::io::Result<fs::File> {
+        if let Some(directory) = path.parent() {
+            fs::create_dir_all(directory)?;
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+    }
+
+    /// Held while a Git command creates or deletes a registration.
+    pub(super) fn exclusive(repo: &RepoContext) -> Result<Self> {
+        let path = Self::path(repo);
+        let file = Self::create(&path).with_context(|| format!("open {}", path.display()))?;
+        file.lock().context("lock the worktree registry")?;
+        Ok(Self { _file: Some(file) })
+    }
+
+    /// Held while a Git command reads every registration. A process that
+    /// cannot create the lock file cannot register a worktree either, so in a
+    /// repository it may only read, it reads unlocked rather than failing.
+    pub(super) fn shared(repo: &RepoContext) -> Result<Self> {
+        let path = Self::path(repo);
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match Self::create(&path) {
+                    Ok(file) => file,
+                    Err(_) => return Ok(Self { _file: None }),
+                }
+            }
+            Err(error) => return Err(error).with_context(|| format!("open {}", path.display())),
+        };
+        file.lock_shared().context("lock the worktree registry")?;
+        Ok(Self { _file: Some(file) })
     }
 }
 

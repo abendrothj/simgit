@@ -1,0 +1,6 @@
+{
+  "name": "simgit",
+  "version": "0.5.0",
+  "description": "Stores every Claude Code worktree with simgit (copy-on-write, outside the repository)",
+  "hooks": "./integrations/claude-code/hooks.json"
+}

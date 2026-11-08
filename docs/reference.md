@@ -1,7 +1,7 @@
 # simgit reference
 
 Detailed semantics for the flat command surface
-(`simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair`).
+(`simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair|hook`).
 [README.md](../README.md) is the overview; this file is the contract each
 command actually implements. `simgit` is the canonical executable and `sg` is an
 equivalent alias; examples use `simgit`.
@@ -40,6 +40,53 @@ branch name instead.
 `unlock` is idempotent in the same way and one step further: a target that is
 not locked, and a target that no longer exists at all, both exit 0 and report
 `was_locked: false`. Crash recovery can call it unconditionally.
+
+## `hook`
+
+```sh
+simgit hook claude-code --requires <version> [--discard-dirty]
+```
+
+Adapts a Claude Code hook to simgit's worktrees: it reads one hook payload on
+stdin and acts on its `hook_event_name`. `claude-code` is the only provider.
+The Claude Code plugin runs it; see [Claude Code](agent-integration.md#claude-code)
+for install, behaviour and limits. Do not run it by hand.
+
+- `--requires <version>` exits 1 with one stderr line when the running simgit
+  is older than the `X.Y.Z` given. A newer one is accepted.
+- `--discard-dirty` lets `WorktreeRemove` discard uncommitted work, as Claude
+  Code's own `git worktree remove --force` does. Without it `hook` never
+  discards. Untracked and uncommitted files are discarded; gitignored files go
+  with the worktree, as with `remove`.
+- Global `--json` is rejected: the harness fixes the output.
+- Exit codes are 0 and 1. clap usage errors, such as an unknown subcommand,
+  exit 2.
+
+Branches are `simgit/<name>`, checked with `git check-ref-format --branch`; a
+subagent's is `simgit/agent-<agent_id>`. New worktrees start at
+`refs/remotes/origin/HEAD` when it exists, else `HEAD`, with no fetch. A name
+matching `pr-<digits>` instead fetches `pull/<n>/head`, or
+`merge-requests/<n>/head` when origin has no such pull ref, from origin (git
+2.29 or newer, for `--no-write-fetch-head`) and starts there. If origin has
+neither ref, creation fails; any other fetch failure fails it with Git's error.
+`GIT_TERMINAL_PROMPT=0` stops HTTPS credential prompts, but an ssh key that
+needs a passphrase and has no agent can still prompt. A reused `pr-<n>`
+worktree is not refetched. Allocations are persistent.
+
+| Event | Action | stdout | Exit |
+|---|---|---|---|
+| `WorktreeCreate` | Under the branch claim: reuse the `simgit/<name>` worktree, else attach the branch if it exists, else create it from the base. Never returns the main checkout, and refuses a worktree locked by `run`. A worktree deleted by hand is pruned first, so its branch is attached again at its old tip. | the path only | 1 with one stderr line on failure |
+| `WorktreeRemove` | Only a worktree on a `simgit/*` branch; others are refused. Removes it (refusing a dirty one without `--discard-dirty`), then drops the branch if no commit on it is unreached by another ref. A path that no longer exists succeeds; if Git still registers it, the registration is pruned and the branch dropped by the same rule. | nothing | 1 when refused or failed |
+| `SubagentStop` | Removes the `simgit/agent-<agent_id>` worktree and branch when it is clean, unlocked and holds no unreached commit. Otherwise keeps it. A worktree deleted by hand has its registration pruned and its branch dropped by the same rule. It does nothing when the branch is not checked out in a worktree. | nothing | always 0 |
+| `SessionStart` | Nothing; the plugin uses it to check the version. | nothing | 0 |
+| any other | Nothing. | nothing | 0 |
+
+A branch is dropped by `hook` only when `git rev-list --single-worktree
+<branch> --not --exclude=refs/heads/<branch> --all` is empty. `--all` counts
+every other ref, including `refs/stash` and remote-tracking refs, so pushed
+commits count as reached. That differs from `remove --delete-branch`, whose
+merged check compares against the main checkout's `HEAD`; `hook` never passes
+`--delete-unmerged` and never deletes a commit no other ref reaches.
 
 ## Where worktrees live
 
@@ -166,17 +213,24 @@ the recorded owner is still alive and names that PID — stop that process inste
 of looking for an override flag, because there is none. A lock file written
 before locks recorded a PID counts as unknown-owner and can be cleared.
 
-Allocating takes three more locks, and none of them needs `unlock`. An `add`,
+Allocating takes four more locks, and none of them needs `unlock`. An `add`,
 or a `run` that creates its workspace, claims the destination path and, when
 it names a branch, the branch, so two allocations for one path or one branch
-never both proceed; the second fails at once rather than waiting. While it
+never both proceed. For `add` and `run` the second fails at once; `hook`
+waits for the first to finish and then reuses its worktree. While it
 uses a baseline it also holds the baseline cache lock shared, which keeps
 `prune` from removing that baseline (see [Baselines and `prune`](#baselines-and-prune)).
 The branch claims (`.git/simgit/claims/branches/`) and the cache lock
 (`.git/simgit/baselines.lock`) are operating-system file locks on files that
 are never deleted, so the kernel releases them when the process exits, however
 it exits. A path claim left by a killed allocator is taken over by the next
-allocation of that path once the PID it records is gone.
+allocation of that path once the PID it records is gone. Allocations for
+different branches and paths run concurrently, waiting for one another only
+while Git registers each new worktree, under the registry lock
+(`.git/simgit/claims/registry.lock`), another operating-system file lock.
+`list`, branch deletion and `prune` wait for a registration in progress, and
+it waits for them; each holds the lock for one quick Git command. Removing a
+worktree does not take it, so an allocation never waits for a large removal.
 
 Commands launched outside `simgit run` are not tracked. Idle age uses index and
 directory modification time, so it is only a cleanup heuristic for explicitly
@@ -186,7 +240,7 @@ disposable workspaces.
 
 The global `--json` flag gives orchestrators structured output from `doctor`,
 `add`, `remove`, `list`, `unlock`, `gc`, `prune` and `repair`; it is accepted
-before or after the command, and `run` is the one command that rejects it. A
+before or after the command, and `run` and `hook` are the commands that reject it. A
 `--json` failure, including an argument-parsing error, emits no JSON: nonzero
 exit, empty stdout, one line of diagnostic text on stderr. That line replaces
 each line break with one space, drops blank lines, and keeps all other
