@@ -1,6 +1,6 @@
 use super::{
     absolute_path, cow, default_worktree_path, discover_repo, emit, filesystem_name,
-    git_output_common, lexical_normalize, main_worktree, nearest_existing_directory, resolved_path,
+    git_worktree_list, lexical_normalize, main_worktree, nearest_existing_directory, resolved_path,
     select_populate_mode, stale_worktree_registrations, RepoContext,
 };
 use anyhow::{Context, Result};
@@ -36,7 +36,7 @@ fn doctor_in_repository(repo: &RepoContext, json: bool) -> Result<()> {
     let filesystem = filesystem_name(&probe);
     let cow_supported = cow::clone_supported(&repo.common_git_dir, &probe).ok();
     let populate_mode = select_populate_mode(repo, &probe, false)?.label();
-    let git_worktree = git_output_common(repo, ["worktree", "list", "--porcelain", "-z"])?;
+    let git_worktree = git_worktree_list(repo)?;
     let git_worktree_supported = git_worktree.status.success();
     let stale = if git_worktree_supported {
         stale_worktree_registrations(&git_worktree.stdout)

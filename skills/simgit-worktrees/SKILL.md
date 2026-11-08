@@ -87,10 +87,12 @@ Outside a Git worktree those repository fields are `null` and the stale-registra
 
 Stop on an identity mismatch, unsupported Git worktrees, or an ownership problem. Treat stale registrations and retained baselines as state to review, not permission to delete work. Never allocate inside the source repository: override an unsafe default and choose an explicit absolute allocation root outside the source repository.
 
-This skill describes simgit 0.4.0. Compare `doctor --json`'s `version` with it before relying on anything below:
+This skill describes simgit 0.5.0. Compare `doctor --json`'s `version` with it before relying on anything below:
 
 - Older than 0.4.0: `add --attach`, the per-branch allocation claim, and `prune`'s `cache_busy` field do not exist, and `prune` may delete a baseline an allocation is using. Tell the user, and either get approval to upgrade (see **Install safely**) or limit yourself to what the installed version documents in its `--help`; for an existing branch, `simgit run <branch> -- <command>` works on older versions.
-- Newer than 0.4.0: this copy of the skill may be stale. Ask the user to refresh it (`npx skills update simgit-worktrees -g`, or a fresh copy for a manual install) before depending on behavior it does not describe.
+- Newer than 0.5.0: this copy of the skill may be stale. Ask the user to refresh it (`npx skills update simgit-worktrees -g`, or a fresh copy for a manual install) before depending on behavior it does not describe.
+
+With the simgit Claude Code plugin active, the harness allocates and removes worktrees through `simgit hook`, so the agent does not run simgit for its own infrastructure and works inside the directory it is given.
 
 ## Allocate with JSON
 

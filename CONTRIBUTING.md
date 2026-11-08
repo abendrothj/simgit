@@ -122,6 +122,13 @@ Published as `simgit-cli` on crates.io. The crate ships two binaries: `simgit`
    If `skills/simgit-worktrees/SKILL.md` now relies on behavior new in this
    release, raise the version its Preflight section names in the same commit:
    the skill is installed from `main`, so agents read it before users upgrade.
+   The Claude Code plugin ships from the same commit. Bump `version` in
+   `.claude-plugin/plugin.json` every release (Claude Code caches plugins by
+   version, and a test checks it equals the crate version). When the adapter's
+   behaviour changes, also raise the `--requires` values and the `systemMessage`
+   version in `integrations/claude-code/hooks.json` to the new version; leave
+   them alone otherwise, since they are the oldest release that behaves as the
+   plugin expects.
 2. Tag and push: `git tag -a vX.Y.Z -m "…" && git push origin main vX.Y.Z`.
    The `v*` tag triggers `.github/workflows/release.yml`, which reruns the gates
    above, builds the four targets (`aarch64`/`x86_64` × macOS/Linux), packages
@@ -133,6 +140,9 @@ Published as `simgit-cli` on crates.io. The crate ships two binaries: `simgit`
    symlink; refresh its `url`/`sha256` for the new tag
    (`curl -sL <tarball> | shasum -a 256`) and copy it into the
    `abendrothj/homebrew-tap` repo's `Formula/simgit.rb`.
+5. Move the `ref` in `.claude-plugin/marketplace.json` to the new tag, only after
+   the Homebrew formula serves that release, so the plugin never gets ahead of
+   brew.
 
 ## Communication
 

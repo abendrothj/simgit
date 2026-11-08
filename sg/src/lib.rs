@@ -32,6 +32,8 @@
 //!   and launch any command inside it
 //! - `simgit unlock [branch|path]` — clear a `run` lock left behind by a
 //!   launcher that was killed, unless the process holding it is still alive
+//! - `simgit hook claude-code --requires X.Y.Z` — handle one Claude Code hook
+//!   payload read from stdin, refusing to run on an older simgit
 //! - `simgit gc` — reap idle/ephemeral worktrees and optionally branches
 //! - `simgit repair` — remount interrupted Linux overlay worktrees
 //! - `simgit prune` — prune stale worktree registrations and cached baselines
@@ -87,6 +89,8 @@ enum Commands {
     Run(commands::worktree::WorktreeRun),
     /// Clear a stranded `run` lock, by path or by branch name.
     Unlock(commands::worktree::WorktreeUnlock),
+    /// Handle an agent harness's hook payload read from stdin.
+    Hook(commands::worktree::WorktreeHook),
     /// Reap idle/ephemeral worktrees (e.g. abandoned agent sandboxes).
     Gc(commands::worktree::WorktreeGc),
     /// Prune stale Git registrations and old or unreachable cached baselines.
@@ -153,6 +157,8 @@ pub fn run_cli() -> Result<()> {
         error.exit()
     });
     let json = cli.json;
+    // The harness shows a failed hook's stderr to the person: one line, too.
+    let one_line_errors = json || matches!(cli.command, Commands::Hook(_));
     let result = match cli.command {
         Commands::Doctor => commands::worktree::doctor(json),
         Commands::Add(args) => commands::worktree::add(args, json),
@@ -160,11 +166,12 @@ pub fn run_cli() -> Result<()> {
         Commands::Remove(args) => commands::worktree::remove(args, json),
         Commands::Run(args) => commands::worktree::run_in_worktree(args, json),
         Commands::Unlock(args) => commands::worktree::unlock(args, json),
+        Commands::Hook(args) => commands::worktree::hook(args, json),
         Commands::Gc(args) => commands::worktree::gc(args, json),
         Commands::Prune(args) => commands::worktree::prune(args, json),
         Commands::Repair => commands::worktree::repair(json),
     };
-    if json {
+    if one_line_errors {
         result.map_err(|error| anyhow::anyhow!(one_line(&format!("{error:#}"))))
     } else {
         result

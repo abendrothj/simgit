@@ -29,13 +29,16 @@ Linux and in CI; do not treat them as gates on macOS.
   from the same code. Use `simgit` in docs and examples.
 - Command lifecycle lives in `sg/src/commands/worktree.rs`; the backends live in
   `sg/src/commands/worktree/{cow,overlay,launch,index}.rs`.
+- `simgit hook` (the Claude Code adapter) lives in
+  `sg/src/commands/worktree/hook.rs`.
 
 ### Command surface invariants
 
 - The surface is flat:
-  `simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair`.
+  `simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair|hook`.
   There is no `worktree` namespace.
-- `--json` is global only; never add a per-subcommand `--json`.
+- `--json` is global only; never add a per-subcommand `--json`. `hook` rejects
+  it, like `run`, because the harness fixes the output.
 - Location is always `--path`.
 - There is no `--force`. `--discard-dirty` permits removing a worktree with
   uncommitted changes, and `--delete-unmerged` permits deleting an unmerged
@@ -101,9 +104,11 @@ only works if the destructive surface is small, named, and stable, so treat
 this as a compatibility contract rather than a description:
 
 - Exactly two flags destroy work that Git cannot give back:
-  `--discard-dirty` (uncommitted and untracked files in a worktree, on `remove`
-  and `gc`) and `--delete-unmerged` (branch deletion past the merged check, on
-  `remove` and `gc`). Never rename them, and never widen what they cover.
+  `--discard-dirty` (uncommitted and untracked files in a worktree, on `remove`,
+  `gc` and `hook`) and `--delete-unmerged` (branch deletion past the merged
+  check, on `remove` and `gc`). Never rename them, and never widen what they
+  cover. `hook` never takes `--delete-unmerged`; it may delete a branch the
+  merged check would keep, but only when no commit on it becomes unreachable.
 - Any new operation that can destroy uncommitted work or unmerged commits MUST
   be gated behind one of those two flags. A third destructive flag is a last
   resort, and adding one means updating this list in the same change.
@@ -112,7 +117,7 @@ this as a compatibility contract rather than a description:
   and skips locked ones, branch deletion stops at the merged check, `prune`
   drops only caches that rematerialize, `repair` only remounts, and `unlock`
   refuses a live owner with no override. Gates classify `doctor`, `list`,
-  `unlock`, `prune`, `repair`, flagless `add`/`remove`/`gc`, and `add --attach`
+  `unlock`, `prune`, `repair`, flagless `add`/`remove`/`gc`/`hook`, and `add --attach`
   (which checks out an existing branch without moving or deleting it) as
   automatic on that basis; a change that breaks it silently turns an approved
   command destructive.
