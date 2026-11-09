@@ -2,4 +2,6 @@ The simgit plugin makes Claude Code store every worktree it creates with simgit,
 
 Install simgit: `brew install abendrothj/tap/simgit`, then add the plugin: `claude plugin install simgit --marketplace abendrothj/simgit`.
 
-Details: [docs/agent-integration.md](../../docs/agent-integration.md#claude-code).
+Codex loads the same plugin: `codex plugin marketplace add abendrothj/simgit`, then `codex plugin add simgit@simgit`.
+
+Details: [docs/agent-integration.md](../../docs/agent-integration.md#claude-code) and [Codex](../../docs/agent-integration.md#codex).

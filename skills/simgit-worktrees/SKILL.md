@@ -92,7 +92,7 @@ This skill describes simgit 0.5.0. Compare `doctor --json`'s `version` with it b
 - Older than 0.4.0: `add --attach`, the per-branch allocation claim, and `prune`'s `cache_busy` field do not exist, and `prune` may delete a baseline an allocation is using. Tell the user, and either get approval to upgrade (see **Install safely**) or limit yourself to what the installed version documents in its `--help`; for an existing branch, `simgit run <branch> -- <command>` works on older versions.
 - Newer than 0.5.0: this copy of the skill may be stale. Ask the user to refresh it (`npx skills update simgit-worktrees -g`, or a fresh copy for a manual install) before depending on behavior it does not describe.
 
-With the simgit Claude Code plugin active, the harness allocates and removes worktrees through `simgit hook`, so the agent does not run simgit for its own infrastructure and works inside the directory it is given.
+In Claude Code with the simgit plugin active, the harness allocates and removes worktrees through `simgit hook`, so the agent does not run simgit for its own infrastructure and works inside the directory it is given. In Codex the same plugin brings this skill, but its hooks never allocate: when the work needs isolation, the agent uses the fast path above itself, runs its commands with the returned `path` as the working directory, and cleans up with the `cleanup_token`.
 
 ## Allocate with JSON
 
