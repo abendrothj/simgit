@@ -71,12 +71,16 @@ impl HookFixture {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn simgit");
-        child
+        // A hook refused before it reads its payload (`--json`, a bad
+        // `--requires`) may exit first; the broken pipe is then expected.
+        if let Err(error) = child
             .stdin
             .take()
             .expect("stdin")
             .write_all(stdin.as_bytes())
-            .expect("write stdin");
+        {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "write stdin");
+        }
         child.wait_with_output().expect("wait for simgit")
     }
 
@@ -152,6 +156,17 @@ fn requires_refuses_an_older_binary_with_exit_1() {
 fn json_flag_is_rejected() {
     let fixture = HookFixture::new();
     let output = fixture.run(&["--json"], &[], r#"{"hook_event_name":"SessionStart"}"#);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+
+    // The refusal comes before stdin is read. A payload larger than a pipe
+    // buffer makes the writer outlive the reader every time, not just
+    // sometimes.
+    let large = format!(
+        r#"{{"hook_event_name":"SessionStart","pad":"{}"}}"#,
+        "x".repeat(1 << 20)
+    );
+    let output = fixture.run(&["--json"], &[], &large);
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
 }
