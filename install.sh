@@ -5,7 +5,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/abendrothj/simgit/main/install.sh | sh
 #
 # Environment:
-#   SIMGIT_VERSION      tag to install (default: latest release)
+#   SIMGIT_VERSION      release to install, vX.Y.Z or X.Y.Z (default: latest)
 #   SIMGIT_INSTALL_DIR  install directory (default: ~/.local/bin)
 #
 # No Rust toolchain and no jq required. Unsupported platforms are reported
@@ -21,6 +21,21 @@ die() {
 	printf 'simgit: %s\n' "$1" >&2
 	exit 1
 }
+
+# A tag is vX.Y.Z; accept it with or without the v. Anything else would be
+# pasted into a download URL.
+if [ -n "$VERSION" ]; then
+	number=${VERSION#v}
+	patch=${number#*.*.}
+	case "$number" in
+	"" | *[!0-9.]* | .* | *. | *..* | "$patch") number= ;;
+	esac
+	case "$patch" in
+	"" | *.*) number= ;;
+	esac
+	[ -n "$number" ] || die "SIMGIT_VERSION must look like v1.2.3, got: $VERSION"
+	VERSION="v$number"
+fi
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -58,7 +73,7 @@ url="${release_url}/${asset}"
 sums_url="${release_url}/SHA256SUMS"
 
 if command -v curl >/dev/null 2>&1; then
-	fetch() { curl -fsSL "$1" -o "$2"; }
+	fetch() { curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2"; }
 elif command -v wget >/dev/null 2>&1; then
 	fetch() { wget -qO "$2" "$1"; }
 else
@@ -189,6 +204,13 @@ case ":${PATH:-}:" in
 	;;
 esac
 
+# The hint matters only where clones are not copy-on-write, so ask simgit's own
+# probe about the install filesystem, which is usually the one holding $HOME.
 if [ "$os" = Linux ] && ! command -v fuse-overlayfs >/dev/null 2>&1; then
-	printf 'simgit: fuse-overlayfs not found — on a non-reflink filesystem (ext4) simgit falls back to a plain checkout.\n         Install it (e.g. apt-get install fuse-overlayfs) to keep the copy-on-write path.\n'
+	case "$(cd "$INSTALL_DIR" && "$INSTALL_DIR/simgit" --json doctor 2>/dev/null)" in
+	*'"cow_supported": true'*) ;;
+	*)
+		printf 'simgit: fuse-overlayfs not found — on a non-reflink filesystem (ext4) simgit falls back to a plain checkout.\n         Install it (e.g. apt-get install fuse-overlayfs) to keep the copy-on-write path.\n'
+		;;
+	esac
 fi

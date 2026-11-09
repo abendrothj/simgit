@@ -63,6 +63,9 @@ Method and full results:
 
 ## Install
 
+simgit needs Git 2.39 or newer, and building it from source needs Rust 1.89
+or newer; CI tests both.
+
 On macOS, prefer the Homebrew formula: it uses a versioned release asset with a
 pinned SHA-256 digest.
 

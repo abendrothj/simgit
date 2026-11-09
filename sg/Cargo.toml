@@ -3,6 +3,7 @@ name        = "simgit-cli"
 description = "simgit — disk-efficient copy-on-write Git worktrees for running many agents at once"
 version.workspace     = true
 edition.workspace     = true
+rust-version.workspace = true
 license.workspace     = true
 repository.workspace  = true
 homepage    = "https://github.com/abendrothj/simgit"

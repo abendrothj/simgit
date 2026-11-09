@@ -129,12 +129,17 @@ Published as `simgit-cli` on crates.io. The crate ships two binaries: `simgit`
    version in `integrations/claude-code/hooks.json` to the new version; leave
    them alone otherwise, since they are the oldest release that behaves as the
    plugin expects.
-2. Tag and push: `git tag -a vX.Y.Z -m "…" && git push origin main vX.Y.Z`.
-   The `v*` tag triggers `.github/workflows/release.yml`, which reruns the gates
-   above, builds the four targets (`aarch64`/`x86_64` × macOS/Linux), packages
-   both binaries into each `sg-<target>.tar.gz`, and publishes a `SHA256SUMS`
-   manifest covering all four archives. `install.sh` verifies that manifest
-   before extracting, so never edit or replace release assets by hand.
+2. Push `main` and wait for its CI to pass, then tag that commit and push the
+   tag: `git tag -a vX.Y.Z -m "…" && git push origin vX.Y.Z`.
+   The `v*` tag triggers `.github/workflows/release.yml`. It refuses a tag
+   whose commit is not on `main` or has no successful CI run, reruns the gates
+   above and `cargo package`, builds the four targets (`aarch64`/`x86_64` ×
+   macOS/Linux), smoke-tests the native archives, packages both binaries into
+   each `sg-<target>.tar.gz`, and writes a `SHA256SUMS` manifest covering all
+   four. It stages them on a draft release, checks what GitHub serves against
+   the manifest, and only then publishes. A rerun refuses a release that is
+   already published. `install.sh` verifies that manifest before extracting,
+   so never edit or replace release assets by hand.
 3. `cargo publish -p simgit-cli`.
 4. Homebrew: `packaging/homebrew/simgit.rb` installs `simgit` with an `sg`
    symlink; refresh its `url`/`sha256` for the new tag

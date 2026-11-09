@@ -47,6 +47,20 @@ jobs:
       - run: cargo test --all --locked
       - run: python3 tests/cli_picker.py
 
+  minimums:
+    # The oldest Rust (rust-version) and Git that simgit supports, in one
+    # image: Rust 1.89 on Debian bookworm, whose Git is 2.39. simgit's own
+    # floor is Git 2.36, for `git worktree list -z`.
+    runs-on: ubuntu-latest
+    container: rust:1.89-bookworm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          key: minimums
+      - run: git --version && rustc --version
+      - run: cargo test --all --locked
+
   reflink-linux:
     # Exercises the native FICLONE path on a real reflink filesystem; the
     # standard Ubuntu runner filesystem is not guaranteed to support it.

@@ -9,16 +9,22 @@ on:
   push:
     tags: ["v*"]
 
+# Only the job that publishes may write; everything before it reads.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
     # Nine commits were released this session while CI was red. Artifacts now
     # require the same gate CI applies, so a tag cannot ship a broken tree.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           components: clippy, rustfmt
@@ -31,25 +37,61 @@ jobs:
             echo "release tag $GITHUB_REF_NAME does not match simgit-cli v$version" >&2
             exit 1
           fi
+      - name: Verify the tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "release tag $GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main" >&2
+            exit 1
+          fi
+      - name: Verify CI passed for the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          passed="$(gh run list --repo "$GITHUB_REPOSITORY" --commit "$GITHUB_SHA" \
+            --workflow ci.yml --status success --json databaseId --jq length)"
+          if [ "$passed" -eq 0 ]; then
+            echo "no successful CI run for $GITHUB_SHA; tag a commit whose CI is green" >&2
+            exit 1
+          fi
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # Packaging builds the crate from the files crates.io would get, which
+      # catches a manifest or include list that only works in this checkout.
+      - run: cargo package --locked -p simgit-cli
+
+  test:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: cargo test --all --locked
       - run: python3 tests/cli_picker.py
 
   build:
-    needs: verify
+    needs: test
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+            native: true
           - target: x86_64-apple-darwin
             os: macos-latest
+            native: false
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            native: true
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
+            native: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -71,6 +113,17 @@ jobs:
           cp "target/${{ matrix.target }}/release/simgit" "$dir/sg"
           cp README.md LICENSE "$dir/"
           tar czf "$dir.tar.gz" "$dir"
+      # Run what a user would install, from the archive itself, on the
+      # targets this runner can execute.
+      - name: Smoke-test the archive
+        if: matrix.native
+        run: |
+          smoke="$(mktemp -d)"
+          tar xzf "sg-${{ matrix.target }}.tar.gz" -C "$smoke"
+          bin="$smoke/sg-${{ matrix.target }}"
+          cmp "$bin/simgit" "$bin/sg"
+          test "$("$bin/simgit" --version)" = "simgit ${GITHUB_REF_NAME#v}"
+          (cd "$smoke" && "$bin/simgit" --json doctor >/dev/null)
       - name: Upload packaged target
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -82,6 +135,8 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       # `gh release create --verify-tag` resolves the tag through git, so the
       # publishing job needs the repository, not just the built artifacts.
@@ -104,13 +159,20 @@ jobs:
             sg-x86_64-unknown-linux-gnu.tar.gz \
             > SHA256SUMS
           test "$(wc -l < SHA256SUMS)" -eq 4
-      - name: Attach archives and checksum manifest to release
+      # Stage everything on a draft and check what GitHub now serves before
+      # anyone can see it; only then publish.
+      - name: Stage the release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="$GITHUB_REF_NAME"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --verify-tag --title "$tag" --generate-notes
+          if gh release view "$tag" >/dev/null 2>&1; then
+            if [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" != true ]; then
+              echo "release $tag is already published; refusing to replace its assets" >&2
+              exit 1
+            fi
+          else
+            gh release create "$tag" --draft --verify-tag --title "$tag" --generate-notes
           fi
           gh release upload "$tag" \
             dist/sg-aarch64-apple-darwin.tar.gz \
@@ -119,3 +181,16 @@ jobs:
             dist/sg-x86_64-unknown-linux-gnu.tar.gz \
             dist/SHA256SUMS \
             --clobber
+      - name: Check the staged assets against the checksum manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          staged="$(mktemp -d)"
+          gh release download "$GITHUB_REF_NAME" --dir "$staged"
+          cd "$staged"
+          test "$(find . -type f | wc -l)" -eq 5
+          sha256sum -c SHA256SUMS
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
