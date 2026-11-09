@@ -28,7 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
 
@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       # `--locked` catches a stale Cargo.lock here rather than at release
       # time, where the build already uses it.
       - run: cargo test --all --locked
@@ -54,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Reflink integration tests
         run: bash tests/reflink_integration.sh
 
@@ -64,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - name: Install fuse-overlayfs
         run: sudo apt-get update && sudo apt-get install -y fuse-overlayfs
       - run: cargo build --release --locked
@@ -78,7 +78,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           key: aarch64
       - name: Install Linux ARM64 linker
