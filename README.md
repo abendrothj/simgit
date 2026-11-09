@@ -107,7 +107,7 @@ rejects it, because it owns the child's stdout. Location is always `--path`.
 | `simgit repair` | Remount overlay-backed worktrees after a reboot or interrupted mount (Linux). |
 | `simgit hook claude-code --requires <v>` | Store Claude Code's worktrees with simgit. Run by the Claude Code plugin, not by hand; rejects `--json`. |
 
-To use simgit as Claude Code's worktree storage, install the plugin: see [Claude Code](docs/agent-integration.md#claude-code).
+To use simgit as Claude Code's worktree storage, install the plugin: see [Claude Code](docs/agent-integration.md#claude-code). The same plugin brings the skill to Codex: see [Codex](docs/agent-integration.md#codex).
 
 There is no `--force`: the two operations that can destroy work name what they
 destroy, and `--delete-unmerged` requires `--delete-branch`/`--delete-branches`

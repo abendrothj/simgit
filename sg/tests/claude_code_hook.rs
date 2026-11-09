@@ -1371,6 +1371,11 @@ fn marketplace_ref_names_a_release_no_newer_than_the_crate() {
         env!("CARGO_MANIFEST_DIR"),
         "/../.claude-plugin/marketplace.json"
     ));
+    // Codex rejects `"source": "github"` entries; a `url` source serves both
+    // Claude Code and Codex.
+    let source = &market["plugins"][0]["source"];
+    assert_eq!(source["source"], "url", "{source}");
+    assert_eq!(source["url"], "https://github.com/abendrothj/simgit.git");
     let reference = market["plugins"][0]["source"]["ref"]
         .as_str()
         .expect("marketplace plugin ref");

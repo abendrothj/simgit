@@ -592,6 +592,30 @@ from native is that no commit is deleted that no other ref reaches.
   branch ever allocated; a stop of a subagent that had no worktree creates
   none. They are empty and are not cleaned up.
 
+## Codex
+
+Codex reads Claude Code's plugin format and speaks its hook protocol, so the
+same plugin serves both:
+
+```sh
+brew install abendrothj/tap/simgit
+codex plugin marketplace add abendrothj/simgit
+codex plugin add simgit@simgit
+```
+
+The plugin brings the `simgit-worktrees` skill and the `SessionStart` and
+`SubagentStop` hooks; Codex ignores the Claude Code-only `WorktreeCreate` and
+`WorktreeRemove`. Codex runs plugin hooks only after you trust them with
+`/hooks`; the skill works without them.
+
+Codex has no hook that replaces worktree creation, so in Codex the agent
+allocates its own worktrees through the skill (`simgit add --json --ephemeral`)
+and releases them with the returned `cleanup_token`; idle, clean ephemeral
+leftovers can be reaped with [`simgit gc`](reference.md#gc).
+`SubagentStop` removes nothing there, because Codex subagents never get
+`simgit/agent-*` worktrees. Whether Codex shows the version-check message to
+you or only to the model has not been checked.
+
 ## For agent guard tools
 
 A guard that decides from argv alone which simgit invocations need approval

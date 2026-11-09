@@ -49,8 +49,9 @@ simgit hook claude-code --requires <version> [--discard-dirty]
 
 Adapts a Claude Code hook to simgit's worktrees: it reads one hook payload on
 stdin and acts on its `hook_event_name`. `claude-code` is the only provider.
-The Claude Code plugin runs it; see [Claude Code](agent-integration.md#claude-code)
-for install, behaviour and limits. Do not run it by hand.
+The Claude Code plugin runs it, in Codex too; see [Claude Code](agent-integration.md#claude-code)
+and [Codex](agent-integration.md#codex) for install, behaviour and limits. Do
+not run it by hand.
 
 - `--requires <version>` exits 1 with one stderr line when the running simgit
   is older than the `X.Y.Z` given. A newer one is accepted.
