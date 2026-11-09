@@ -1,7 +1,7 @@
 //! Command launch and workspace selection, independent of the chosen agent.
 
 use super::{
-    create_worktree, discover_repo, ensure_unlocked, git_failure, git_output_common,
+    admin_dirs, create_worktree, discover_repo, ensure_unlocked, git_failure, git_output_common,
     list_worktrees, mark_ephemeral, overlay, remove_file_if_present, worktree_admin_dir,
     worktree_description, worktree_path_for_branch, BranchClaim, CreatedWorktree, RepoContext,
     WorktreeAdd, WorktreeEntry, WorktreeLock,
@@ -254,8 +254,13 @@ fn pick_worktree(repo: &RepoContext) -> Result<WorktreeEntry> {
         bail!("no workspaces found; create one with simgit run <branch> -- <command>");
     }
     eprintln!("Choose a workspace:");
+    let admins = admin_dirs(repo);
     for (index, entry) in entries.iter().enumerate() {
-        eprintln!("  {}. {}", index + 1, worktree_description(repo, entry));
+        eprintln!(
+            "  {}. {}",
+            index + 1,
+            worktree_description(repo, &admins, entry)
+        );
     }
     loop {
         eprint!("Workspace [1-{}], or q to cancel: ", entries.len());

@@ -37,9 +37,10 @@ Paste the following block verbatim into `AGENTS.md`:
   add `--discard-dirty` or `--delete-unmerged` without explicit user or
   operator authority; preserve work when safe cleanup refuses it.
 - Recover a crashed agent before reuse or cleanup: confirm the child process is
-  gone, clear the stranded `run` lock with `simgit unlock <path>`, then reuse
-  or safely remove the workspace. `simgit unlock` succeeds on a target that is
-  not locked or no longer exists, and `simgit remove` on an already-absent
+  gone, clear the stranded `run` or allocation lock with `simgit unlock
+  <path>`, then reuse or safely remove the workspace. `simgit unlock` succeeds
+  on a target that is not locked or no longer exists, refuses a lock set with
+  `git worktree lock`, and `simgit remove` on an already-absent
   target succeeds and reports `already_absent: true`, so retried cleanup is
   safe.
 - Agents commit normally and integrate their branches through normal Git
@@ -422,6 +423,16 @@ integration. Only explicit user or operator authority for that particular
 worktree may permit destructive cleanup; an `--ephemeral` marker alone is
 never that authority.
 
+A detached worktree (`add --detach`) whose commits no branch or tag reaches is
+refused by `remove` (with or without `--commit`) and skipped by `gc` as
+`unreached-commits`, since removing it would leave those commits dangling. No
+flag overrides this. The fix is `git -C <path> branch <name>`, after which
+cleanup succeeds; `--commit` does not help, because it commits uncommitted
+files, not the commits already made. On any detached worktree with uncommitted
+files, `remove --commit` is refused before it commits, since its commit would
+be one no ref reaches; `git -C <path> switch -c <name>` first, then
+`--commit`.
+
 Do not use `gc --older-than 0s` as a follow-up to one job: GC selects *every*
 clean, unlocked ephemeral worktree in the repository, including a different
 provider's newly allocated job before its worker starts. Use the recorded
@@ -432,7 +443,13 @@ jobs allocate: `prune` never removes a baseline an allocation is using and
 never waits for one. When an allocation holds the cache, plain
 `prune --json` keeps the baselines it would have dropped and reports
 `"cache_busy": true`, so a scheduled pass simply runs again later;
-`prune --all` fails instead, with a retry message on stderr.
+`prune --all` fails instead, with a retry message on stderr. Stale
+registrations it drops are listed in `pruned_registrations`, an array of
+paths. Those it keeps because they may hold work are listed in
+`kept_registrations`, an array of objects with `worktree` (string: the
+worktree's path, or its admin dir `.git/worktrees/<name>` when the entry's
+`gitdir` file cannot be read) and `reason` (`dirty`, `unreached-commits` or
+`status-failed`); report them rather than deleting them.
 
 Safe cleanup is idempotent. When the target no longer resolves to a worktree —
 an earlier attempt already removed it, or the workspace is gone for some other
@@ -454,11 +471,17 @@ An at-least-once cleanup path may therefore retry removal without a separate
 existence check. `--delete-branch` is the one part that distinguishes the two
 target forms once the worktree is gone: a branch-name target still deletes a
 leftover branch of that name under the usual `--delete-unmerged` rule, while an
-already-absent *path* target is an error, because a path that no longer
-resolves cannot say which branch it once held. A provider that deletes branches
-should do it while the worktree still exists, passing `cleanup_token`, or
-afterwards pass the `branch` value from its own allocation record. A target
-that exists but cannot be removed safely still fails.
+already-absent *path* target is an error, because a path that no longer resolves
+cannot say which branch it once held. A worktree deleted by hand while Git still
+registers it does resolve: either form reports `already_absent: true`, drops the
+registration, and with `--delete-branch` deletes its branch. One whose
+registration holds staged changes, an operation in progress, submodule
+repositories or refs of its own is refused as dirty, like a dirty live
+worktree. A locked registration, or a detached one
+whose HEAD no ref reaches, is refused whatever the flags. A provider that
+deletes branches should do it while the worktree still exists, passing
+`cleanup_token`, or afterwards pass the `branch` value from its own allocation
+record. A target that exists but cannot be removed safely still fails.
 
 A removal that fails partway is reported as a failure, not as a partial
 success: `--json` failures emit no JSON, so a provider reads the exit status
@@ -476,6 +499,11 @@ successful removal, and do not reinterpret a missing or mismatched path as
 permission to remove some other worktree. Never construct cleanup targets from
 an agent-supplied branch name; the allocation record's `cleanup_token`, or its
 recorded `branch`, are the only acceptable targets.
+
+Allocation also leaves an empty path claim file under
+`.git/simgit/claims/paths/` for every destination path ever allocated. They
+are kept on purpose and need no cleanup; see
+[Run locks and recovery](reference.md#run-locks-and-recovery).
 
 ### 6. Recover a crashed agent
 
@@ -507,22 +535,28 @@ recovery sequence is:
    and `owner_pid`.
 3. If `unlock` refuses, the recorded owner process is still running and the
    error names its PID. There is no override flag: stop that process, then
-   unlock again. An `owner_pid` of `null` is a lock file written without an
-   owner and is cleared as unknown-owner.
+   unlock again. An `owner_pid` of `null` is a simgit lock written without an
+   owner and is cleared as unknown-owner. A lock set with `git worktree lock`
+   is not simgit's: `unlock` refuses it, naming Git's reason and
+   `git worktree unlock`, and a provider leaves it alone.
 4. Then either reuse the workspace — relaunch into the same absolute `path`,
    whose files, index, and branch are exactly as the crashed agent left them —
    or clean it up with the ordinary safe removal of step 5, which retains dirty
    work and unmerged branches instead of discarding what the agent produced.
 
 A killed `add`, or a `run` killed while it was still creating its workspace,
-needs nothing unlocked: the branch claim and the baseline-cache lock it held
-are operating-system file locks released with the process, and the next
-allocation takes over its path claim once the recorded PID is gone. It may
-leave a registered worktree it had not finished populating, which shows every
-tracked file as deleted, so safe removal refuses it as dirty. Since `add`
-never returned, no agent ever ran there and the provider holds no allocation
-record for it; report the path to the operator, whose explicit authority
-`remove --discard-dirty` still requires even though it loses nothing here.
+may leave a registered worktree it had not finished populating. That
+registration stays locked with the reason `simgit: allocating (pid N)`, which
+keeps `prune` and `gc` off it, so safe removal first refuses it as locked.
+Clear the lock with `simgit unlock` as in step 2; it refuses while that PID is
+alive. After that, the worktree shows every tracked file as deleted, so safe
+removal refuses it as dirty. The branch claim, the path claim and the
+baseline-cache lock it held are operating-system file locks released with the
+process. Since
+`add` never returned, no agent ever ran there and the provider holds no
+allocation record for it; report the path to the operator, whose explicit
+authority `remove --discard-dirty` still requires even though it loses nothing
+here.
 
 ## Claude Code
 

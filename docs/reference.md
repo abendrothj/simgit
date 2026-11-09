@@ -17,6 +17,26 @@ leftover changes first, instead of discarding them; `commit` in the `--json`
 output carries that commit's full hash, and `committed` stays `false` when
 there was nothing to commit.
 
+`remove` (with or without `--commit` or `--discard-dirty`) refuses a detached
+worktree whose HEAD commit no branch, tag, or other ref reaches, because
+removing it would leave those commits dangling. The check runs before
+`--commit` commits anything and before teardown, and no flag overrides it. The
+error names the fix: `git -C <path> branch <name>`, then remove. When the
+worktree's directory or its `.git` file is gone, it names
+`git -C <main-checkout> branch <name> <commit>` instead, which works without
+the directory. A detached worktree at a commit some ref reaches is removed as
+usual, and so is one on a branch.
+
+`remove --commit` on a detached worktree with something to commit is refused
+before it commits: the new commit would be one no ref reaches, which removal
+then refuses to drop. Create a branch first with
+`git -C <path> switch -c <name>`, then remove with `--commit`; the error names
+that command, and so does the plain dirty refusal of a detached worktree.
+
+`remove` refuses the main checkout, by path or as the default target, before
+`--commit` commits anything: Git cannot remove it, and the files stay as they
+were.
+
 `--commit` commits before removing the worktree, and the commit is never
 rolled back if the removal then fails: it is the work you asked to keep. Such a
 failure names the commit it kept, so a caller can tell it from one that
@@ -37,9 +57,34 @@ branch of that name: a path with no worktree cannot name a branch, so
 `remove <absent-path> --delete-branch` is an error telling you to pass the
 branch name instead.
 
+A worktree whose directory was deleted by hand, while Git still registers it,
+is already absent too. `remove`, by branch or by path, drops that one
+registration, and `--commit` commits nothing. The registration still names the
+branch, so `--delete-branch` deletes it under the usual merged check by either
+form. The registration keeps the worktree's index, any operation in
+progress, its submodules' repositories (`modules/`) and its own refs
+(`refs/worktree/*`, `refs/bisect/*`, `refs/rewritten/*`), and the last two can
+hold the only copy of a commit. So one whose index differs from its HEAD
+(staged changes), that holds a merge, rebase, cherry-pick or revert in
+progress, that holds a submodule repository, or that has refs of its own counts
+as dirty: `remove` refuses it without `--discard-dirty`, and the error names
+the commands that show what is staged and which refs it holds. A submodule
+repository counts even when every commit in it is pushed, since simgit cannot
+tell that without asking the remote: a hand-deleted worktree whose submodules
+were initialized always needs `--discard-dirty`. Two other such registrations are refused and kept
+whatever the flags: a locked one, since `git worktree lock` exists to protect a
+worktree on an unplugged drive, and a detached one whose HEAD no ref reaches
+(above), since the registration holds the only reference to its commits. A path
+that cannot be checked, such as one whose parent denies access, is not taken
+for deleted.
+
 `unlock` is idempotent in the same way and one step further: a target that is
 not locked, and a target that no longer exists at all, both exit 0 and report
-`was_locked: false`. Crash recovery can call it unconditionally.
+`was_locked: false`. A worktree deleted by hand that Git still registers is
+found through the registry by its path as well as its branch, so a stranded lock
+on it is cleared rather than reported as absent. Crash recovery can call it
+unconditionally. It clears only locks simgit wrote (see [Run locks and
+recovery](#run-locks-and-recovery)).
 
 ## `hook`
 
@@ -65,7 +110,8 @@ not run it by hand.
 
 Branches are `simgit/<name>`, checked with `git check-ref-format --branch`; a
 subagent's is `simgit/agent-<agent_id>`. New worktrees start at
-`refs/remotes/origin/HEAD` when it exists, else `HEAD`, with no fetch. A name
+`refs/remotes/origin/HEAD` when it exists, else the project's `HEAD` (the worktree
+`$CLAUDE_PROJECT_DIR` names), with no fetch. A name
 matching `pr-<digits>` instead fetches `pull/<n>/head`, or
 `merge-requests/<n>/head` when origin has no such pull ref, from origin (git
 2.29 or newer, for `--no-write-fetch-head`) and starts there. If origin has
@@ -76,9 +122,9 @@ worktree is not refetched. Allocations are persistent.
 
 | Event | Action | stdout | Exit |
 |---|---|---|---|
-| `WorktreeCreate` | Under the branch claim: reuse the `simgit/<name>` worktree, else attach the branch if it exists, else create it from the base. Never returns the main checkout, and refuses a worktree locked by `run`. A worktree deleted by hand is pruned first, so its branch is attached again at its old tip. | the path only | 1 with one stderr line on failure |
-| `WorktreeRemove` | Only a worktree on a `simgit/*` branch; others are refused. Removes it (refusing a dirty one without `--discard-dirty`), then drops the branch if no commit on it is unreached by another ref. A path that no longer exists succeeds; if Git still registers it, the registration is pruned and the branch dropped by the same rule. | nothing | 1 when refused or failed |
-| `SubagentStop` | Removes the `simgit/agent-<agent_id>` worktree and branch when it is clean, unlocked and holds no unreached commit. Otherwise keeps it. A worktree deleted by hand has its registration pruned and its branch dropped by the same rule. It does nothing when the branch is not checked out in a worktree. | nothing | always 0 |
+| `WorktreeCreate` | Under the branch claim: reuse the `simgit/<name>` worktree, else attach the branch if it exists, else create it from the base. Never returns the main checkout, and refuses a worktree locked by `run`. A worktree deleted by hand is pruned first, so its branch is attached again at its old tip; one whose registration holds uncommitted work (staged changes, an operation in progress, submodule repositories or refs of its own) is kept, and the create fails. | the path only | 1 with one stderr line on failure |
+| `WorktreeRemove` | Only a worktree on a `simgit/*` branch; others are refused. Removes it (refusing a dirty one without `--discard-dirty`), then drops the branch if no commit on it is unreached by another ref. A path that no longer exists succeeds; if Git still registers it, the registration is pruned and the branch dropped by the same rule, unless it holds uncommitted work as for `remove`, which keeps both. | nothing | 1 when refused or failed |
+| `SubagentStop` | Removes the `simgit/agent-<agent_id>` worktree and branch when it is clean, unlocked and holds no unreached commit. Otherwise keeps it. A worktree deleted by hand has its registration pruned and its branch dropped by the same rule, unless it holds uncommitted work as for `remove`. It does nothing when the branch is not checked out in a worktree. | nothing | always 0 |
 | `SessionStart` | Nothing; the plugin uses it to check the version. | nothing | 0 |
 | any other | Nothing. | nothing | 0 |
 
@@ -100,6 +146,22 @@ branches that flatten to the same string still get distinct directories.
 `feat/my-feature` becomes `../.simgit/<repo>/feat-my-feature-c75e230f`, while an
 already-safe name like `feature-x` is used as-is. Script against the
 `worktree`/`path` field that `add --json` returns, not against a formula.
+
+`<repo>` is the main working tree, wherever its Git data lives, so a
+`--separate-git-dir` repository's worktrees go beside its checkout. Run from a
+linked worktree of such a repository, which records no path back to its main
+checkout, they go beside the Git directory instead. `list` and `doctor`'s
+`common_git_owner` name the same main working tree.
+
+A submodule's checkout lies inside its superproject's working tree, so its
+worktrees go beside the outermost superproject's main checkout instead, under
+`.simgit/<super>/.modules/<submodule path>-<digest>/`, whether simgit runs from
+the submodule's checkout, a subdirectory of it, or one of its linked worktrees.
+The digest is of the submodule's Git directory, which keeps apart submodules
+with the same name and the copies each superproject worktree checks out.
+`.modules` cannot clash with a branch, since Git refuses ref components that
+start with `.`. A submodule whose superproject cannot be found keeps the
+ordinary rule.
 
 `--path` names the worktree directory itself, not a parent to allocate inside.
 Missing parents are created. The directory may already exist if it is empty —
@@ -181,6 +243,12 @@ workspaces should now pass `--ephemeral`.
 On reuse, `--path` must identify the existing workspace. `--base`,
 `--require-cow` and `--sparse` are creation-only options and are rejected on
 reuse; `--base` is also rejected when attaching an existing branch.
+
+`--base` is any revision `git rev-parse` accepts, and defaults to `HEAD`. It is
+resolved in the working tree you run simgit from, so from a linked worktree the
+default is that worktree's `HEAD` (detached is fine) and `HEAD~1` is relative to
+it, not to the main checkout. A branch name or commit resolves the same from
+anywhere. A repository with no commits fails with a message saying so.
 `--require-cow` cannot be combined with `SIMGIT_POPULATE=checkout`.
 
 `SIMGIT_POPULATE` forces the populate backend and accepts exactly one of
@@ -211,8 +279,36 @@ It clears the lock wherever it lives: a linked worktree's lock is Git's own
 `.git/worktrees/<slug>/locked`, while `.git/simgit-run.lock` is used only when
 `run` targets the main checkout, which Git cannot lock. `unlock` refuses while
 the recorded owner is still alive and names that PID — stop that process instead
-of looking for an override flag, because there is none. A lock file written
-before locks recorded a PID counts as unknown-owner and can be cleared.
+of looking for an override flag, because there is none. A simgit lock file
+written before locks recorded a PID counts as unknown-owner and can be cleared.
+`unlock` removes only the lock it read and judged: if that lock was cleared
+meanwhile it reports success, and if a new one has taken its place, such as a
+`run` that started after another `unlock`, it leaves that lock and fails, to be
+run again.
+
+`run` writes its lock complete and links it into place, so no reader sees it
+half-written. On a filesystem without hard links (exFAT, some network mounts)
+it creates the lock exclusively and then writes it instead, and there a
+concurrent `unlock` or `run` can see it empty for an instant and refuse it as
+Git's.
+
+`unlock` clears only locks whose content starts with `simgit:`. A lock set with
+`git worktree lock`, perhaps to protect a worktree on removable media, is
+refused: the error names Git's reason, when it has one, and
+`git worktree unlock <path>`, and the lock stays. `run` on such a worktree is
+refused with the same reason rather than as a running command. `gc` and
+`remove` refuse any locked worktree, as before, and `remove` also refuses one
+whose lock simgit cannot find to rule out.
+
+An allocation also locks its own registration through Git, with the reason
+`simgit: allocating (pid N)`, from `git worktree add` until the worktree is
+populated and its mode and `--ephemeral` markers are written. CoW population
+moves the worktree's `.git` aside while it clones, and the lock keeps Git's
+`worktree prune`, `simgit prune` and `gc` from dropping the registration, or
+reaping the worktree, before it is whole. An allocation killed after registering,
+or one whose failure leaves the workspace retained for recovery, keeps this
+lock, and `unlock` clears it like a `run` lock: once the recorded PID is gone,
+never while it runs.
 
 Allocating takes four more locks, and none of them needs `unlock`. An `add`,
 or a `run` that creates its workspace, claims the destination path and, when
@@ -221,21 +317,35 @@ never both proceed. For `add` and `run` the second fails at once; `hook`
 waits for the first to finish and then reuses its worktree. While it
 uses a baseline it also holds the baseline cache lock shared, which keeps
 `prune` from removing that baseline (see [Baselines and `prune`](#baselines-and-prune)).
-The branch claims (`.git/simgit/claims/branches/`) and the cache lock
+The branch claims (`.git/simgit/claims/branches/`), the path claims
+(`.git/simgit/claims/paths/`) and the cache lock
 (`.git/simgit/baselines.lock`) are operating-system file locks on files that
 are never deleted, so the kernel releases them when the process exits, however
-it exits. A path claim left by a killed allocator is taken over by the next
-allocation of that path once the PID it records is gone. Allocations for
+it exits, and a killed allocator leaves no claim to take over. Nothing deletes
+those files, `prune` included, so one empty claim file stays for every branch
+and every path ever claimed. Deleting one would break the exclusion it
+provides: a process that had opened it but not yet locked it would lock the
+deleted file while the next allocator created and locked a new one, and both
+would proceed. Allocations for
 different branches and paths run concurrently, waiting for one another only
 while Git registers each new worktree, under the registry lock
 (`.git/simgit/claims/registry.lock`), another operating-system file lock.
 `list`, branch deletion and `prune` wait for a registration in progress, and
-it waits for them; each holds the lock for one quick Git command. Removing a
+it waits for them. `list` and branch deletion hold the lock for one quick Git
+command, `prune` for its whole pass over the registrations. Removing a live
 worktree does not take it, so an allocation never waits for a large removal.
+Dropping the registration of a worktree whose directory is gone takes it
+exclusively for that one Git command, and so does the last step of an overlay
+teardown, once the overlay's files are deleted.
 
-Commands launched outside `simgit run` are not tracked. Idle age uses index and
-directory modification time, so it is only a cleanup heuristic for explicitly
-disposable workspaces.
+Commands launched outside `simgit run` are not tracked. Idle age comes from the
+modification time of the worktree's index, which Git updates when it stages,
+commits or checks out, and from the worktree directory's when there is no
+index. Work outside `run` that never touches Git, such as editing files, is not
+activity, so idle age is only a cleanup heuristic for explicitly disposable
+workspaces. A worktree with neither an index nor a directory to read counts as
+idle; `gc` still keeps it while it is locked, or while it may hold uncommitted
+work.
 
 ## Machine-readable output
 
@@ -254,10 +364,10 @@ normalized, so one worktree always has exactly one string form and orchestrators
 can compare those strings directly. That resolution applies whenever a target
 resolves to a real worktree, so `remove`'s `removed` is the resolved absolute
 path even when you named the worktree by branch or by a relative path. It is
-only when nothing resolves — `remove` on an already-absent target, `unlock` on
-one — that `removed` and `unlocked` repeat the target verbatim, because there is
-no worktree left to resolve against and inventing a resolved form would imply
-one exists.
+only when nothing resolves — `remove` on a target Git no longer registers,
+`unlock` on one — that `removed` and `unlocked` repeat the target verbatim,
+because there is no worktree left to resolve against and inventing a resolved
+form would imply one exists.
 
 | Command | Fields |
 |---|---|
@@ -267,7 +377,7 @@ one exists.
 | `remove` | `removed`, `already_absent`, `branch_deleted`, `committed`, `commit` |
 | `unlock` | `unlocked`, `was_locked`, `owner_pid` |
 | `gc` | `reaped`, `skipped`, `deleted_branches`, `retained_branches`, `dry_run` |
-| `prune` | `pruned`, `pruned_registrations`, `retained`, `retained_bytes`, `cache_busy` |
+| `prune` | `pruned`, `pruned_registrations`, `kept_registrations`, `retained`, `retained_bytes`, `cache_busy` |
 
 `doctor` exits 0 outside a Git worktree: identity, version and filesystem are
 always reported, and every repository-dependent field is `null` rather than an
@@ -291,16 +401,63 @@ work; `--delete-unmerged` next to `--delete-branches` explicitly discards
 unmerged branches.
 
 Every worktree GC considered but did not reap appears in `skipped` with a
-reason: `persistent`, `dirty`, `locked`, or `recently-active` for one that is
-simply younger than `--older-than`. An empty `reaped` list is therefore always
-explained.
+reason: `persistent`, `dirty`, `locked`, `unreached-commits` (below),
+`recently-active` for one that is simply younger than `--older-than`,
+`status-failed` for one whose state simgit could not read (below), or
+`remove-failed` for one it selected but could not remove, such as one locked
+or changed meanwhile; its branch is kept. An empty `reaped` list is therefore
+always explained.
+
+A detached worktree whose HEAD commit no ref reaches (for example, commits made
+in an `add --detach` worktree) is skipped as `unreached-commits`: removing it
+would leave those commits dangling. No flag overrides this; give the commits a
+branch with `git -C <path> branch <name>` and `gc` can then reap the worktree.
+A worktree on a branch is unaffected, since its commits stay on the branch.
+If Git cannot answer whether the commits are reached, the worktree is skipped
+as `status-failed`, as is one whose lock simgit cannot find to rule out and one
+whose uncommitted changes Git cannot list.
+
+A worktree whose directory was deleted by hand is reaped by dropping its
+registration, and `--delete-branches` deletes its branch under the usual rule.
+Its idle age comes from the index kept in its registration. It is selected,
+and skipped as `persistent`, `locked`, `recently-active`, `unreached-commits`,
+`dirty` (uncommitted work in its registration, as for `remove`) or
+`status-failed` (a registration it cannot read), like
+any other worktree. GC drops only the registrations of what it reaps: every
+worktree it skips, or does not select under `--prefix`, stays registered, so a
+later GC can still reap it and delete its branch.
 
 ## Baselines and `prune`
 
 `prune` does two things and reports both. It deregisters stale Git worktree
 registrations — entries whose directory is gone — listing their paths in
-`pruned_registrations` and printing `pruned N stale registration(s)`. And it
-reclaims the baseline cache, reporting what that cache still costs in both
+`pruned_registrations` and printing `pruned N stale registration(s)`. It keeps a
+locked entry, a detached one whose HEAD no ref reaches, whose commits would
+dangle, and one holding uncommitted work as for `remove`: staged changes, an
+operation in progress, submodule repositories or refs of its own. It also
+keeps an entry whose directory is still there without its `.git` file, or
+cannot be checked, because that worktree's index and Git state live in the
+registration. It reads Git's admin dirs itself, so an entry whose `gitdir` file
+is missing or corrupt, which `git worktree list` does not show, is pruned too
+and listed by its admin dir (`.git/worktrees/<name>`). One whose HEAD cannot
+be read is kept, never deleted unjudged. A stale entry kept because it may hold
+work is named with gc's reason for it: `dirty`, `unreached-commits`, or
+`status-failed` when it cannot be judged. Human output names each on stderr;
+`--json` lists them in `kept_registrations` as `worktree` (the admin dir for
+an entry whose `gitdir` cannot be read) and `reason`, and
+writes nothing to stderr for them, so a failing `prune --json` still writes
+one line. A locked entry and a remountable overlay are kept without being
+named. Every entry is
+judged and dropped in one pass under the registry lock, so concurrent prunes
+never act on each other's half-finished view. It also deletes the temporary
+files a killed simgit leaves, once the process they name is gone: a lock's
+`<lock>.<pid>.<uuid>.pending` copy beside Git's `locked` or
+`.git/simgit-run.lock`, and a copy-on-write probe, recorded in
+`.git/simgit/clone-probes/<pid>.<uuid>.source` with the
+`.simgit-clone-probe-<pid>.<uuid>` file it names. A running process's are
+kept. A probe an older simgit left names no process
+(`clone-probes/<uuid>.source` and `.simgit-clone-probe-<uuid>`), so `prune`
+keeps it; delete both by hand while no simgit is running. And it reclaims the baseline cache, reporting what that cache still costs in both
 formats (`retained_bytes` in JSON).
 
 One baseline is materialized per distinct base commit, so branching from several

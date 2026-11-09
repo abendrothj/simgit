@@ -627,6 +627,117 @@ fn remove_refuses_delete_unmerged_without_delete_branch() {
     assert!(branch.success(), "branch chat/test was deleted anyway");
 }
 
+/// `remove --commit` on the main checkout used to commit the user's files and
+/// only then fail, because Git cannot remove the main worktree. It must refuse
+/// before committing, by path and by the default target alike.
+#[test]
+fn remove_commit_refuses_the_main_checkout_before_committing() {
+    let fixture = Fixture::new();
+    fs::write(fixture.repo.join("README.md"), "edited\n").unwrap();
+    fs::write(fixture.repo.join("scratch.txt"), "work in progress\n").unwrap();
+    let head = |repo: &Path| {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let status = |repo: &Path| {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let before = (head(&fixture.repo), status(&fixture.repo));
+    let path = fixture.repo.display().to_string();
+
+    for args in [
+        vec!["remove", path.as_str(), "--commit"],
+        vec!["remove", "--commit"],
+    ] {
+        let output = fixture.run(&args);
+        assert!(!output.status.success(), "{args:?} succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("main checkout"), "{args:?}: {stderr}");
+        assert_eq!(
+            (head(&fixture.repo), status(&fixture.repo)),
+            before,
+            "{args:?} committed or changed the main checkout"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("README.md")).unwrap(),
+        "edited\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("scratch.txt")).unwrap(),
+        "work in progress\n"
+    );
+}
+
+/// `list` ran four `git rev-parse` per worktree, 16 s for 600 of them. It
+/// reads the registrations once instead, so its `git` count stays put.
+#[test]
+fn list_runs_no_git_per_worktree() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let wrapper_dir = fixture.root.join("bin");
+    fs::create_dir(&wrapper_dir).unwrap();
+    let wrapper = wrapper_dir.join("git");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\necho >> \"$SIMGIT_TEST_GIT_LOG\"\nexec \"$SIMGIT_TEST_REAL_GIT\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(wrapper_dir)
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let log = fixture.root.join("git.log");
+    let gits_for = |args: &[&str]| {
+        let _ = fs::remove_file(&log);
+        let output = fixture
+            .command()
+            .env("PATH", &path)
+            .env("SIMGIT_TEST_REAL_GIT", &real_git)
+            .env("SIMGIT_TEST_GIT_LOG", &log)
+            .args(args)
+            .output()
+            .unwrap();
+        success(&output);
+        fs::read_to_string(&log).unwrap().lines().count()
+    };
+    let add = |name: &str, extra: &[&str]| {
+        success(
+            &fixture
+                .command()
+                .args(["add", name, "--path"])
+                .arg(fixture.root.join(name))
+                .args(extra)
+                .output()
+                .unwrap(),
+        );
+    };
+
+    add("one", &["--ephemeral"]);
+    let few = (gits_for(&["list"]), gits_for(&["list", "--json"]));
+    for name in ["two", "three", "four", "five"] {
+        add(name, &[]);
+    }
+    let many = (gits_for(&["list"]), gits_for(&["list", "--json"]));
+    assert_eq!(few, many, "list ran more git for more worktrees");
+}
+
 #[test]
 fn prune_and_list_answer_machine_readable_questions() {
     // `prune --json` advertised JSON in --help and printed prose, which breaks
@@ -1205,6 +1316,126 @@ fn unlock_clears_a_stranded_lock_and_refuses_a_live_one() {
     assert_eq!(report["was_locked"], false);
     assert_eq!(report["owner_pid"], serde_json::Value::Null);
     success(&fixture.run(&["gc", "--older-than", "0s", "--include-persistent"]));
+
+    // An allocation lock is simgit's too: it is refused while its allocator
+    // runs (this test process stands in for one) and cleared once it is gone.
+    fixture.create(&[]);
+    let path = fixture.worktree.display().to_string();
+    let mut gone = Command::new("true").spawn().unwrap();
+    let dead = gone.id();
+    gone.wait().unwrap();
+    git(
+        &fixture.worktree,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            &format!("simgit: allocating (pid {})", std::process::id()),
+            &path,
+        ],
+    );
+    assert!(!fixture.run(&["unlock", &path]).status.success());
+    git(&fixture.worktree, &["worktree", "unlock", &path]);
+    git(
+        &fixture.worktree,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            &format!("simgit: allocating (pid {dead})"),
+            &path,
+        ],
+    );
+    let unlocked = fixture.run(&["unlock", &path, "--json"]);
+    success(&unlocked);
+    let report: serde_json::Value = serde_json::from_slice(&unlocked.stdout).unwrap();
+    assert_eq!(report["was_locked"], true);
+    assert_eq!(report["owner_pid"], dead);
+    success(&fixture.run(&["run", "chat/test", "--", "true"]));
+}
+
+/// A lock a person set with `git worktree lock` guards something simgit
+/// cannot see, such as a worktree on removable media. It names no simgit
+/// process, so `unlock` must not treat "no live owner" as "stranded".
+#[test]
+fn unlock_refuses_a_lock_git_set() {
+    let fixture = Fixture::new();
+    fixture.create(&[]);
+    let path = fixture.worktree.display().to_string();
+
+    for reason in [Some("usb"), None] {
+        let mut args = vec!["worktree", "lock"];
+        if let Some(reason) = reason {
+            args.extend(["--reason", reason]);
+        }
+        args.push(&path);
+        git(&fixture.worktree, &args);
+
+        let refused = fixture.run(&["unlock", &path]);
+        let message = String::from_utf8_lossy(&refused.stderr).into_owned();
+        assert!(!refused.status.success(), "unlock cleared Git's lock");
+        assert!(
+            message.contains("git worktree unlock"),
+            "refusal does not point at Git: {message}"
+        );
+        if let Some(reason) = reason {
+            assert!(message.contains(reason), "reason missing: {message}");
+        }
+        let locked = fixture.run(&["list", "--json"]);
+        success(&locked);
+        assert!(
+            String::from_utf8_lossy(&locked.stdout).contains("\"locked\""),
+            "the lock is gone"
+        );
+        // The refusal covers the branch spelling and the explicit target alike.
+        assert!(!fixture.run(&["unlock", "chat/test"]).status.success());
+
+        git(&fixture.worktree, &["worktree", "unlock", &path]);
+        success(&fixture.run(&["unlock", &path]));
+    }
+}
+
+/// `remove` shares the refusal with `gc` and the hook; a lock Git set must
+/// not read as "a command may be running", and its reason is what matters.
+#[test]
+fn remove_names_the_reason_of_a_lock_git_set() {
+    let fixture = Fixture::new();
+    fixture.create(&[]);
+    let path = fixture.worktree.display().to_string();
+    git(
+        &fixture.worktree,
+        &["worktree", "lock", "--reason", "usb", &path],
+    );
+
+    let refused = fixture.run(&["remove", &path]);
+    let message = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(!refused.status.success());
+    assert!(message.contains("usb"), "Git's reason missing: {message}");
+    assert!(!message.contains("may be running"), "{message}");
+    assert!(fixture.worktree.exists(), "locked worktree was removed");
+}
+
+/// `run` told people a lock Git set was "a running command" and sent them to
+/// `unlock`, which refuses it. It should say what the lock really is.
+#[test]
+fn run_reports_gits_lock_reason() {
+    let fixture = Fixture::new();
+    fixture.create(&[]);
+    let path = fixture.worktree.display().to_string();
+    git(
+        &fixture.worktree,
+        &["worktree", "lock", "--reason", "usb", &path],
+    );
+
+    let refused = fixture.run(&["run", "chat/test", "--", "true"]);
+    let message = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(!refused.status.success());
+    assert!(message.contains("usb"), "Git's reason missing: {message}");
+    assert!(
+        !message.contains("running command"),
+        "Git's lock reported as a running command: {message}"
+    );
+    assert!(message.contains("git worktree unlock"), "{message}");
 }
 
 /// Cleanup must survive being repeated: an agent that crashed mid-teardown, or
@@ -1853,6 +2084,116 @@ fn remove_delete_branch_refuses_an_already_removed_path() {
     assert!(!local_refs(&fixture.repo).contains("refs/heads/chat/test"));
 }
 
+/// A simgit killed mid-lock or mid-probe leaves its temporary files behind.
+/// `prune` removes those whose process is gone and keeps a live one's, and a
+/// probe record never makes it delete anything but a probe.
+#[test]
+fn prune_removes_the_temporary_files_of_dead_processes() {
+    let fixture = Fixture::new();
+    fixture.create(&[]);
+    let admin = Path::new(&registration(&fixture, &fixture.worktree)).to_path_buf();
+    let git_dir = fixture.repo.join(".git");
+    let probes = git_dir.join("simgit/clone-probes");
+    fs::create_dir_all(&probes).unwrap();
+    let dead = dead_pid();
+    let live = std::process::id();
+    let token = |pid: u32| format!("{pid}.{}", uuid::Uuid::new_v4());
+    let pending = |dir: &Path, lock: &str, pid: u32| {
+        let path = dir.join(format!("{lock}.{}.pending", token(pid)));
+        fs::write(&path, "simgit: workspace in use\n").unwrap();
+        path
+    };
+    let probe = |pid: u32, destination: Option<&Path>| {
+        let token = token(pid);
+        let target = fixture.root.join(format!(".simgit-clone-probe-{token}"));
+        let destination = destination.unwrap_or(&target);
+        fs::write(&target, "probe").unwrap();
+        let source = probes.join(format!("{token}.source"));
+        fs::write(&source, destination.as_os_str().as_encoded_bytes()).unwrap();
+        (source, target)
+    };
+
+    let dead_files = [
+        pending(&admin, "locked", dead),
+        pending(&git_dir, "simgit-run.lock", dead),
+    ];
+    let live_files = [
+        pending(&admin, "locked", live),
+        pending(&git_dir, "simgit-run.lock", live),
+    ];
+    let (dead_source, dead_probe) = probe(dead, None);
+    let (live_source, live_probe) = probe(live, None);
+    let readme = fixture.repo.join("README.md");
+    let (misdirected, _) = probe(dead, Some(&readme));
+    // Claim files are never deleted: removing one would break its exclusion.
+    let claims = || {
+        ["branches", "paths"].map(|kind| {
+            fs::read_dir(git_dir.join("simgit/claims").join(kind))
+                .unwrap()
+                .count()
+        })
+    };
+    let claimed = claims();
+    assert!(claimed.iter().all(|count| *count > 0), "{claimed:?}");
+
+    success(&fixture.run(&["prune"]));
+    assert_eq!(claims(), claimed, "prune deleted claim files");
+    for path in dead_files.iter().chain([&dead_source, &dead_probe]) {
+        assert!(!path.exists(), "kept {}", path.display());
+    }
+    for path in live_files.iter().chain([&live_source, &live_probe]) {
+        assert!(path.exists(), "removed {}", path.display());
+    }
+    assert!(readme.is_file(), "a probe record made prune delete a file");
+    assert!(!misdirected.exists(), "kept {}", misdirected.display());
+}
+
+/// A stale registration prune keeps is named in `kept_registrations` under
+/// `--json`, never on stderr, so a failing `prune --json` still writes exactly
+/// one diagnostic line. Human output names it on stderr.
+#[test]
+fn prune_json_reports_kept_registrations_in_its_output() {
+    let fixture = Fixture::new();
+    fixture.create(&[]);
+    let kept = resolved(&fixture.worktree).display().to_string();
+    let admin = std::path::PathBuf::from(registration(&fixture, &fixture.worktree));
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    fs::write(admin.join("HEAD"), "not a head\n").unwrap();
+    // An allocation's hold on the cache makes `prune --all` fail.
+    let cache = fixture.repo.join(".git/simgit");
+    fs::create_dir_all(cache.join("baselines/held")).unwrap();
+    let lock = fs::File::create(cache.join("baselines.lock")).unwrap();
+    lock.lock_shared().unwrap();
+
+    let failed = fixture.run(&["--json", "prune", "--all"]);
+    assert!(
+        !failed.status.success(),
+        "prune --all ignored the held cache"
+    );
+    assert!(failed.stdout.is_empty());
+    let stderr = String::from_utf8(failed.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("retry `simgit prune --all`"), "{stderr}");
+
+    drop(lock);
+    let pruned = fixture.run(&["--json", "prune"]);
+    success(&pruned);
+    assert!(pruned.stderr.is_empty(), "{:?}", pruned.stderr);
+    let report: serde_json::Value = serde_json::from_slice(&pruned.stdout).unwrap();
+    assert_eq!(
+        report["kept_registrations"],
+        serde_json::json!([{ "worktree": kept, "reason": "status-failed" }])
+    );
+    let human = fixture.run(&["prune"]);
+    success(&human);
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(
+        stderr.contains(&format!("kept stale registration {kept}")),
+        "{stderr}"
+    );
+    assert!(admin.join("HEAD").is_file());
+}
+
 /// Pruning a stale registration mutates the Git registry, and it is the thing
 /// `doctor` reports as stale — so reporting only "pruned 0 cached baseline(s)"
 /// told the user nothing had happened.
@@ -1914,4 +2255,2521 @@ fn local_refs(repo: &Path) -> String {
         .unwrap();
     success(&output);
     String::from_utf8(output.stdout).unwrap()
+}
+
+fn add_detached(fixture: &Fixture) -> std::path::PathBuf {
+    let output = fixture
+        .command()
+        .args(["add", "--detach", "--json"])
+        .output()
+        .unwrap();
+    success(&output);
+    let created: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    std::path::PathBuf::from(created["path"].as_str().unwrap())
+}
+
+fn commit_in(worktree: &Path, name: &str) -> String {
+    fs::write(worktree.join(name), "result\n").unwrap();
+    git(worktree, &["add", "."]);
+    git(worktree, &["commit", "-qm", name]);
+    rev_parse(worktree, "HEAD")
+}
+
+fn object_count(repo: &Path) -> String {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(["count-objects", "-v"])
+        .output()
+        .unwrap();
+    success(&output);
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn assert_refused_to_orphan(fixture: &Fixture, args: &[&str], path: &Path, head: &str) {
+    let output = fixture.run(args);
+    assert!(!output.status.success(), "{args:?} succeeded");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("git -C {} branch <name>", path.display())),
+        "{stderr}"
+    );
+    assert!(path.is_dir(), "worktree removed by {args:?}");
+    assert_eq!(rev_parse(path, "HEAD"), head);
+}
+
+#[test]
+fn remove_refuses_a_detached_worktree_with_unreached_commits() {
+    let fixture = Fixture::new();
+    let path = add_detached(&fixture);
+    let head = commit_in(&path, "agent.txt");
+    let target = path.to_str().unwrap();
+
+    assert_refused_to_orphan(&fixture, &["remove", target], &path, &head);
+    assert_refused_to_orphan(
+        &fixture,
+        &["remove", target, "--discard-dirty"],
+        &path,
+        &head,
+    );
+
+    // The advertised fix works.
+    git(&path, &["branch", "kept"]);
+    success(&fixture.run(&["remove", target]));
+    assert!(!path.exists());
+    assert_eq!(rev_parse(&fixture.repo, "kept"), head);
+}
+
+#[test]
+fn remove_commit_refuses_a_detached_worktree() {
+    let fixture = Fixture::new();
+    let path = add_detached(&fixture);
+    let head = commit_in(&path, "agent.txt");
+    fs::write(path.join("more.txt"), "uncommitted\n").unwrap();
+    let objects = object_count(&fixture.repo);
+
+    assert_refused_to_orphan(
+        &fixture,
+        &["remove", path.to_str().unwrap(), "--commit"],
+        &path,
+        &head,
+    );
+
+    assert_eq!(object_count(&fixture.repo), objects, "a commit was made");
+    assert!(path.join("more.txt").is_file());
+
+    // At a commit main reaches, the commit --commit would make is what no ref
+    // reaches: refused before committing, with neither refusal offering it.
+    let path = add_detached(&fixture);
+    let head = rev_parse(&path, "HEAD");
+    fs::write(path.join("more.txt"), "uncommitted\n").unwrap();
+    let objects = object_count(&fixture.repo);
+    let target = path.to_str().unwrap();
+    let switch = format!("git -C {target} switch -c <name>");
+    for args in [vec!["remove", target, "--commit"], vec!["remove", target]] {
+        let output = fixture.run(&args);
+        assert!(!output.status.success(), "{args:?} succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&switch), "{stderr}");
+        assert!(!stderr.contains("committed as"), "{stderr}");
+        assert!(!stderr.contains("keep the work with --commit"), "{stderr}");
+        assert_eq!(object_count(&fixture.repo), objects, "a commit was made");
+        assert_eq!(rev_parse(&path, "HEAD"), head);
+        assert!(path.join("more.txt").is_file());
+    }
+
+    // The advertised fix works.
+    git(&path, &["switch", "-qc", "kept"]);
+    success(&fixture.run(&["remove", target, "--commit"]));
+    assert!(!path.exists());
+    assert_ne!(rev_parse(&fixture.repo, "kept"), head);
+}
+
+#[test]
+fn remove_keeps_uncommitted_files_and_unreached_commits_on_every_path() {
+    let fixture = Fixture::new();
+    let path = add_detached(&fixture);
+    let head = commit_in(&path, "agent.txt");
+    fs::write(path.join("scratch.txt"), "uncommitted\n").unwrap();
+    let target = path.to_str().unwrap();
+
+    for args in [
+        vec!["remove", target],
+        vec!["remove", target, "--discard-dirty"],
+        vec!["remove", target, "--commit"],
+    ] {
+        assert_refused_to_orphan(&fixture, &args, &path, &head);
+        assert_eq!(
+            fs::read_to_string(path.join("scratch.txt")).unwrap(),
+            "uncommitted\n"
+        );
+    }
+    success(&fixture.run(&[
+        "gc",
+        "--older-than",
+        "0s",
+        "--include-persistent",
+        "--discard-dirty",
+    ]));
+    assert!(path.is_dir());
+    assert_eq!(rev_parse(&path, "HEAD"), head);
+}
+
+/// A fixture whose repository uses the reftable ref format, or `None` on a
+/// Git older than 2.45, which has none. Under reftable every registration's
+/// `HEAD` file is a stub naming `refs/heads/.invalid`, detached or not.
+fn reftable_fixture() -> Option<Fixture> {
+    let version = Command::new("git").arg("version").output().unwrap();
+    let version = String::from_utf8_lossy(&version.stdout).into_owned();
+    let mut parts = version
+        .trim()
+        .trim_start_matches("git version ")
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().unwrap_or(0));
+    if (parts.next()?, parts.next()?) < (2, 45) {
+        return None;
+    }
+    let fixture = Fixture::new();
+    fs::remove_dir_all(fixture.repo.join(".git")).unwrap();
+    git(&fixture.repo, &["init", "-q", "--ref-format=reftable"]);
+    git(&fixture.repo, &["config", "user.email", "test@example.com"]);
+    git(&fixture.repo, &["config", "user.name", "Test User"]);
+    git(&fixture.repo, &["add", "."]);
+    git(&fixture.repo, &["commit", "-qm", "initial"]);
+    Some(fixture)
+}
+
+fn commit_exists(repo: &Path, commit: &str) -> bool {
+    Command::new("git")
+        .current_dir(repo)
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn reftable_remove_keeps_unreached_detached_commits() {
+    let Some(fixture) = reftable_fixture() else {
+        return;
+    };
+    let path = add_detached(&fixture);
+    let head = commit_in(&path, "agent.txt");
+    let target = path.to_str().unwrap();
+    assert_refused_to_orphan(&fixture, &["remove", target], &path, &head);
+    assert_refused_to_orphan(&fixture, &["remove", target, "--commit"], &path, &head);
+
+    // Deleted by hand, the registration holds the only reference.
+    fs::remove_dir_all(&path).unwrap();
+    let output = fixture.run(&["remove", target]);
+    assert!(
+        !output.status.success(),
+        "removed an unreached registration"
+    );
+    assert_eq!(registered_head(&fixture, &path), Some(head.clone()));
+    assert!(commit_exists(&fixture.repo, &head));
+}
+
+#[test]
+fn reftable_remove_commit_refuses_a_dirty_detached_worktree() {
+    let Some(fixture) = reftable_fixture() else {
+        return;
+    };
+    let path = add_detached(&fixture);
+    let head = rev_parse(&path, "HEAD");
+    fs::write(path.join("more.txt"), "uncommitted\n").unwrap();
+    let objects = object_count(&fixture.repo);
+
+    let output = fixture.run(&["remove", path.to_str().unwrap(), "--commit"]);
+    assert!(!output.status.success(), "committed and removed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("switch -c <name>"), "{stderr}");
+    assert_eq!(object_count(&fixture.repo), objects, "a commit was made");
+    assert_eq!(rev_parse(&path, "HEAD"), head);
+    assert!(path.join("more.txt").is_file());
+}
+
+#[test]
+fn reftable_prune_keeps_a_deleted_unreached_detached_registration() {
+    let Some(fixture) = reftable_fixture() else {
+        return;
+    };
+    let path = add_detached(&fixture);
+    let head = commit_in(&path, "agent.txt");
+    let kept = resolved(&path).display().to_string();
+    fs::remove_dir_all(&path).unwrap();
+
+    let pruned = fixture.run(&["--json", "prune"]);
+    success(&pruned);
+    let report: serde_json::Value = serde_json::from_slice(&pruned.stdout).unwrap();
+    assert_eq!(report["pruned_registrations"], serde_json::json!([]));
+    assert_eq!(
+        report["kept_registrations"],
+        serde_json::json!([{ "worktree": kept, "reason": "unreached-commits" }])
+    );
+    assert_eq!(registered_head(&fixture, &path), Some(head.clone()));
+    assert!(commit_exists(&fixture.repo, &head));
+}
+
+#[test]
+fn remove_removes_a_detached_worktree_at_a_reached_commit() {
+    let fixture = Fixture::new();
+    let path = add_detached(&fixture);
+
+    success(&fixture.run(&["remove", path.to_str().unwrap()]));
+
+    assert!(!path.exists());
+}
+
+#[test]
+fn remove_and_gc_keep_a_detached_worktree_whose_gitfile_is_gone() {
+    let fixture = Fixture::new();
+    let path = add_detached(&fixture);
+    let head = commit_in(&path, "agent.txt");
+    let main_head = rev_parse(&fixture.repo, "HEAD");
+    // Without its gitfile git walks up and would measure the main checkout.
+    fs::remove_file(path.join(".git")).unwrap();
+
+    let output = fixture.run(&["--json", "remove", path.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    // `git -C <path> branch` would walk up and branch the main checkout's HEAD.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("branch <name> {head}")),
+        "{stderr}"
+    );
+    assert!(path.is_dir());
+
+    let gc = fixture.run(&["--json", "gc", "--older-than", "0s", "--include-persistent"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["reaped"], serde_json::json!([]));
+    assert!(path.is_dir());
+    assert_eq!(rev_parse(&fixture.repo, "HEAD"), main_head);
+    // The registration holds the only reference to the commit, so neither gc's
+    // closing prune nor `prune` may drop it while the directory is there.
+    assert_eq!(registered_head(&fixture, &path), Some(head.clone()));
+    success(&fixture.run(&["prune"]));
+    assert_eq!(registered_head(&fixture, &path), Some(head));
+}
+
+/// Without its gitfile, git run in a worktree nested in another repository
+/// answers for that repository, so the lock that keeps the registration from
+/// being pruned must still be found through this repository's registry.
+#[test]
+fn gc_keeps_a_gitfile_less_worktree_inside_another_repository() {
+    let fixture = Fixture::new();
+    let other = fixture.root.join("other");
+    fs::create_dir(&other).unwrap();
+    git(&other, &["init", "-q"]);
+    let path = other.join("wt");
+    let output = fixture
+        .command()
+        .args(["add", "--detach", "--path"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    success(&output);
+    let head = commit_in(&path, "agent.txt");
+    fs::remove_file(path.join(".git")).unwrap();
+
+    let gc = fixture.run(&["--json", "gc", "--older-than", "0s", "--include-persistent"]);
+    success(&gc);
+    assert_eq!(registered_head(&fixture, &path), Some(head));
+    assert!(!other.join(".git/locked").exists());
+}
+
+/// The HEAD Git's registry records for `worktree`, or `None` when it is not
+/// registered. Works after the directory is gone.
+fn registered_head(fixture: &Fixture, worktree: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(&fixture.repo)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .unwrap();
+    success(&output);
+    let wanted = format!("worktree {}", resolved(worktree).display());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .split("\0\0")
+        .find_map(|record| {
+            let mut fields = record.split('\0');
+            if fields.next()? != wanted {
+                return None;
+            }
+            fields.find_map(|field| field.strip_prefix("HEAD ").map(str::to_owned))
+        })
+}
+
+/// `path` with its parent resolved, as Git records it. A parent that is gone
+/// too (removal drops empty `.simgit` scaffolding) leaves `path` as given.
+fn resolved(path: &Path) -> std::path::PathBuf {
+    match path.parent().unwrap().canonicalize() {
+        Ok(parent) => parent.join(path.file_name().unwrap()),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Wait for a wrapper to create `marker`, failing rather than hanging when it
+/// never runs.
+fn wait_for(marker: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never appeared",
+            marker.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A pid that named a process which has exited.
+fn dead_pid() -> u32 {
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+/// A worktree deleted by hand stays registered, its branch checked out at a
+/// path that is gone. Removing it is already the state the caller asked for.
+#[test]
+fn remove_by_branch_of_a_deleted_worktree_is_already_absent() {
+    let fixture = Fixture::new();
+    let path = resolved(&fixture.worktree).display().to_string();
+    fixture.create(&[]);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+
+    let removed = fixture.run(&["--json", "remove", "chat/test"]);
+    success(&removed);
+    let report: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(report["removed"], path);
+    assert_eq!(report["already_absent"], true);
+    assert_eq!(report["committed"], false);
+    assert_eq!(report["branch_deleted"], false);
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+    assert!(local_refs(&fixture.repo).contains("refs/heads/chat/test"));
+
+    fixture.create(&[]);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    let deleted = fixture.run(&["--json", "remove", "chat/test", "--delete-branch"]);
+    success(&deleted);
+    let report: serde_json::Value = serde_json::from_slice(&deleted.stdout).unwrap();
+    assert_eq!(report["already_absent"], true);
+    assert_eq!(report["branch_deleted"], true);
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+    assert!(!local_refs(&fixture.repo).contains("refs/heads/chat/test"));
+
+    // While the registration is there it names the branch, so the path form
+    // can delete it too; nothing is left on disk for --commit to commit.
+    fixture.create(&[]);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    let by_path = fixture.run(&["--json", "remove", &path, "--commit", "--delete-branch"]);
+    success(&by_path);
+    let report: serde_json::Value = serde_json::from_slice(&by_path.stdout).unwrap();
+    assert_eq!(report["removed"], path);
+    assert_eq!(report["already_absent"], true);
+    assert_eq!(report["committed"], false);
+    assert_eq!(report["branch_deleted"], true);
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+    assert!(!local_refs(&fixture.repo).contains("refs/heads/chat/test"));
+}
+
+#[test]
+fn gc_prunes_a_deleted_worktree_and_honours_delete_branches() {
+    let fixture = Fixture::new();
+    fixture.create(&["--ephemeral"]);
+    let admin = registration(&fixture, &fixture.worktree);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    // Idle age comes from the registration once the directory is gone:
+    // backdate its index past the default --older-than.
+    let touched = Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(Path::new(&admin).join("index"))
+        .status()
+        .unwrap();
+    assert!(touched.success());
+
+    let gc = fixture.run(&["--json", "gc", "--delete-branches"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(
+        report["reaped"],
+        serde_json::json!([resolved(&fixture.worktree).display().to_string()])
+    );
+    assert_eq!(report["skipped"], serde_json::json!([]));
+    assert_eq!(report["deleted_branches"], serde_json::json!(["chat/test"]));
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+    assert!(!local_refs(&fixture.repo).contains("refs/heads/chat/test"));
+}
+
+/// With neither its directory nor its index left, nothing records when a
+/// deleted worktree was last touched. It used to count as touched just now,
+/// so it was `recently-active` forever and never reaped.
+#[test]
+fn gc_reaps_a_deleted_worktree_whose_index_is_gone() {
+    let fixture = Fixture::new();
+    fixture.create(&["--ephemeral"]);
+    let admin = registration(&fixture, &fixture.worktree);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    fs::remove_file(Path::new(&admin).join("index")).unwrap();
+
+    let gc = fixture.run(&["--json", "gc"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["skipped"], serde_json::json!([]));
+    assert_eq!(
+        report["reaped"],
+        serde_json::json!([resolved(&fixture.worktree).display().to_string()])
+    );
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+}
+
+/// Counting an unreadable index as idle must not make it reapable: whether it
+/// holds staged work cannot be told, so gc keeps it and says why.
+#[test]
+fn gc_keeps_a_deleted_worktree_whose_index_cannot_be_read() {
+    let fixture = Fixture::new();
+    fixture.create(&["--ephemeral"]);
+    let admin = registration(&fixture, &fixture.worktree);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    // A symlink to itself cannot be read even by root.
+    let index = Path::new(&admin).join("index");
+    fs::remove_file(&index).unwrap();
+    std::os::unix::fs::symlink("index", &index).unwrap();
+
+    let gc = fixture.run(&["--json", "gc"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["reaped"], serde_json::json!([]));
+    assert_eq!(
+        report["skipped"],
+        serde_json::json!([{
+            "worktree": resolved(&fixture.worktree).display().to_string(),
+            "reason": "status-failed",
+        }])
+    );
+    assert!(registered_head(&fixture, &fixture.worktree).is_some());
+}
+
+/// Pruning a detached registration whose HEAD no ref reaches leaves its
+/// commits dangling, directory or not, so no path does it.
+#[test]
+fn remove_and_gc_keep_a_deleted_detached_worktree_with_unreached_commits() {
+    let fixture = Fixture::new();
+    let path = add_detached(&fixture);
+    let head = commit_in(&path, "agent.txt");
+    let target = path.to_str().unwrap();
+    fs::remove_dir_all(&path).unwrap();
+    let main = fixture.repo.canonicalize().unwrap();
+    let fix = format!("git -C {} branch <name> {head}", main.display());
+
+    for args in [
+        vec!["remove", target],
+        vec!["remove", target, "--discard-dirty"],
+        vec!["remove", target, "--commit"],
+    ] {
+        let output = fixture.run(&args);
+        assert!(!output.status.success(), "{args:?} succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(&fix), "{stderr}");
+        assert_eq!(registered_head(&fixture, &path), Some(head.clone()));
+    }
+
+    let gc = fixture.run(&[
+        "--json",
+        "gc",
+        "--older-than",
+        "0s",
+        "--include-persistent",
+        "--discard-dirty",
+    ]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["reaped"], serde_json::json!([]));
+    assert_eq!(
+        report["skipped"],
+        serde_json::json!([{ "worktree": target, "reason": "unreached-commits" }])
+    );
+    assert_eq!(registered_head(&fixture, &path), Some(head.clone()));
+    success(&fixture.run(&["prune"]));
+    assert_eq!(registered_head(&fixture, &path), Some(head.clone()));
+
+    // The advertised fix works without the directory.
+    git(&main, &["branch", "kept", &head]);
+    let removed = fixture.run(&["--json", "remove", target]);
+    success(&removed);
+    let report: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(report["already_absent"], true);
+    assert_eq!(registered_head(&fixture, &path), None);
+    assert_eq!(rev_parse(&fixture.repo, "kept"), head);
+}
+
+/// A directory that is gone because its drive is unplugged is what
+/// `git worktree lock` protects, so a locked registration is never pruned.
+#[test]
+fn remove_and_gc_keep_a_locked_worktree_whose_directory_is_gone() {
+    let fixture = Fixture::new();
+    let path = resolved(&fixture.worktree).display().to_string();
+    fixture.create(&["--ephemeral"]);
+    let head = rev_parse(&fixture.worktree, "HEAD");
+    git(
+        &fixture.repo,
+        &["worktree", "lock", "--reason", "usb", &path],
+    );
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+
+    for target in ["chat/test", path.as_str()] {
+        let output = fixture.run(&["--json", "remove", target, "--delete-branch"]);
+        assert!(!output.status.success(), "removed {target}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("usb"), "{stderr}");
+        assert_eq!(
+            registered_head(&fixture, &fixture.worktree),
+            Some(head.clone())
+        );
+    }
+
+    let gc = fixture.run(&["--json", "gc", "--older-than", "0s", "--delete-branches"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["reaped"], serde_json::json!([]));
+    assert_eq!(
+        report["skipped"],
+        serde_json::json!([{ "worktree": path, "reason": "locked" }])
+    );
+    success(&fixture.run(&["prune"]));
+    assert_eq!(registered_head(&fixture, &fixture.worktree), Some(head));
+    assert!(local_refs(&fixture.repo).contains("refs/heads/chat/test"));
+}
+
+/// An allocation killed while its directory is missing (CoW population moves
+/// it aside) leaves its lock on a registration that `unlock <path>` must find.
+#[test]
+fn unlock_clears_a_stranded_allocation_lock_on_a_deleted_worktree() {
+    let fixture = Fixture::new();
+    let path = resolved(&fixture.worktree).display().to_string();
+    fixture.create(&[]);
+    let dead = dead_pid();
+    let reason = format!("simgit: allocating (pid {dead})");
+    git(
+        &fixture.repo,
+        &["worktree", "lock", "--reason", &reason, &path],
+    );
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+
+    let unlocked = fixture.run(&["--json", "unlock", &path]);
+    success(&unlocked);
+    let report: serde_json::Value = serde_json::from_slice(&unlocked.stdout).unwrap();
+    assert_eq!(report["unlocked"], path);
+    assert_eq!(report["was_locked"], true);
+    assert_eq!(report["owner_pid"], dead);
+    assert_eq!(fixture.listed()["locked"], serde_json::Value::Null);
+
+    let removed = fixture.run(&["--json", "remove", &path]);
+    success(&removed);
+    let report: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(report["already_absent"], true);
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+}
+
+/// Create a worktree on `branch` at `path` with `run`.
+fn create_at(fixture: &Fixture, branch: &str, path: &Path, extra: &[&str]) {
+    let output = fixture
+        .command()
+        .args(["run", branch, "--path"])
+        .arg(path)
+        .args(extra)
+        .args(["--", "true"])
+        .output()
+        .unwrap();
+    success(&output);
+}
+
+/// Assert that every remove form refuses a deleted worktree as dirty and that
+/// gc and prune keep its registration.
+fn assert_deleted_worktree_kept_as_dirty(fixture: &Fixture, branch: &str) {
+    let path = resolved(&fixture.worktree).display().to_string();
+    let head = registered_head(fixture, &fixture.worktree);
+    assert!(head.is_some());
+    let refs = local_refs(&fixture.repo);
+    for args in [
+        vec!["remove", branch],
+        vec!["remove", path.as_str()],
+        vec!["remove", branch, "--commit"],
+        vec!["remove", branch, "--delete-branch"],
+    ] {
+        let output = fixture.run(&args);
+        assert!(!output.status.success(), "{args:?} succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--discard-dirty"), "{stderr}");
+        assert_eq!(registered_head(fixture, &fixture.worktree), head);
+    }
+    let gc = fixture.run(&[
+        "--json",
+        "gc",
+        "--older-than",
+        "0s",
+        "--include-persistent",
+        "--delete-branches",
+    ]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(
+        report["skipped"],
+        serde_json::json!([{ "worktree": path, "reason": "dirty" }])
+    );
+    success(&fixture.run(&["prune"]));
+    assert_eq!(registered_head(fixture, &fixture.worktree), head);
+    assert_eq!(local_refs(&fixture.repo), refs, "a branch was deleted");
+}
+
+/// A deleted worktree's index outlives its directory, and staged changes in it
+/// are uncommitted work: losing them takes --discard-dirty, as for a live one.
+#[test]
+fn remove_and_gc_keep_staged_work_of_a_deleted_worktree() {
+    let fixture = Fixture::new();
+    fixture.create(&["--ephemeral"]);
+    fs::write(fixture.worktree.join("staged.txt"), "staged\n").unwrap();
+    git(&fixture.worktree, &["add", "staged.txt"]);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+
+    assert_deleted_worktree_kept_as_dirty(&fixture, "chat/test");
+
+    let removed = fixture.run(&["--json", "remove", "chat/test", "--discard-dirty"]);
+    success(&removed);
+    let report: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(report["already_absent"], true);
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+}
+
+/// A merge, rebase, cherry-pick or revert in progress is uncommitted work too,
+/// even when the index matches HEAD.
+#[test]
+fn a_deleted_worktree_with_an_operation_in_progress_counts_as_dirty() {
+    let fixture = Fixture::new();
+    for marker in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+    ] {
+        fixture.create(&["--ephemeral"]);
+        let head = rev_parse(&fixture.worktree, "HEAD");
+        let admin = std::path::PathBuf::from(registration(&fixture, &fixture.worktree));
+        if marker.ends_with("_HEAD") {
+            fs::write(admin.join(marker), format!("{head}\n")).unwrap();
+        } else {
+            fs::create_dir(admin.join(marker)).unwrap();
+        }
+        fs::remove_dir_all(&fixture.worktree).unwrap();
+
+        assert_deleted_worktree_kept_as_dirty(&fixture, "chat/test");
+        success(&fixture.run(&["remove", "chat/test", "--discard-dirty"]));
+        assert_eq!(
+            registered_head(&fixture, &fixture.worktree),
+            None,
+            "{marker}"
+        );
+    }
+}
+
+/// On an unborn HEAD there is no commit to compare with: anything in the
+/// index is staged, and an empty index holds nothing.
+#[test]
+fn a_deleted_worktree_on_an_unborn_branch_is_dirty_only_with_staged_files() {
+    let fixture = Fixture::new();
+    fixture.create(&[]);
+    git(&fixture.worktree, &["checkout", "-q", "--orphan", "fresh"]);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    assert_deleted_worktree_kept_as_dirty(&fixture, "fresh");
+    success(&fixture.run(&["remove", "fresh", "--discard-dirty"]));
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+
+    fixture.create(&[]);
+    git(&fixture.worktree, &["checkout", "-q", "--orphan", "empty"]);
+    git(&fixture.worktree, &["rm", "-rqf", "--cached", "."]);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    let removed = fixture.run(&["--json", "remove", "empty"]);
+    success(&removed);
+    let report: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(report["already_absent"], true);
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+}
+
+/// A linked worktree keeps its submodules' repositories (`modules/`) and its
+/// own refs (`refs/worktree`, `refs/bisect`) in its registration, so dropping
+/// it can lose commits nothing else holds.
+#[test]
+fn a_deleted_worktree_with_submodule_commits_or_its_own_refs_counts_as_dirty() {
+    let fixture = Fixture::new();
+    add_submodule(&fixture);
+    fixture.create(&["--ephemeral"]);
+    git(
+        &fixture.worktree,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "-q",
+        ],
+    );
+    let sub = fixture.worktree.join("sub");
+    git(&sub, &["config", "user.email", "test@example.com"]);
+    git(&sub, &["config", "user.name", "Test User"]);
+    let precious = commit_in(&sub, "precious.txt");
+    let modules =
+        std::path::PathBuf::from(registration(&fixture, &fixture.worktree)).join("modules/sub");
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+
+    assert_deleted_worktree_kept_as_dirty(&fixture, "chat/test");
+    git(
+        &fixture.repo,
+        &[
+            &format!("--git-dir={}", modules.display()),
+            // Its `core.worktree` names the deleted checkout.
+            &format!("--work-tree={}", fixture.repo.display()),
+            "cat-file",
+            "-e",
+            &format!("{precious}^{{commit}}"),
+        ],
+    );
+    success(&fixture.run(&["remove", "chat/test", "--discard-dirty"]));
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+
+    // A commit only a per-worktree ref reaches.
+    fixture.create(&["--ephemeral"]);
+    commit_in(&fixture.worktree, "kept.txt");
+    git(
+        &fixture.worktree,
+        &["update-ref", "refs/worktree/kept", "HEAD"],
+    );
+    git(&fixture.worktree, &["reset", "-q", "--hard", "HEAD~1"]);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+
+    assert_deleted_worktree_kept_as_dirty(&fixture, "chat/test");
+    success(&fixture.run(&["remove", "chat/test", "--discard-dirty"]));
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+}
+
+/// gc drops only what it reaps. A deleted worktree it skips, or never selects,
+/// keeps its registration, so a later gc can still reap it and its branch.
+#[test]
+fn gc_keeps_the_registrations_of_deleted_worktrees_it_skips() {
+    let fixture = Fixture::new();
+    let fresh = resolved(&fixture.worktree);
+    let persistent = fixture.root.join("persistent");
+    fixture.create(&["--ephemeral"]);
+    create_at(&fixture, "kept/test", &persistent, &[]);
+    let admin = registration(&fixture, &fixture.worktree);
+    let persistent = persistent.canonicalize().unwrap();
+    fs::remove_dir_all(&fresh).unwrap();
+    fs::remove_dir_all(&persistent).unwrap();
+    let both = |fixture: &Fixture| {
+        (
+            registered_head(fixture, &fresh).is_some(),
+            registered_head(fixture, &persistent).is_some(),
+        )
+    };
+
+    let gc = fixture.run(&["--json", "gc", "--delete-branches"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["reaped"], serde_json::json!([]));
+    assert_eq!(
+        report["skipped"],
+        serde_json::json!([
+            { "worktree": fresh.display().to_string(), "reason": "recently-active" },
+            { "worktree": persistent.display().to_string(), "reason": "persistent" },
+        ])
+    );
+    assert_eq!(both(&fixture), (true, true));
+
+    let filtered = fixture.run(&[
+        "--json",
+        "gc",
+        "--older-than",
+        "0s",
+        "--include-persistent",
+        "--prefix",
+        "none/",
+    ]);
+    success(&filtered);
+    assert_eq!(both(&fixture), (true, true));
+
+    let touched = Command::new("touch")
+        .args(["-t", "200001010000"])
+        .arg(Path::new(&admin).join("index"))
+        .status()
+        .unwrap();
+    assert!(touched.success());
+    let gc = fixture.run(&["--json", "gc", "--delete-branches"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(
+        report["reaped"],
+        serde_json::json!([fresh.display().to_string()])
+    );
+    assert_eq!(report["deleted_branches"], serde_json::json!(["chat/test"]));
+    assert_eq!(both(&fixture), (false, true));
+    assert!(local_refs(&fixture.repo).contains("refs/heads/kept/test"));
+}
+
+/// A prune judges which registrations to keep and then drops the rest. Another
+/// simgit's lock on a kept registration (a concurrent prune protecting it) can
+/// be released in between, so protection must never rest on that lock. The
+/// wrapper holds the first prune inside the registry lock (at its dirty check,
+/// or at Git's own prune or remove) while a second waits behind it, and logs
+/// each git call, so the second's first call under the lock is shown to come
+/// after the first is released.
+#[test]
+fn prunes_keep_an_unreached_registration_whose_lock_is_released_meanwhile() {
+    use std::io::Write;
+
+    let fixture = Fixture::new();
+    let detached = add_detached(&fixture);
+    let head = commit_in(&detached, "agent.txt");
+    let detached_path = detached.display().to_string();
+    let reason = format!("simgit: workspace in use (pid {})", std::process::id());
+    git(
+        &fixture.repo,
+        &["worktree", "lock", "--reason", &reason, &detached_path],
+    );
+    fs::remove_dir_all(&detached).unwrap();
+    let branch = resolved(&fixture.worktree);
+    fixture.create(&[]);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+
+    let started = fixture.root.join("prune-started");
+    let release = fixture.root.join("prune-release");
+    let log = fixture.root.join("prune-log");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "case \"$*\" in\n\
+               *'rev-parse --show-toplevel'*|*--git-common-dir*)\n\
+                 \"$SIMGIT_TEST_REAL_GIT\" \"$@\"\n\
+                 status=$?\n\
+                 echo \"$PPID discovered\" >> '{log}'\n\
+                 exit $status ;;\n\
+             esac\n\
+             echo \"$PPID locked\" >> '{log}'\n\
+             if {{ [ \"$2\" = diff-index ] || {{ [ \"$2\" = worktree ] \
+               && {{ [ \"$3\" = prune ] || [ \"$3\" = remove ]; }}; }}; }} \
+               && mkdir '{started}' 2>/dev/null; then\n\
+               tries=0\n\
+               while [ ! -e '{release}' ] && [ $tries -lt 200 ]; do sleep 0.05; tries=$((tries + 1)); done\n\
+             fi\n",
+            started = started.display(),
+            release = release.display(),
+            log = log.display(),
+        ),
+    );
+    let spawn = || {
+        fixture
+            .command()
+            .envs(env.clone())
+            .args(["--json", "prune"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let first = spawn();
+    wait_for(&started);
+    let second = spawn();
+    let logged = |line: &str| {
+        let log = fs::read_to_string(&log).unwrap_or_default();
+        log.lines().position(|logged| logged == line)
+    };
+    // `discover_repo`'s three rev-parse calls come before the registry lock:
+    // once they are done, a prune without that lock would reach Git at once.
+    let discovered = format!("{} discovered", second.id());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == discovered)
+        .count()
+        < 3
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the second prune never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let under_lock = format!("{} locked", second.id());
+    git(&fixture.repo, &["worktree", "unlock", &detached_path]);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"released\n")
+        .unwrap();
+    fs::write(&release, "").unwrap();
+    let first = first.wait_with_output().unwrap();
+    let second = second.wait_with_output().unwrap();
+    success(&first);
+    success(&second);
+    let released = logged("released").unwrap();
+    let reached = logged(&under_lock).expect("the second prune ran no git under the lock");
+    assert!(
+        reached > released,
+        "a second prune ran beside the first:\n{}",
+        fs::read_to_string(&log).unwrap()
+    );
+
+    assert_eq!(registered_head(&fixture, &detached), Some(head));
+    assert_eq!(registered_head(&fixture, &branch), None);
+    let reported = |output: &std::process::Output| {
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["pruned_registrations"]
+            .clone()
+    };
+    assert_eq!(
+        reported(&first),
+        serde_json::json!([branch.display().to_string()])
+    );
+    assert_eq!(reported(&second), serde_json::json!([]));
+}
+
+/// The gone check is repeated under the registry lock, just before the drop:
+/// a directory that is back by then is a live worktree, which Git would
+/// delete if clean. The wrapper holds the dirty check while it comes back.
+#[test]
+fn remove_leaves_a_deleted_worktree_that_reappears_alone() {
+    let fixture = Fixture::new();
+    fixture.create(&[]);
+    let aside = fixture.root.join("aside");
+    fs::rename(&fixture.worktree, &aside).unwrap();
+    let started = fixture.root.join("check-started");
+    let release = fixture.root.join("check-release");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "if [ \"$2\" = diff-index ] && mkdir '{started}' 2>/dev/null; then\n\
+               tries=0\n\
+               while [ ! -e '{release}' ] && [ $tries -lt 200 ]; do sleep 0.05; tries=$((tries + 1)); done\n\
+             fi\n",
+            started = started.display(),
+            release = release.display(),
+        ),
+    );
+    let remove = fixture
+        .command()
+        .envs(env)
+        .args(["--json", "remove", "chat/test"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&started);
+    fs::rename(&aside, &fixture.worktree).unwrap();
+    fs::write(&release, "").unwrap();
+    let output = remove.wait_with_output().unwrap();
+
+    assert!(!output.status.success(), "dropped a live worktree");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("reappeared"), "{stderr}");
+    assert!(fixture.worktree.join("README.md").is_file());
+    assert!(registered_head(&fixture, &fixture.worktree).is_some());
+}
+
+/// Git does not list a registration whose `gitdir` file is empty or corrupt,
+/// but its own prune drops one. simgit judges each admin dir itself: a corrupt
+/// one on a branch goes, one whose detached HEAD no ref reaches stays, and one
+/// whose HEAD cannot be read stays and is reported.
+#[test]
+fn prune_drops_a_corrupt_registration_and_keeps_what_it_cannot_lose() {
+    let fixture = Fixture::new();
+    // Git 2.51+ auto maintenance, run by `git commit` in the background, would
+    // prune a corrupt registration itself before simgit sees it.
+    git(&fixture.repo, &["config", "maintenance.auto", "false"]);
+    let admins = fixture.repo.canonicalize().unwrap().join(".git/worktrees");
+    let corrupt = |worktree: &Path| {
+        let admin = std::path::PathBuf::from(registration(&fixture, worktree));
+        fs::remove_dir_all(worktree).unwrap();
+        fs::write(admin.join("gitdir"), "").unwrap();
+        admins.join(admin.file_name().unwrap())
+    };
+    fixture.create(&[]);
+    let on_branch = corrupt(&fixture.worktree);
+    let detached = add_detached(&fixture);
+    let head = commit_in(&detached, "agent.txt");
+    let unreached = corrupt(&detached);
+    let other = fixture.root.join("other");
+    create_at(&fixture, "other/test", &other, &[]);
+    let unreadable = corrupt(&other);
+    fs::write(unreadable.join("HEAD"), "not a head\n").unwrap();
+
+    let pruned = fixture.run(&["--json", "prune"]);
+    success(&pruned);
+    let report: serde_json::Value = serde_json::from_slice(&pruned.stdout).unwrap();
+    assert_eq!(
+        report["pruned_registrations"],
+        serde_json::json!([on_branch.display().to_string()])
+    );
+    assert!(!on_branch.exists());
+    assert_eq!(
+        fs::read_to_string(unreached.join("HEAD")).unwrap().trim(),
+        head
+    );
+    assert!(unreadable.join("HEAD").is_file());
+    let kept = report["kept_registrations"].as_array().unwrap();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    for (admin, reason) in [
+        (&unreached, "unreached-commits"),
+        (&unreadable, "status-failed"),
+    ] {
+        let entry =
+            serde_json::json!({ "worktree": admin.display().to_string(), "reason": reason });
+        assert!(kept.contains(&entry), "{entry} not in {kept:?}");
+    }
+    assert!(pruned.stderr.is_empty(), "{:?}", pruned.stderr);
+}
+
+/// `--delete-branch` and `--delete-branches` keep their merged check when the
+/// worktree is gone: the registration goes, an unmerged branch stays.
+#[test]
+fn a_deleted_worktree_keeps_its_unmerged_branch() {
+    let fixture = Fixture::new();
+    fixture.create(&["--ephemeral"]);
+    commit_in(&fixture.worktree, "agent.txt");
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+
+    let output = fixture.run(&["--json", "remove", "chat/test", "--delete-branch"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not fully merged"), "{stderr}");
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+    assert!(local_refs(&fixture.repo).contains("refs/heads/chat/test"));
+
+    fixture.create(&["--ephemeral"]);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    let gc = fixture.run(&["--json", "gc", "--older-than", "0s", "--delete-branches"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(
+        report["reaped"],
+        serde_json::json!([resolved(&fixture.worktree).display().to_string()])
+    );
+    assert_eq!(
+        report["retained_branches"],
+        serde_json::json!(["chat/test"])
+    );
+    assert_eq!(registered_head(&fixture, &fixture.worktree), None);
+    assert!(local_refs(&fixture.repo).contains("refs/heads/chat/test"));
+}
+
+/// A path that cannot be checked (its parent denies search) is not known to be
+/// gone, so its registration is never dropped as if it were.
+#[test]
+fn an_unreadable_worktree_path_is_not_treated_as_gone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let uid = Command::new("id").arg("-u").output().unwrap();
+    if String::from_utf8_lossy(&uid.stdout).trim() == "0" {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
+    let fixture = Fixture::new();
+    let parent = fixture.root.join("sealed");
+    let path = parent.join("wt");
+    create_at(&fixture, "chat/test", &path, &["--ephemeral"]);
+    let path = path.canonicalize().unwrap();
+    let head = registered_head(&fixture, &path);
+    // Restores the permission even when an assertion fails, so Drop can clean up.
+    struct Unseal(std::path::PathBuf);
+    impl Drop for Unseal {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _unseal = Unseal(parent.clone());
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = fixture.run(&["--json", "remove", "chat/test"]);
+    assert!(!output.status.success(), "removed an unreadable worktree");
+    let gc = fixture.run(&["--json", "gc", "--older-than", "0s", "--delete-branches"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["reaped"], serde_json::json!([]));
+    success(&fixture.run(&["prune"]));
+    assert_eq!(registered_head(&fixture, &path), head);
+    assert!(local_refs(&fixture.repo).contains("refs/heads/chat/test"));
+}
+
+fn registration(fixture: &Fixture, worktree: &Path) -> String {
+    let dir = fixture.repo.join(".git/worktrees");
+    for entry in fs::read_dir(&dir).unwrap() {
+        let entry = entry.unwrap().path();
+        let recorded = fs::read_to_string(entry.join("gitdir")).unwrap();
+        if Path::new(recorded.trim()).parent() == Some(worktree.canonicalize().unwrap().as_path()) {
+            return entry.display().to_string();
+        }
+    }
+    panic!("no registration for {worktree:?}");
+}
+
+/// HEAD names an object that does not exist, so git cannot say whether the
+/// commit is reached: that is an error, never permission to delete.
+#[test]
+fn remove_and_gc_keep_a_detached_worktree_when_git_cannot_answer() {
+    let fixture = Fixture::new();
+    let path = add_detached(&fixture);
+    let registered = registration(&fixture, &path);
+    fs::write(
+        Path::new(&registered).join("HEAD"),
+        format!("{}\n", "a".repeat(40)),
+    )
+    .unwrap();
+
+    let output = fixture.run(&["--json", "remove", path.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.trim().lines().count(), 1, "{stderr}");
+    assert!(path.is_dir());
+
+    let gc = fixture.run(&["--json", "gc", "--older-than", "0s", "--include-persistent"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["reaped"], serde_json::json!([]));
+    assert!(
+        report["skipped"].to_string().contains("status-failed"),
+        "{report}"
+    );
+    assert!(path.is_dir());
+}
+
+/// A prune drops a registration whose `.git` is missing, and CoW population
+/// takes it away while it clones the tree into place. With simgit's prunes
+/// running beside them, parallel allocations used to lose their registration
+/// mid-clone and then fail their own rollback. The tree is large enough that
+/// each clone is slow enough for a prune to land in it. Only the root-clone
+/// (macOS) and overlay backends move `.git`, so only there can this fail.
+///
+/// Native `git worktree prune` is out of scope here: it takes no lock, and Git
+/// makes the admin dir visible before its `locked` file, so it can drop a
+/// registration inside `git worktree add` itself. Native prune during
+/// population is pinned on every OS by
+/// `prune_during_population_keeps_the_registration`.
+///
+/// gc runs beside them too, with `--include-persistent --dry-run`, so the
+/// allocation lock is all that keeps a racer from it. The wrapper stretches
+/// the moments just before and after each allocation drops that lock, and gc
+/// must name a racer as reapable only once its allocation has written
+/// everything, its mode marker included.
+#[test]
+fn allocation_survives_a_concurrent_prune() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let fixture = Fixture::new();
+    for index in 0..1000 {
+        fs::write(
+            fixture.repo.join(format!("file-{index}")),
+            format!("{index}\n"),
+        )
+        .unwrap();
+    }
+    git(&fixture.repo, &["add", "."]);
+    git(&fixture.repo, &["commit", "-qm", "many files"]);
+    // A checkout never takes `.git` away; the CoW backends do.
+    let command = || {
+        let mut command = fixture.command();
+        command.env_remove("SIMGIT_POPULATE");
+        command
+    };
+    let unlock = git_wrapper(
+        &fixture,
+        "if [ \"$2\" = worktree ] && [ \"$3\" = unlock ]; then\n\
+           sleep 0.2\n\
+           \"$SIMGIT_TEST_REAL_GIT\" \"$@\"\n\
+           status=$?\n\
+           sleep 0.2\n\
+           exit $status\n\
+         fi\n",
+    );
+    let fully_allocated = |path: &Path| {
+        let admin = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--absolute-git-dir"])
+            .output()
+            .unwrap();
+        let admin = String::from_utf8_lossy(&admin.stdout).trim().to_owned();
+        path.join("file-999").is_file() && Path::new(&admin).join("simgit-mode").is_file()
+    };
+
+    let done = AtomicBool::new(false);
+    let (outcomes, maintenance) = std::thread::scope(|scope| {
+        let pruner = scope.spawn(|| {
+            let mut outputs = Vec::new();
+            while !done.load(Ordering::Relaxed) {
+                outputs.push(command().arg("prune").output().unwrap());
+            }
+            outputs
+        });
+        // Apart from prune, which waits for each unlock to finish.
+        let collector = scope.spawn(|| {
+            let mut outputs = Vec::new();
+            let (mut met_lock, mut met_reapable) = (false, false);
+            while !done.load(Ordering::Relaxed) {
+                let gc = command()
+                    .args(["--json", "gc", "--include-persistent", "--dry-run"])
+                    .args(["--older-than", "0s"])
+                    .output()
+                    .unwrap();
+                success(&gc);
+                let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+                for path in report["reaped"].as_array().unwrap() {
+                    let path = Path::new(path.as_str().unwrap());
+                    met_reapable = true;
+                    assert!(
+                        fully_allocated(path),
+                        "gc named {} reapable mid-allocation",
+                        path.display()
+                    );
+                }
+                met_lock |= report["skipped"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|skipped| skipped["reason"] == "locked");
+                outputs.push(gc);
+            }
+            assert!(met_lock, "gc never met an allocation lock");
+            assert!(met_reapable, "gc never saw an allocated racer");
+            outputs
+        });
+        let racers: Vec<_> = (0..10)
+            .map(|index| {
+                command()
+                    .envs(unlock.clone())
+                    .args(["--json", "add", &format!("agent/racer-{index}"), "--path"])
+                    .arg(fixture.root.join(format!("racer-{index}")))
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let outcomes: Vec<_> = racers
+            .into_iter()
+            .map(|racer| racer.wait_with_output().unwrap())
+            .collect();
+        done.store(true, Ordering::Relaxed);
+        let mut maintenance = pruner.join().unwrap();
+        maintenance.extend(collector.join().unwrap());
+        (outcomes, maintenance)
+    });
+    for output in &maintenance {
+        success(output);
+    }
+
+    let failures: Vec<_> = outcomes
+        .iter()
+        .filter(|output| !output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stderr).into_owned())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of 10 allocations failed: {failures:#?}",
+        failures.len()
+    );
+    let registrations = Command::new("git")
+        .current_dir(&fixture.repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
+    let registrations = String::from_utf8_lossy(&registrations.stdout).into_owned();
+    for (index, output) in outcomes.iter().enumerate() {
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let path = Path::new(report["path"].as_str().unwrap());
+        assert_eq!(fs::read_to_string(path.join("file-999")).unwrap(), "999\n");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        success(&status);
+        assert!(status.stdout.is_empty(), "racer-{index} is not clean");
+        let entries: Vec<_> = registrations
+            .split("\n\n")
+            .filter(|entry| {
+                entry
+                    .lines()
+                    .any(|line| line == format!("branch refs/heads/agent/racer-{index}"))
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "racer-{index}: {registrations}");
+        assert!(
+            !entries[0].lines().any(|line| line.starts_with("locked")),
+            "racer-{index} kept its allocation lock: {registrations}"
+        );
+    }
+}
+
+/// The allocation lock names the allocating process, so an allocation killed
+/// before its worktree was whole leaves a lock that `unlock` refuses while the
+/// allocator lives and clears once it is gone.
+#[test]
+fn a_killed_allocation_leaves_a_lock_that_unlock_clears() {
+    let fixture = Fixture::new();
+    let started = fixture.root.join("reset-started");
+    let release = fixture.root.join("reset-release");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "if [ \"$1\" = -C ] && [ \"$3\" = reset ]; then\n\
+               : > '{started}'\n\
+               tries=0\n\
+               while [ ! -e '{release}' ] && [ $tries -lt 200 ]; do sleep 0.05; tries=$((tries + 1)); done\n\
+               exit 1\n\
+             fi\n",
+            started = started.display(),
+            release = release.display(),
+        ),
+    );
+    let mut allocation = fixture
+        .command()
+        .envs(env)
+        .args(["add", "agent/killed", "--path"])
+        .arg(&fixture.worktree)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let allocator = allocation.id();
+    while !started.exists() {
+        assert!(
+            allocation.try_wait().unwrap().is_none(),
+            "allocation exited before populating"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let locked = |fixture: &Fixture| {
+        let output = fixture.run(&["list", "--json"]);
+        success(&output);
+        let entries: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+        entries
+            .into_iter()
+            .find(|entry| entry["branch"] == "refs/heads/agent/killed")
+            .unwrap()["locked"]
+            .clone()
+    };
+    let while_allocating = locked(&fixture);
+    let refused = fixture.run(&["unlock", "agent/killed"]);
+    allocation.kill().unwrap();
+    allocation.wait().unwrap();
+    fs::write(&release, "").unwrap();
+
+    assert_eq!(
+        while_allocating,
+        format!("simgit: allocating (pid {allocator})")
+    );
+    assert!(!refused.status.success(), "unlock ignored a live allocator");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains(&format!("pid {allocator}")),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(
+        locked(&fixture),
+        format!("simgit: allocating (pid {allocator})")
+    );
+
+    let unlocked = fixture.run(&["--json", "unlock", "agent/killed"]);
+    success(&unlocked);
+    let report: serde_json::Value = serde_json::from_slice(&unlocked.stdout).unwrap();
+    assert_eq!(report["was_locked"], true);
+    assert_eq!(report["owner_pid"], allocator);
+    assert_eq!(locked(&fixture), serde_json::Value::Null);
+}
+
+/// A failing `post-checkout` hook fails the allocation but keeps the worktree,
+/// as `git worktree add` does, so it must not keep the allocation lock too.
+#[test]
+fn a_failing_post_checkout_hook_keeps_the_worktree_unlocked() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let hook = fixture.repo.join(".git/hooks/post-checkout");
+    fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = fixture
+        .command()
+        .args(["add", "agent/hooked", "--path"])
+        .arg(&fixture.worktree)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "the failing hook did not fail add"
+    );
+    assert!(fixture.worktree.join("README.md").is_file());
+    let listed = fixture.run(&["list", "--json"]);
+    success(&listed);
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&listed.stdout).unwrap();
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry["branch"] == "refs/heads/agent/hooked")
+        .unwrap();
+    assert_eq!(entry["locked"], serde_json::Value::Null, "{entry}");
+}
+
+/// A population failure rolls the allocation back. The registration is still
+/// locked at that point, and Git refuses to remove a locked worktree.
+#[test]
+fn a_failed_population_rolls_back_its_locked_registration() {
+    let fixture = Fixture::new();
+    let env = git_wrapper(
+        &fixture,
+        "if [ \"$1\" = -C ] && [ \"$3\" = status ]; then exit 1; fi\n",
+    );
+    let output = fixture
+        .command()
+        .envs(env)
+        .args(["add", "agent/failed", "--path"])
+        .arg(&fixture.worktree)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "population did not fail");
+    assert!(!stderr.contains("rollback"), "{stderr}");
+    assert!(!fixture.worktree.exists());
+    let registrations = Command::new("git")
+        .current_dir(&fixture.repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&registrations.stdout)
+            .matches("worktree ")
+            .count(),
+        1
+    );
+    let branch = Command::new("git")
+        .current_dir(&fixture.repo)
+        .args(["show-ref", "--verify", "--quiet", "refs/heads/agent/failed"])
+        .status()
+        .unwrap();
+    assert!(!branch.success(), "rollback kept the new branch");
+}
+
+/// The same race on every OS: in checkout mode, the wrapper does to `.git`
+/// what CoW population does, and prunes while it is gone.
+#[test]
+fn prune_during_population_keeps_the_registration() {
+    let fixture = Fixture::new();
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "if [ \"$1\" = -C ] && [ \"$3\" = reset ]; then\n\
+               mv \"$2/.git\" \"$2/.git-aside\" || exit\n\
+               \"$SIMGIT_TEST_REAL_GIT\" -C '{repo}' worktree prune || exit\n\
+               mv \"$2/.git-aside\" \"$2/.git\" || exit\n\
+             fi\n",
+            repo = fixture.repo.display(),
+        ),
+    );
+    let target = fixture.root.join("pruned");
+    let output = fixture
+        .command()
+        .envs(env)
+        .args(["add", "agent/pruned", "--path"])
+        .arg(&target)
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(
+        fs::read_to_string(target.join("README.md")).unwrap(),
+        "original\n"
+    );
+    let listed = fixture.run(&["list", "--json"]);
+    success(&listed);
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&listed.stdout).unwrap();
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry["branch"] == "refs/heads/agent/pruned")
+        .expect("the registration was pruned");
+    assert_eq!(entry["locked"], serde_json::Value::Null, "{entry}");
+}
+
+/// Stand in for fuse-overlayfs, so the overlay backend runs where it is not
+/// installed. The "mount" copies only the gitlink into place, so population
+/// fails, and `unmount_script` is every unmount tool. Returns `PATH`.
+/// Linux asks the mount table whether the overlay is mounted, and no fake
+/// can enter it, so these tests run only where the gitlink is the evidence.
+#[cfg(not(target_os = "linux"))]
+fn fake_overlay_tools(fixture: &Fixture, unmount_script: &str) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = fixture.root.join("overlay-bin");
+    fs::create_dir(&bin).unwrap();
+    let tools = [
+        (
+            "fuse-overlayfs",
+            "upper=$(printf '%s' \"$2\" | sed 's/.*upperdir=\\([^,]*\\),.*/\\1/')\n\
+             cp \"$upper/.git\" \"$3/.git\"\n",
+        ),
+        ("fusermount3", unmount_script),
+        ("fusermount", unmount_script),
+        ("umount", unmount_script),
+    ];
+    for (name, body) in tools {
+        let tool = bin.join(name);
+        fs::write(&tool, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap()
+}
+
+/// A failed overlay that cannot be unmounted is kept for recovery, and keeps
+/// its allocation lock: prune must not drop a registration whose `.git` may
+/// survive only in the upperdir. The error says how to release it.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_retained_overlay_keeps_its_allocation_lock() {
+    let fixture = Fixture::new();
+    let path = fake_overlay_tools(&fixture, "exit 0\n");
+    let target = fixture.root.join("overlaid");
+    let output = fixture
+        .command()
+        .env("PATH", path)
+        .env("SIMGIT_POPULATE", "overlay")
+        .args(["add", "agent/overlaid", "--path"])
+        .arg(&target)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "population did not fail");
+    assert!(stderr.contains("retained for recovery"), "{stderr}");
+    // The population failure stays the cause.
+    assert!(stderr.contains("verify overlay worktree"), "{stderr}");
+    let canonical = target.canonicalize().unwrap();
+    assert!(
+        stderr.contains(&format!("simgit unlock {}", canonical.display())),
+        "{stderr}"
+    );
+
+    let listed = fixture.run(&["list", "--json"]);
+    success(&listed);
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&listed.stdout).unwrap();
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry["branch"] == "refs/heads/agent/overlaid")
+        .unwrap();
+    assert!(
+        entry["locked"]
+            .as_str()
+            .is_some_and(|reason| reason.starts_with("simgit: allocating (pid ")),
+        "{entry}"
+    );
+    let unlocked = fixture.run(&["--json", "unlock", "agent/overlaid"]);
+    success(&unlocked);
+    let report: serde_json::Value = serde_json::from_slice(&unlocked.stdout).unwrap();
+    assert_eq!(report["was_locked"], true);
+}
+
+/// The other exit that cannot roll back: the overlay unmounts, but its
+/// gitlink cannot be put back. The same rule holds.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn a_failed_gitlink_restore_keeps_the_allocation_lock() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let mountpoint = "for last; do :; done\nrm -f \"$last/.git\"\nchmod 555 \"$last\"\n";
+    let path = fake_overlay_tools(&fixture, mountpoint);
+    let target = fixture.root.join("overlaid");
+    let output = fixture
+        .command()
+        .env("PATH", path)
+        .env("SIMGIT_POPULATE", "overlay")
+        .args(["add", "agent/overlaid", "--path"])
+        .arg(&target)
+        .output()
+        .unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "population did not fail");
+    assert!(stderr.contains("restore the gitlink"), "{stderr}");
+    assert!(stderr.contains("verify overlay worktree"), "{stderr}");
+    let canonical = target.canonicalize().unwrap();
+    assert!(
+        stderr.contains(&format!("simgit unlock {}", canonical.display())),
+        "{stderr}"
+    );
+    let registrations = fixture.repo.join(".git/worktrees");
+    let locked: Vec<_> = fs::read_dir(&registrations)
+        .unwrap()
+        .filter_map(|entry| fs::read_to_string(entry.unwrap().path().join("locked")).ok())
+        .collect();
+    assert_eq!(locked.len(), 1, "{locked:?}");
+    assert!(
+        locked[0].starts_with("simgit: allocating (pid "),
+        "{locked:?}"
+    );
+}
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .current_dir(repo)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// `git status` failing is how these tests make population fail.
+const FAIL_POPULATION: &str = "if [ \"$1\" = -C ] && [ \"$3\" = status ]; then\n\
+       echo 'simulated population failure' >&2\n\
+       exit 1\n\
+     fi\n";
+
+/// The rollback of a failed allocation must not hide why it failed, and must
+/// delete the branch the allocation created even when it is named `master`.
+#[test]
+fn failed_allocation_reports_the_cause_and_removes_its_new_branch() {
+    let fixture = Fixture::new();
+    git(&fixture.repo, &["branch", "-M", "main"]);
+    let env = git_wrapper(&fixture, FAIL_POPULATION);
+    let failed = fixture
+        .command()
+        .envs(env)
+        .args(["add", "master", "--path"])
+        .arg(&fixture.worktree)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success(), "{stderr}");
+    assert!(stderr.contains("simulated population failure"), "{stderr}");
+    assert!(!stderr.contains("refusing to delete"), "{stderr}");
+    assert!(!branch_exists(&fixture.repo, "master"));
+    assert!(!fixture.worktree.exists());
+    assert!(branch_exists(&fixture.repo, "main"));
+}
+
+/// When the rollback fails too, its error is context on the cause, not a
+/// replacement for it.
+#[test]
+fn failed_rollback_keeps_the_original_cause() {
+    let fixture = Fixture::new();
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "if [ \"$2\" = worktree ] && [ \"$3\" = remove ]; then\n\
+               echo 'fatal: simulated removal failure' >&2\n\
+               exit 1\n\
+             fi\n{FAIL_POPULATION}"
+        ),
+    );
+    let failed = fixture
+        .command()
+        .envs(env)
+        .args(["add", "agent/doomed", "--path"])
+        .arg(&fixture.worktree)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("simulated population failure"),
+        "cause lost: {stderr}"
+    );
+    assert!(stderr.contains("simulated removal failure"), "{stderr}");
+}
+
+/// A failing hook is the cause even when releasing the allocation lock fails
+/// too: the unlock failure is context, not a replacement.
+#[test]
+fn a_failing_hook_stays_the_cause_when_unlock_fails_too() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let hook = fixture.repo.join(".git/hooks/post-checkout");
+    fs::write(
+        &hook,
+        "#!/bin/sh\necho 'simulated hook failure' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let env = git_wrapper(
+        &fixture,
+        "if [ \"$2\" = worktree ] && [ \"$3\" = unlock ]; then\n\
+           echo 'fatal: simulated unlock failure' >&2\n\
+           exit 1\n\
+         fi\n",
+    );
+
+    let failed = fixture
+        .command()
+        .envs(env)
+        .args(["add", "agent/hooked", "--path"])
+        .arg(&fixture.worktree)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("simulated hook failure"),
+        "cause lost: {stderr}"
+    );
+    assert!(stderr.contains("simgit unlock"), "{stderr}");
+}
+
+/// When marking an allocation ephemeral fails, the marker is the cause and
+/// the branch this call created goes, even when it is named `master`. The
+/// wrapper makes the marker's path a directory once Git has registered the
+/// worktree, so writing the marker fails.
+#[test]
+fn failed_ephemeral_marker_reports_the_cause_and_removes_its_new_branch() {
+    let fixture = Fixture::new();
+    git(&fixture.repo, &["branch", "-M", "main"]);
+    let env = git_wrapper(
+        &fixture,
+        "if [ \"$2\" = worktree ] && [ \"$3\" = add ]; then\n\
+           \"$SIMGIT_TEST_REAL_GIT\" \"$@\" || exit $?\n\
+           for admin in \"${1#--git-dir=}\"/worktrees/*/; do mkdir \"${admin}simgit-ephemeral\"; done\n\
+           exit 0\n\
+         fi\n",
+    );
+
+    let failed = fixture
+        .command()
+        .envs(env)
+        .args(["add", "master", "--ephemeral", "--path"])
+        .arg(&fixture.worktree)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("write ephemeral marker"),
+        "cause lost: {stderr}"
+    );
+    assert!(!stderr.contains("refusing to delete"), "{stderr}");
+    assert!(!branch_exists(&fixture.repo, "master"));
+    assert!(!fixture.worktree.exists());
+    assert!(branch_exists(&fixture.repo, "main"));
+}
+
+/// Add `<fixture.root>/lib` to the fixture as the submodule `sub` and return
+/// its checkout. Its git dir is `.git/modules/sub`, named nothing like `.git`.
+fn add_submodule(fixture: &Fixture) -> std::path::PathBuf {
+    add_submodule_to(fixture, &fixture.repo, "lib", "sub")
+}
+
+/// Add a new one-commit repository `<fixture.root>/<source>` to `superproject`
+/// as a submodule at `path`, commit it there, and return its checkout.
+fn add_submodule_to(
+    fixture: &Fixture,
+    superproject: &Path,
+    source: &str,
+    path: &str,
+) -> std::path::PathBuf {
+    let lib = fixture.root.join(source);
+    fs::create_dir_all(&lib).unwrap();
+    git(&lib, &["init", "-q"]);
+    git(&lib, &["config", "user.email", "test@example.com"]);
+    git(&lib, &["config", "user.name", "Test User"]);
+    fs::write(lib.join("lib.txt"), "lib\n").unwrap();
+    git(&lib, &["add", "."]);
+    git(&lib, &["commit", "-qm", "lib"]);
+    let lib = lib.to_str().unwrap();
+    git(
+        superproject,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            lib,
+            path,
+        ],
+    );
+    git(superproject, &["config", "user.email", "test@example.com"]);
+    git(superproject, &["config", "user.name", "Test User"]);
+    git(superproject, &["commit", "-qm", "add submodule"]);
+    superproject.join(path)
+}
+
+/// The directory `add` puts `branch` in by default when run from `dir`.
+fn default_parent(fixture: &Fixture, dir: &Path, branch: &str) -> std::path::PathBuf {
+    let output = fixture
+        .command()
+        .current_dir(dir)
+        .args(["--json", "add", branch])
+        .output()
+        .unwrap();
+    success(&output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let path = Path::new(report["path"].as_str().unwrap());
+    assert!(path.join(".git").is_file(), "{report}");
+    path.parent().unwrap().to_path_buf()
+}
+
+/// Assert that `parent` is `<root>/.simgit/repo/.modules/<prefix>-<8 hex>`:
+/// beside the superproject's main checkout, apart from its branches.
+fn assert_module_root(fixture: &Fixture, parent: &Path, prefix: &str) {
+    let modules = fixture
+        .root
+        .canonicalize()
+        .unwrap()
+        .join(".simgit/repo/.modules");
+    assert_eq!(parent.parent(), Some(modules.as_path()), "{parent:?}");
+    let name = parent.file_name().unwrap().to_str().unwrap();
+    let digest = name
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .unwrap_or_else(|| panic!("{name} does not start with {prefix}-"));
+    assert!(
+        digest.len() == 8 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{name}"
+    );
+}
+
+/// What `git status` reports in `checkout`, ignored files included.
+fn status_with_ignored(checkout: &Path) -> String {
+    let output = Command::new("git")
+        .current_dir(checkout)
+        .args(["status", "--porcelain", "--ignored"])
+        .output()
+        .unwrap();
+    success(&output);
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// A submodule's checkout sits inside its superproject's working tree, so its
+/// worktrees go beside the superproject instead, wherever simgit runs from.
+#[test]
+fn default_path_in_a_submodule_is_outside_the_superproject() {
+    let fixture = Fixture::new();
+    let sub = add_submodule(&fixture);
+    let before = status_with_ignored(&fixture.repo);
+
+    let from_checkout = default_parent(&fixture, &sub, "agent/checkout");
+    assert_module_root(&fixture, &from_checkout, "sub");
+    let nested = sub.join("deeper");
+    fs::create_dir_all(&nested).unwrap();
+    assert_eq!(
+        default_parent(&fixture, &nested, "agent/nested"),
+        from_checkout
+    );
+    let linked = fixture.root.join("sub-linked");
+    git(&sub, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+    assert_eq!(
+        default_parent(&fixture, &linked, "agent/linked"),
+        from_checkout
+    );
+
+    fs::remove_dir(&nested).unwrap();
+    assert_eq!(status_with_ignored(&fixture.repo), before);
+}
+
+/// Each superproject worktree has its own module git dir, so the same
+/// submodule there gets its own root, beside the superproject's main checkout
+/// and outside both working trees.
+#[test]
+fn default_path_in_a_submodule_of_a_linked_worktree_is_outside_both() {
+    let fixture = Fixture::new();
+    let sub = add_submodule(&fixture);
+    let linked = fixture.root.join("linked");
+    git(
+        &fixture.repo,
+        &["worktree", "add", "-q", linked.to_str().unwrap()],
+    );
+    git(
+        &linked,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "-q",
+            "--init",
+        ],
+    );
+    let before = (
+        status_with_ignored(&fixture.repo),
+        status_with_ignored(&linked),
+    );
+
+    let in_linked = default_parent(&fixture, &linked.join("sub"), "agent/linked");
+    assert_module_root(&fixture, &in_linked, "sub");
+    let in_main = default_parent(&fixture, &sub, "agent/main");
+    assert_module_root(&fixture, &in_main, "sub");
+    assert_ne!(in_linked, in_main);
+    assert_eq!(
+        (
+            status_with_ignored(&fixture.repo),
+            status_with_ignored(&linked),
+        ),
+        before
+    );
+}
+
+/// A submodule of a submodule goes beside the outermost superproject, never
+/// beside the intermediate one, which is itself inside a working tree.
+#[test]
+fn default_path_in_a_nested_submodule_is_beside_the_outermost_superproject() {
+    let fixture = Fixture::new();
+    let middle = add_submodule_to(&fixture, &fixture.repo, "middle", "a");
+    let inner = add_submodule_to(&fixture, &middle, "inner", "b");
+    let before = status_with_ignored(&fixture.repo);
+
+    assert_module_root(
+        &fixture,
+        &default_parent(&fixture, &inner, "agent/inner"),
+        "a-b",
+    );
+    assert_eq!(status_with_ignored(&fixture.repo), before);
+}
+
+#[test]
+fn same_named_submodules_get_distinct_default_roots() {
+    let fixture = Fixture::new();
+    let first = add_submodule_to(&fixture, &fixture.repo, "one", "x/lib");
+    let second = add_submodule_to(&fixture, &fixture.repo, "two", "y/lib");
+
+    let first = default_parent(&fixture, &first, "agent/first");
+    let second = default_parent(&fixture, &second, "agent/second");
+    assert_module_root(&fixture, &first, "x-lib");
+    assert_module_root(&fixture, &second, "y-lib");
+}
+
+#[test]
+fn default_path_with_separate_git_dir() {
+    let fixture = Fixture::new();
+    let checkout = fixture.root.join("checkout");
+    let git_dir = fixture.root.join("store");
+    git(
+        &fixture.root,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            git_dir.to_str().unwrap(),
+            checkout.to_str().unwrap(),
+        ],
+    );
+    git(&checkout, &["config", "user.email", "test@example.com"]);
+    git(&checkout, &["config", "user.name", "Test User"]);
+    fs::write(checkout.join("README.md"), "separate\n").unwrap();
+    git(&checkout, &["add", "."]);
+    git(&checkout, &["commit", "-qm", "initial"]);
+    assert_eq!(
+        default_parent(&fixture, &checkout, "agent/edit"),
+        fixture
+            .root
+            .canonicalize()
+            .unwrap()
+            .join(".simgit/checkout")
+    );
+}
+
+#[test]
+fn doctor_is_main_worktree_in_a_submodule() {
+    let fixture = Fixture::new();
+    let sub = add_submodule(&fixture);
+    let doctor = |dir: &Path| {
+        let output = fixture
+            .command()
+            .current_dir(dir)
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap();
+        success(&output);
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let report = doctor(&sub);
+    assert_eq!(report["repository_details"]["is_main_worktree"], true);
+    assert_eq!(
+        report["repository_details"]["common_git_owner"],
+        sub.canonicalize().unwrap().display().to_string()
+    );
+    assert_module_root(
+        &fixture,
+        Path::new(report["default_worktree_root"].as_str().unwrap()),
+        "sub",
+    );
+    assert_eq!(report["default_worktree_root_inside_repository"], false);
+    // `list --json` names the checkout, not the git dir Git reports for it.
+    assert_eq!(
+        first_listed(&fixture, &sub)["worktree"],
+        sub.canonicalize().unwrap().display().to_string()
+    );
+
+    let linked = fixture.root.join("sub-linked");
+    git(&sub, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+    assert_eq!(
+        doctor(&linked)["repository_details"]["is_main_worktree"],
+        false
+    );
+}
+
+/// `remove` knows the main checkout from the registry's first entry, which Git
+/// reports as a submodule's git dir; the guard must still recognise it.
+#[test]
+fn remove_commit_refuses_a_submodules_main_checkout() {
+    let fixture = Fixture::new();
+    let sub = add_submodule(&fixture);
+    git(&sub, &["config", "user.email", "test@example.com"]);
+    git(&sub, &["config", "user.name", "Test User"]);
+    fs::write(sub.join("scratch.txt"), "work in progress\n").unwrap();
+    let head = rev_parse(&sub, "HEAD");
+    let target = sub.canonicalize().unwrap().display().to_string();
+
+    for args in [
+        vec!["remove", "--commit"],
+        vec!["remove", &target, "--commit"],
+    ] {
+        let output = fixture
+            .command()
+            .current_dir(&sub)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?} succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("main checkout"), "{args:?}: {stderr}");
+        assert_eq!(rev_parse(&sub, "HEAD"), head, "{args:?} committed");
+    }
+    assert!(sub.join("scratch.txt").is_file());
+}
+
+/// With `worktree.useRelativePaths` (Git 2.48+), the registry records a
+/// worktree relative to its admin dir. A deleted one must be found, and its
+/// lock honoured, just as when the path is absolute. Older Git ignores the
+/// setting and cannot read a relative entry itself, so there is nothing to test.
+#[test]
+fn a_deleted_worktree_with_relative_paths_is_handled_like_an_absolute_one() {
+    let fixture = Fixture::new();
+    git(
+        &fixture.repo,
+        &["config", "worktree.useRelativePaths", "true"],
+    );
+    let path = resolved(&fixture.worktree).display().to_string();
+
+    fixture.create(&["--ephemeral"]);
+    let admin = Path::new(&registration_by_branch(&fixture, "chat/test")).to_path_buf();
+    let recorded = fs::read_to_string(admin.join("gitdir")).unwrap();
+    if Path::new(recorded.trim()).is_absolute() {
+        eprintln!("skipped: this Git predates worktree.useRelativePaths");
+        return;
+    }
+    git(
+        &fixture.repo,
+        &["worktree", "lock", "--reason", "usb", &path],
+    );
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    let removed = fixture.run(&["--json", "remove", "chat/test"]);
+    assert!(!removed.status.success(), "removed a locked worktree");
+    let stderr = String::from_utf8_lossy(&removed.stderr);
+    assert!(stderr.contains("usb"), "{stderr}");
+    let gc = fixture.run(&["--json", "gc", "--older-than", "0s"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(
+        report["skipped"],
+        serde_json::json!([{ "worktree": path, "reason": "locked" }])
+    );
+    assert!(admin.is_dir());
+
+    git(&fixture.repo, &["worktree", "unlock", &path]);
+    let removed = fixture.run(&["--json", "remove", "chat/test"]);
+    success(&removed);
+    let report: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(report["removed"], path);
+    assert_eq!(report["already_absent"], true);
+    assert!(!admin.exists());
+
+    fixture.create(&["--ephemeral"]);
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    let gc = fixture.run(&["--json", "gc", "--older-than", "0s", "--delete-branches"]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["reaped"], serde_json::json!([path]));
+    assert_eq!(report["skipped"], serde_json::json!([]));
+    assert!(!branch_exists(&fixture.repo, "chat/test"));
+}
+
+/// Git counts a `locked` entry that is a dangling symlink as a lock (it checks
+/// with lstat), so simgit must too. `git worktree list` then fails reading the
+/// reason, and so does every command that lists worktrees; none may drop it.
+#[test]
+fn a_dangling_symlink_lock_keeps_a_deleted_worktree() {
+    let fixture = Fixture::new();
+    fixture.create(&["--ephemeral"]);
+    let admin = Path::new(&registration(&fixture, &fixture.worktree)).to_path_buf();
+    std::os::unix::fs::symlink(fixture.root.join("nowhere"), admin.join("locked")).unwrap();
+    // From inside the worktree, unlock finds the lock without listing.
+    let unlocked = fixture
+        .command()
+        .current_dir(&fixture.worktree)
+        .args(["--json", "unlock"])
+        .output()
+        .unwrap();
+    assert!(!unlocked.status.success(), "unlock called it unlocked");
+    assert!(fs::symlink_metadata(admin.join("locked")).is_ok());
+    // `git worktree unlock` dies reading it too, so the advice is to delete it.
+    let stderr = String::from_utf8_lossy(&unlocked.stderr);
+    assert!(
+        stderr.contains("rm ") && stderr.contains("/locked"),
+        "{stderr}"
+    );
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+
+    let pruned = fixture.run(&["prune"]);
+    let stdout = String::from_utf8_lossy(&pruned.stdout);
+    assert!(!stdout.contains("pruned 1 stale"), "{stdout}");
+    assert!(admin.join("HEAD").is_file(), "prune dropped it");
+
+    let removed = fixture.run(&["remove", "chat/test", "--discard-dirty"]);
+    assert!(!removed.status.success(), "removed a locked worktree");
+    assert!(admin.join("HEAD").is_file(), "remove dropped it");
+
+    let gc = fixture.run(&["--json", "gc", "--older-than", "0s", "--discard-dirty"]);
+    if gc.status.success() {
+        let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+        assert_eq!(report["reaped"], serde_json::json!([]));
+    }
+    assert!(admin.join("HEAD").is_file(), "gc dropped it");
+}
+
+/// A `gitdir` of `/` names no worktree directory to check, so the entry
+/// cannot be judged stale and is kept.
+#[test]
+fn prune_keeps_a_registration_whose_gitdir_has_no_parent() {
+    let fixture = Fixture::new();
+    fixture.create(&[]);
+    let admin = Path::new(&registration(&fixture, &fixture.worktree)).to_path_buf();
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    fs::write(admin.join("gitdir"), "/\n").unwrap();
+
+    let pruned = fixture.run(&["--json", "prune"]);
+    success(&pruned);
+    let report: serde_json::Value = serde_json::from_slice(&pruned.stdout).unwrap();
+    assert_eq!(report["pruned_registrations"], serde_json::json!([]));
+    assert!(admin.join("HEAD").is_file());
+}
+
+/// The admin dir of the registration whose HEAD is on `branch`.
+fn registration_by_branch(fixture: &Fixture, branch: &str) -> String {
+    let wanted = format!("ref: refs/heads/{branch}");
+    let dir = fixture.repo.join(".git/worktrees");
+    for entry in fs::read_dir(&dir).unwrap() {
+        let entry = entry.unwrap().path();
+        if fs::read_to_string(entry.join("HEAD")).unwrap().trim() == wanted {
+            return entry.display().to_string();
+        }
+    }
+    panic!("no registration on {branch}");
+}
+
+/// The first entry of `list --json` run from `dir`: the main worktree.
+fn first_listed(fixture: &Fixture, dir: &Path) -> serde_json::Value {
+    let output = fixture
+        .command()
+        .current_dir(dir)
+        .args(["--json", "list"])
+        .output()
+        .unwrap();
+    success(&output);
+    let entries: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+    entries.into_iter().next().unwrap()
+}
+
+/// `doctor --json` run from `dir`.
+fn doctor_report(fixture: &Fixture, dir: &Path) -> serde_json::Value {
+    let output = fixture
+        .command()
+        .current_dir(dir)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    success(&output);
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// From a linked worktree of a layout with no main checkout to find, the main
+/// worktree is what Git lists first, and worktrees go beside it.
+fn assert_fallback_main(fixture: &Fixture, linked: &Path, main: &Path) {
+    let main = main.canonicalize().unwrap();
+    let report = doctor_report(fixture, linked);
+    assert_eq!(report["repository_details"]["is_main_worktree"], false);
+    assert_eq!(
+        report["repository_details"]["common_git_owner"],
+        main.display().to_string()
+    );
+    assert_eq!(
+        Path::new(report["default_worktree_root"].as_str().unwrap()),
+        main.parent()
+            .unwrap()
+            .join(".simgit")
+            .join(main.file_name().unwrap())
+    );
+    assert_eq!(
+        first_listed(fixture, linked)["worktree"],
+        main.display().to_string()
+    );
+    // Refused as the main checkout, before its lock state is even asked.
+    let removed = fixture
+        .command()
+        .current_dir(linked)
+        .args(["remove", main.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!removed.status.success(), "removed the main worktree");
+    let stderr = String::from_utf8_lossy(&removed.stderr);
+    assert!(stderr.contains("is the main checkout"), "{stderr}");
+}
+
+/// Clone the fixture bare to `<root>/<path>` and add a linked worktree.
+fn bare_with_linked_worktree(fixture: &Fixture, path: &str) -> std::path::PathBuf {
+    let bare = fixture.root.join(path);
+    let source = fixture.repo.to_str().unwrap();
+    git(
+        &fixture.root,
+        &["clone", "-q", "--bare", source, bare.to_str().unwrap()],
+    );
+    let linked = fixture.root.join("bare-linked");
+    git(&bare, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+    linked
+}
+
+#[test]
+fn a_bare_repository_is_its_own_main_worktree() {
+    let fixture = Fixture::new();
+    let linked = bare_with_linked_worktree(&fixture, "x.git");
+    assert_fallback_main(&fixture, &linked, &fixture.root.join("x.git"));
+    assert_eq!(first_listed(&fixture, &linked)["bare"], true);
+}
+
+/// A bare repository at `proj/.git` keeps worktrees beside `proj`, as before.
+#[test]
+fn a_bare_repository_named_dot_git_is_owned_by_its_parent() {
+    let fixture = Fixture::new();
+    let linked = bare_with_linked_worktree(&fixture, "proj/.git");
+    assert_fallback_main(&fixture, &linked, &fixture.root.join("proj"));
+}
+
+/// A `--separate-git-dir` repository records no path back to its checkout, so
+/// from a linked worktree its git dir stands in for the main worktree.
+#[test]
+fn a_separate_git_dir_seen_from_a_linked_worktree_is_its_own_main_worktree() {
+    let fixture = Fixture::new();
+    let checkout = fixture.root.join("checkout");
+    let git_dir = fixture.root.join("store");
+    git(
+        &fixture.root,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            git_dir.to_str().unwrap(),
+            checkout.to_str().unwrap(),
+        ],
+    );
+    git(&checkout, &["config", "user.email", "test@example.com"]);
+    git(&checkout, &["config", "user.name", "Test User"]);
+    fs::write(checkout.join("README.md"), "separate\n").unwrap();
+    git(&checkout, &["add", "."]);
+    git(&checkout, &["commit", "-qm", "initial"]);
+    let linked = fixture.root.join("separate-linked");
+    git(
+        &checkout,
+        &["worktree", "add", "-q", linked.to_str().unwrap()],
+    );
+    assert_fallback_main(&fixture, &linked, &git_dir);
+}
+
+/// A lock simgit cannot locate is not a lock it can rule out. Here the entry's
+/// `gitdir` is not UTF-8, so no reader of the registry can match it to the
+/// worktree Git lists; nothing may be torn down on that guess.
+#[test]
+fn an_undeterminable_lock_state_refuses_teardown() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let fixture = Fixture::new();
+    fixture.create(&["--ephemeral"]);
+    let admin = Path::new(&registration(&fixture, &fixture.worktree)).to_path_buf();
+    fs::write(admin.join("locked"), "usb").unwrap();
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    let mut gitdir = fixture.root.join("gone").as_os_str().as_bytes().to_vec();
+    gitdir.extend_from_slice(b"\xff/.git\n");
+    fs::write(admin.join("gitdir"), gitdir).unwrap();
+
+    let gc = fixture.run(&[
+        "--json",
+        "gc",
+        "--older-than",
+        "0s",
+        "--include-persistent",
+        "--discard-dirty",
+    ]);
+    success(&gc);
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["reaped"], serde_json::json!([]));
+    let skipped = report["skipped"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1, "{report}");
+    assert_eq!(skipped[0]["reason"], "status-failed", "{report}");
+
+    let removed = fixture.run(&["remove", "chat/test", "--discard-dirty"]);
+    assert!(!removed.status.success(), "removed it");
+    let stderr = String::from_utf8_lossy(&removed.stderr);
+    assert!(stderr.contains("cannot tell whether"), "{stderr}");
+    assert!(admin.join("HEAD").is_file());
+}
+
+/// A repository inside another's working tree that is not its submodule has
+/// no superproject to find, so it keeps the ordinary rule.
+#[test]
+fn a_nested_repository_that_is_not_a_submodule_keeps_its_own_root() {
+    let fixture = Fixture::new();
+    let inner = fixture.repo.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    git(&inner, &["init", "-q"]);
+    git(&inner, &["config", "user.email", "test@example.com"]);
+    git(&inner, &["config", "user.name", "Test User"]);
+    fs::write(inner.join("inner.txt"), "inner\n").unwrap();
+    git(&inner, &["add", "."]);
+    git(&inner, &["commit", "-qm", "inner"]);
+    assert_eq!(
+        default_parent(&fixture, &inner, "agent/inner"),
+        fixture.repo.canonicalize().unwrap().join(".simgit/inner")
+    );
+}
+
+/// A registration may spell its absolute path through a symlink, as one whose
+/// parent was moved and linked back does. Git lists that spelling, and the
+/// lock lookup, which compares canonical forms, must still match it.
+#[test]
+fn a_deleted_worktree_registered_through_a_symlink_can_be_removed() {
+    let fixture = Fixture::new();
+    fixture.create(&[]);
+    let admin = Path::new(&registration(&fixture, &fixture.worktree)).to_path_buf();
+    let alias = fixture.root.join("alias");
+    std::os::unix::fs::symlink(fixture.root.canonicalize().unwrap(), &alias).unwrap();
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+    let spelled = alias
+        .join(fixture.worktree.file_name().unwrap())
+        .join(".git");
+    fs::write(admin.join("gitdir"), format!("{}\n", spelled.display())).unwrap();
+
+    let removed = fixture.run(&["--json", "remove", "chat/test", "--discard-dirty"]);
+    success(&removed);
+    let report: serde_json::Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(report["already_absent"], true);
+    assert!(!admin.exists());
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// A linked worktree two commits ahead of the main checkout's HEAD.
+fn linked_worktree_ahead(fixture: &Fixture) -> std::path::PathBuf {
+    let linked = fixture.root.join("linked");
+    git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    for name in ["one", "two"] {
+        fs::write(linked.join(name), name).unwrap();
+        git(&linked, &["add", "."]);
+        git(&linked, &["commit", "-qm", name]);
+    }
+    linked
+}
+
+fn run_from(fixture: &Fixture, dir: &Path, args: &[&str]) -> std::process::Output {
+    fixture
+        .command()
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn add_from_a_linked_worktree_starts_at_its_head() {
+    let fixture = Fixture::new();
+    let linked = linked_worktree_ahead(&fixture);
+    let head = git_stdout(&linked, &["rev-parse", "HEAD"]);
+    assert_ne!(head, git_stdout(&fixture.repo, &["rev-parse", "HEAD"]));
+
+    let output = run_from(&fixture, &linked, &["add", "--json", "agent/from-linked"]);
+    success(&output);
+    let created: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(created["base"], head.as_str());
+    let path = Path::new(created["path"].as_str().unwrap());
+    assert_eq!(git_stdout(path, &["rev-parse", "HEAD"]), head);
+
+    // `HEAD~1` is relative to the caller too.
+    let parent = git_stdout(&linked, &["rev-parse", "HEAD~1"]);
+    let output = run_from(
+        &fixture,
+        &linked,
+        &["add", "--json", "--base", "HEAD~1", "agent/parent"],
+    );
+    success(&output);
+    let created: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(created["base"], parent.as_str());
+
+    // A branch name resolves the same from anywhere.
+    let output = run_from(
+        &fixture,
+        &linked,
+        &["add", "--json", "--base", "linked", "agent/named"],
+    );
+    success(&output);
+    let created: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(created["base"], head.as_str());
+}
+
+#[test]
+fn run_from_a_linked_worktree_starts_at_its_head() {
+    let fixture = Fixture::new();
+    let linked = linked_worktree_ahead(&fixture);
+    let head = git_stdout(&linked, &["rev-parse", "HEAD"]);
+
+    let path = fixture.root.join("run-from-linked");
+    let output = run_from(
+        &fixture,
+        &linked,
+        &[
+            "run",
+            "agent/run-linked",
+            "--path",
+            path.to_str().unwrap(),
+            "--",
+            "true",
+        ],
+    );
+    success(&output);
+    assert_eq!(git_stdout(&path, &["rev-parse", "HEAD"]), head);
+}
+
+#[test]
+fn add_in_a_repository_without_commits_says_so() {
+    let root = std::env::temp_dir().join(format!("simgit-unborn-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    let output = Command::new(env!("CARGO_BIN_EXE_sg"))
+        .current_dir(&root)
+        .args(["add", "agent/x"])
+        .output()
+        .unwrap();
+    let _ = fs::remove_dir_all(&root);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no commits yet"));
 }

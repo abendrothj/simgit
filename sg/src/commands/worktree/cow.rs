@@ -1,4 +1,5 @@
-use super::{main_worktree, run_command, state_dir, RepoContext};
+use super::locks::{process_alive, temp_owner};
+use super::{run_command, state_dir, RepoContext};
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::fs;
@@ -27,16 +28,60 @@ pub(super) fn clone_supported(common_git_dir: &Path, destination_dir: &Path) -> 
     {
         let probe = state_dir(common_git_dir).join("clone-probes");
         fs::create_dir_all(&probe)?;
-        let token = Uuid::new_v4().to_string();
+        // The source names its process and its destination, so `prune` can
+        // clear both after a kill; see `remove_dead_probes`.
+        let token = format!("{}.{}", std::process::id(), Uuid::new_v4());
         let source = probe.join(format!("{token}.source"));
-        let destination = destination_dir.join(format!(".simgit-clone-probe-{token}"));
-        fs::write(&source, b"simgit-cow-probe")?;
+        let destination = super::absolute_path(destination_dir.join(probe_name(&token)))?;
+        fs::write(&source, destination.as_os_str().as_encoded_bytes())?;
         // Probe with the exact operation `clone_tree` performs, so a positive
         // probe can never select a clone mechanism that then fails.
         let cloned = clone_file(&source, &destination).is_ok();
-        let _ = fs::remove_file(&source);
         let _ = fs::remove_file(&destination);
+        let _ = fs::remove_file(&source);
         Ok(cloned)
+    }
+}
+
+fn probe_name(token: &str) -> String {
+    format!(".simgit-clone-probe-{token}")
+}
+
+/// Remove what killed `clone_supported` calls left: each source under
+/// `clone-probes/` names its process and the probe it cloned to. A live
+/// process's are kept, and so are an older simgit's, which name no process.
+pub(super) fn remove_dead_probes(common_git_dir: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(sources) = fs::read_dir(state_dir(common_git_dir).join("clone-probes")) else {
+        return;
+    };
+    for source in sources.flatten().map(|entry| entry.path()) {
+        let Some(token) = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".source"))
+        else {
+            continue;
+        };
+        if temp_owner(token).is_none_or(process_alive) {
+            continue;
+        }
+        let Ok(recorded) = fs::read(&source) else {
+            continue;
+        };
+        let destination = Path::new(std::ffi::OsStr::from_bytes(&recorded));
+        // Only ever the probe this source made, whatever the file says.
+        let names_probe = destination.is_absolute()
+            && destination.file_name() == Some(probe_name(token).as_ref());
+        let cleared = !names_probe
+            || match fs::remove_file(destination) {
+                Ok(()) => true,
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            };
+        // Keep the record of a probe that could not be removed, to retry.
+        if cleared {
+            let _ = fs::remove_file(&source);
+        }
     }
 }
 
@@ -219,7 +264,7 @@ fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) ->
         .join("index");
     let mut read_tree = Command::new("git");
     read_tree
-        .current_dir(main_worktree(&repo.common_git_dir))
+        .current_dir(&repo.main_worktree)
         .env("GIT_INDEX_FILE", &index)
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
         .args(["read-tree", commit]);
@@ -231,7 +276,7 @@ fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) ->
     // the tree and shares its lifetime.
     let mut checkout = Command::new("git");
     checkout
-        .current_dir(main_worktree(&repo.common_git_dir))
+        .current_dir(&repo.main_worktree)
         .env("GIT_INDEX_FILE", &index)
         .arg(format!("--git-dir={}", repo.common_git_dir.display()))
         .arg(format!("--work-tree={}", destination.display()))

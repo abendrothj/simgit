@@ -330,7 +330,7 @@ fn invalid_names_fail_cleanly() {
 }
 
 #[test]
-fn base_is_origin_default_branch_else_head() {
+fn base_is_origin_default_branch_else_project_head() {
     let fixture = HookFixture::new();
     // No origin: the base is HEAD.
     let output = fixture.hook(&[], create_payload("local", &fixture.repo));
@@ -363,6 +363,37 @@ fn base_is_origin_default_branch_else_head() {
         git(&stdout_path(&output), &["rev-parse", "HEAD"]),
         origin_head
     );
+
+    // A project that is itself a linked worktree: its HEAD, not the main
+    // checkout's.
+    let linked = fixture.root.join("linked");
+    git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            linked.to_str().expect("utf8"),
+        ],
+    );
+    fs::write(linked.join("linked.txt"), "linked\n").expect("write");
+    git(&linked, &["add", "."]);
+    git(&linked, &["commit", "-q", "-m", "linked"]);
+    let linked_head = git(&linked, &["rev-parse", "HEAD"]);
+    assert_ne!(linked_head, git(&fixture.repo, &["rev-parse", "HEAD"]));
+    let output = fixture.run_in(
+        &linked,
+        &[],
+        &[],
+        &create_payload("from-linked", &linked).to_string(),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        git(&stdout_path(&output), &["rev-parse", "HEAD"]),
+        linked_head
+    );
 }
 
 #[test]
@@ -377,6 +408,49 @@ fn create_uses_project_dir_not_payload_cwd() {
     assert_eq!(simgit_refs(&other), "");
     assert_eq!(branch_of(&path), "simgit/s5");
     assert!(git(&fixture.repo, &["worktree", "list", "--porcelain"]).contains("simgit/s5"));
+}
+
+/// simgit routinely deletes the directory it was started from, so no `git` it
+/// spawns may depend on the working directory it inherited. The hook finds its
+/// repository without the process cwd, so it can run from one already gone.
+#[test]
+fn create_and_remove_work_from_a_deleted_cwd() {
+    let fixture = HookFixture::new();
+    let gone = fixture.root.join("gone");
+    let run_from_gone = |payload: Value| {
+        fs::create_dir(&gone).expect("create the doomed cwd");
+        let mut child = Command::new("sh")
+            .current_dir(&gone)
+            .env("CLAUDE_PROJECT_DIR", &fixture.repo)
+            .args([
+                "-c",
+                r#"rmdir "$1" && exec "$0" hook claude-code --requires 0.0.0"#,
+            ])
+            .arg(env!("CARGO_BIN_EXE_simgit"))
+            .arg(&gone)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn simgit");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(payload.to_string().as_bytes())
+            .expect("write stdin");
+        child.wait_with_output().expect("wait for simgit")
+    };
+
+    let created = run_from_gone(create_payload("gone-cwd", &fixture.repo));
+    assert_eq!(created.status.code(), Some(0), "{}", stderr(&created));
+    let path = stdout_path(&created);
+    assert!(path.join("README.md").is_file(), "{}", path.display());
+    assert_eq!(branch_of(&path), "simgit/gone-cwd");
+
+    let removed = run_from_gone(remove_payload(&path));
+    assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
+    assert!(!path.exists(), "{}", path.display());
 }
 
 #[test]
@@ -979,6 +1053,58 @@ fn remove_of_a_worktree_deleted_by_hand_prunes_it_and_drops_its_branch() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(!registered(&fixture.repo, &path));
     assert!(!branch_exists(&fixture.repo, "simgit/r10"));
+}
+
+/// A deleted worktree's submodule repositories live in its registration, and
+/// a commit in one may exist nowhere else: the hook keeps both.
+#[test]
+fn remove_of_a_deleted_worktree_keeps_its_submodule_commits() {
+    let fixture = HookFixture::new();
+    let lib = fixture.root.join("lib");
+    fs::create_dir_all(&lib).expect("mkdir");
+    git(&lib, &["init", "-q"]);
+    git(&lib, &["config", "user.email", "test@example.com"]);
+    git(&lib, &["config", "user.name", "Test User"]);
+    commit_in(&lib, "lib.txt");
+    let lib = lib.to_str().expect("utf-8 path");
+    let allow = ["-c", "protocol.file.allow=always"];
+    git(
+        &fixture.repo,
+        &[&allow[..], &["submodule", "add", "-q", lib, "sub"]].concat(),
+    );
+    git(&fixture.repo, &["commit", "-q", "-m", "add submodule"]);
+    let path = create_worktree(&fixture, "subs");
+    git(
+        &path,
+        &[&allow[..], &["submodule", "update", "--init", "-q"]].concat(),
+    );
+    let sub = path.join("sub");
+    git(&sub, &["config", "user.email", "test@example.com"]);
+    git(&sub, &["config", "user.name", "Test User"]);
+    commit_in(&sub, "precious.txt");
+    let precious = git(&sub, &["rev-parse", "HEAD"]);
+    fs::remove_dir_all(&path).expect("delete by hand");
+
+    for extra in [&[][..], &["--discard-dirty"][..]] {
+        let output = fixture.hook(extra, remove_payload(&path));
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert!(registered(&fixture.repo, &path), "{extra:?}");
+        assert!(branch_exists(&fixture.repo, "simgit/subs"), "{extra:?}");
+    }
+    // The fixture's only registration.
+    let admin = fs::read_dir(fixture.repo.join(".git/worktrees"))
+        .expect("registry")
+        .next()
+        .expect("a registration")
+        .expect("read registry")
+        .path();
+    let git_dir = format!("--git-dir={}", admin.join("modules/sub").display());
+    // Its `core.worktree` names the deleted checkout.
+    let work_tree = format!("--work-tree={}", fixture.repo.display());
+    git(
+        &fixture.repo,
+        &[&git_dir, &work_tree, "cat-file", "-e", precious.trim()],
+    );
 }
 
 /// Claude Code can fire one remove twice in parallel (the plugin plus the same

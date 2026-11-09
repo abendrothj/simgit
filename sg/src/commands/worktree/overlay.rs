@@ -1,4 +1,6 @@
-use super::{run_command, state_dir, RepoContext};
+use super::{
+    admin_head, canonical_path, git_command_at, run_command, state_dir, AdminHead, RepoContext,
+};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::fs;
@@ -77,7 +79,7 @@ pub(super) fn state(repo: &RepoContext, worktree: &Path) -> Option<State> {
     read_state(&admin)
 }
 
-fn read_state(admin: &Path) -> Option<State> {
+pub(super) fn read_state(admin: &Path) -> Option<State> {
     let content = fs::read_to_string(admin.join(OVERLAY_MARKER)).ok()?;
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
         let overlay_dir = PathBuf::from(value.get("overlay_dir")?.as_str()?);
@@ -113,8 +115,7 @@ pub(super) fn registrations(repo: &RepoContext) -> Vec<(PathBuf, State)> {
         let Ok(gitdir) = fs::read_to_string(admin.join("gitdir")) else {
             continue;
         };
-        let gitdir = PathBuf::from(gitdir.trim());
-        if let Some(worktree) = gitdir.parent() {
+        if let Some(worktree) = resolve_gitdir(&admin, &gitdir).parent() {
             registrations.push((worktree.to_path_buf(), state));
         }
     }
@@ -122,23 +123,20 @@ pub(super) fn registrations(repo: &RepoContext) -> Vec<(PathBuf, State)> {
 }
 
 pub(super) fn worktree_for_branch(repo: &RepoContext, branch: &str) -> Option<PathBuf> {
-    let wanted = format!("ref: refs/heads/{branch}");
+    let wanted = format!("refs/heads/{branch}");
     let entries = fs::read_dir(repo.common_git_dir.join("worktrees")).ok()?;
     for entry in entries.flatten() {
         let admin = entry.path();
         if read_state(&admin).is_none() {
             continue;
         }
-        let Ok(head) = fs::read_to_string(admin.join("HEAD")) else {
-            continue;
-        };
-        if head.trim() != wanted {
+        if !matches!(admin_head(repo, &admin), Ok(AdminHead::Branch(head)) if head == wanted) {
             continue;
         }
         let Ok(gitdir) = fs::read_to_string(admin.join("gitdir")) else {
             continue;
         };
-        if let Some(worktree) = PathBuf::from(gitdir.trim()).parent() {
+        if let Some(worktree) = resolve_gitdir(&admin, &gitdir).parent() {
             return Some(worktree.to_path_buf());
         }
     }
@@ -147,17 +145,24 @@ pub(super) fn worktree_for_branch(repo: &RepoContext, branch: &str) -> Option<Pa
 
 pub(super) fn branch(repo: &RepoContext, worktree: &Path) -> Option<String> {
     let admin = admin_dir(repo, worktree)?;
-    let head = fs::read_to_string(admin.join("HEAD")).ok()?;
-    head.trim().strip_prefix("ref: ").map(str::to_owned)
+    match admin_head(repo, &admin) {
+        Ok(AdminHead::Branch(head)) => Some(head),
+        _ => None,
+    }
 }
 
 pub(super) fn admin_dir(repo: &RepoContext, worktree: &Path) -> Option<PathBuf> {
-    let live = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["rev-parse", "--absolute-git-dir"])
-        .output()
-        .ok()
+    // Without its `.git`, git walks up from `worktree` and answers for whatever
+    // repository encloses it; only the registry knows this worktree then.
+    let live = Some(worktree)
+        .filter(|worktree| worktree.join(".git").exists())
+        .and_then(|worktree| {
+            git_command_at(worktree)
+                .ok()?
+                .args(["rev-parse", "--absolute-git-dir"])
+                .output()
+                .ok()
+        })
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|path| PathBuf::from(path.trim()));
@@ -173,16 +178,23 @@ pub(super) fn admin_dir(repo: &RepoContext, worktree: &Path) -> Option<PathBuf> 
     }
 
     let registrations = repo.common_git_dir.join("worktrees");
+    let worktree = canonical_path(worktree);
     for entry in fs::read_dir(registrations).ok()?.flatten() {
         let Ok(gitdir) = fs::read_to_string(entry.path().join("gitdir")) else {
             continue;
         };
-        let registered = PathBuf::from(gitdir.trim());
-        if registered.parent() == Some(worktree) {
+        if resolve_gitdir(&entry.path(), &gitdir).parent() == Some(worktree.as_path()) {
             return Some(entry.path());
         }
     }
     None
+}
+
+/// The `.git` path an admin dir's `gitdir` file records, in canonical form,
+/// as Git compares it. Git writes it relative to the admin dir under
+/// `worktree.useRelativePaths`.
+pub(super) fn resolve_gitdir(admin: &Path, recorded: &str) -> PathBuf {
+    canonical_path(&admin.join(recorded.trim()))
 }
 
 pub(super) fn is_mounted(worktree: &Path) -> bool {

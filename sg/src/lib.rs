@@ -30,8 +30,9 @@
 //!   first); removing a target that is already gone succeeds
 //! - `simgit run [branch] -- <command>` — create, reuse, or pick a workspace
 //!   and launch any command inside it
-//! - `simgit unlock [branch|path]` — clear a `run` lock left behind by a
-//!   launcher that was killed, unless the process holding it is still alive
+//! - `simgit unlock [branch|path]` — clear simgit's own `run` or
+//!   allocation lock left behind by a killed process, unless the process holding
+//!   it is still alive; a lock set with `git worktree lock` is refused
 //! - `simgit hook claude-code --requires X.Y.Z` — handle one Claude Code hook
 //!   payload read from stdin, refusing to run on an older simgit
 //! - `simgit gc` — reap idle/ephemeral worktrees and optionally branches
@@ -87,7 +88,7 @@ enum Commands {
     Remove(commands::worktree::WorktreeRemove),
     /// Run any command in a workspace; omit the branch to choose interactively.
     Run(commands::worktree::WorktreeRun),
-    /// Clear a stranded `run` lock, by path or by branch name.
+    /// Clear a stranded `run` or allocation lock, by path or by branch name.
     Unlock(commands::worktree::WorktreeUnlock),
     /// Handle an agent harness's hook payload read from stdin.
     Hook(commands::worktree::WorktreeHook),
