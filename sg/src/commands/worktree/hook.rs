@@ -3,7 +3,7 @@
 use super::launch::{resolve_branch_worktree, Resolved};
 use super::{
     canonical_path, discover_repo, ensure_unlocked, git_common_command, git_failure,
-    git_output_common, list_worktrees, main_worktree, output_retrying_half_written_registration,
+    git_output_common, list_worktrees, output_retrying_half_written_registration,
     prune_git_worktrees, teardown_worktree, worktree_dirty, worktree_path_for_branch, BranchClaim,
     RepoContext, WorktreeAdd, WorktreeEntry,
 };
@@ -203,7 +203,7 @@ fn on_worktree_create(payload: &serde_json::Value) -> Result<()> {
     if worktree_path_for_branch(&repo, &branch)?.is_some_and(|path| !path.exists()) {
         prune_git_worktrees(&repo)?;
     }
-    let main = main_worktree(&repo.common_git_dir).to_path_buf();
+    let main = repo.main_worktree.clone();
     // The base applies only to a new branch; reuse and attach reject it.
     let reference = format!("refs/heads/{branch}");
     let exists = git_output_common(&repo, ["show-ref", "--verify", "--quiet", &reference])?;

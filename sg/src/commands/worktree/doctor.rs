@@ -1,7 +1,7 @@
 use super::{
-    absolute_path, cow, default_worktree_path, discover_repo, emit, filesystem_name,
-    git_worktree_list, lexical_normalize, main_worktree, nearest_existing_directory, resolved_path,
-    select_populate_mode, stale_worktree_registrations, RepoContext,
+    absolute_path, cow, default_worktree_path, discover_repo, emit, enclosing_working_tree,
+    filesystem_name, git_worktree_list, lexical_normalize, nearest_existing_directory,
+    resolved_path, select_populate_mode, stale_worktree_registrations, RepoContext,
 };
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -26,7 +26,7 @@ pub fn doctor(json: bool) -> Result<()> {
 
 fn doctor_in_repository(repo: &RepoContext, json: bool) -> Result<()> {
     let root = absolute_path(
-        default_worktree_path(&repo.common_git_dir, "doctor-probe")?
+        default_worktree_path(repo, "doctor-probe")?
             .parent()
             .context("default worktree has no root")?
             .to_path_buf(),
@@ -46,9 +46,10 @@ fn doctor_in_repository(repo: &RepoContext, json: bool) -> Result<()> {
     let baselines = cow::baseline_inventory(&repo.common_git_dir)?;
     let baseline_count = baselines.retained.len();
     let repository = repo.top_level.display().to_string();
-    let common_git_owner = main_worktree(&repo.common_git_dir);
-    let root_inside_repository = resolved_path(&root)?.starts_with(resolved_path(&repo.top_level)?);
-    let is_main_worktree = resolved_path(&repo.top_level)? == resolved_path(common_git_owner)?;
+    let resolved_root = resolved_path(&root)?;
+    let root_inside_repository = resolved_root.starts_with(resolved_path(&repo.top_level)?)
+        || resolved_root.starts_with(resolved_path(enclosing_working_tree(repo))?);
+    let is_main_worktree = resolved_path(&repo.top_level)? == resolved_path(&repo.main_worktree)?;
 
     if json {
         emit(&json!({
@@ -59,7 +60,7 @@ fn doctor_in_repository(repo: &RepoContext, json: bool) -> Result<()> {
             "repository_details": {
                 "top_level": repository,
                 "common_git_dir": repo.common_git_dir.display().to_string(),
-                "common_git_owner": common_git_owner.display().to_string(),
+                "common_git_owner": repo.main_worktree.display().to_string(),
                 "is_main_worktree": is_main_worktree,
             },
             "filesystem": filesystem,

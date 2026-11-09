@@ -101,7 +101,7 @@ rejects it, because it owns the child's stdout. Location is always `--path`.
 | `simgit list` | Every linked worktree with branch, path, persistence, lock state, and populate `mode`. |
 | `simgit run [BRANCH] -- <cmd>` | Run a command inside a workspace, creating or reusing it. Omit `BRANCH` for an interactive picker. `--persistent`/`--ephemeral`; `--path`, `--base`, `--sparse`, `--require-cow` apply only when creating. |
 | `simgit remove [TARGET]` | Remove a worktree by path or branch. `--commit -m <msg>`, `--delete-branch`, and the authority-gated `--discard-dirty` / `--delete-unmerged`. |
-| `simgit unlock [TARGET]` | Clear a `run` lock stranded by a killed launcher. |
+| `simgit unlock [TARGET]` | Clear a `run` or allocation lock stranded by a killed process. Refuses locks set with `git worktree lock`. |
 | `simgit gc` | Reap idle ephemeral worktrees. `--older-than <90s\|30m\|24h\|7d>` (default 24h), `--prefix`, `--delete-branches`, `--include-persistent`, `--discard-dirty`, `--delete-unmerged`, `--dry-run`. |
 | `simgit prune` | Drop stale Git registrations, and cached baselines that are expired or that no ref reaches any more, never one an allocation is using; `--all` reclaims every baseline now. |
 | `simgit repair` | Remount overlay-backed worktrees after a reboot or interrupted mount (Linux). |
@@ -192,14 +192,15 @@ Everything here is deliberate, and none of it is guessable:
   untouched for at least that long and defaults to 24h, so reaping a workspace
   you just used takes an explicit `0s`.
 - **A killed launcher keeps its lock on purpose.** `simgit unlock [TARGET]`
-  clears it, refuses while the recorded owner PID is alive and names that PID,
-  and there is no override flag.
+  clears it (and a stranded allocation lock), refuses while the recorded owner
+  PID is alive and names that PID, and leaves any lock set with `git worktree
+  lock` to `git worktree unlock`. There is no override flag.
 - **Cleanup is idempotent.** `remove` on an absent target exits 0 with
   `already_absent: true`, and `unlock` on an unlocked or absent target exits 0
   with `was_locked: false`, so retried cleanup is safe. Two cases still error:
-  `remove <absent-path> --delete-branch`, because a path that is gone cannot
-  name the branch it once held, and a path holding files that Git does not
-  register as a worktree, which simgit refuses to delete.
+  `remove <absent-path> --delete-branch` once Git no longer registers the path,
+  because nothing then names the branch it held, and a path holding files that
+  Git does not register as a worktree, which simgit refuses to delete.
 - **A failed `--commit` removal keeps its commit and says so.** The commit is
   made before the worktree is removed and is never rolled back; retrying the
   same command commits nothing twice.

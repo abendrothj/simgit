@@ -1,14 +1,16 @@
+use super::locks::remove_dead_pending;
 use super::{
-    cow, discover_repo, emit, ensure_unlocked, git_common_command, git_failure, git_output_common,
-    git_worktree_list, is_ephemeral, list_worktrees, overlay, parse_duration, run_git_common,
-    stale_worktree_registrations, teardown_worktree, worktree_dirty, worktree_idle, RegistryLock,
-    RepoContext, WorktreeLock,
+    admin_head, admin_holds_uncommitted, cow, discover_repo, emit, git_common_command, git_failure,
+    git_output_common, head_unreached, is_ephemeral, list_worktrees, lock_present, lock_state,
+    overlay, parse_duration, registration_gone, registration_holds_uncommitted, teardown_worktree,
+    worktree_dirty, worktree_idle, AdminHead, RegistryLock, RepoContext,
 };
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde_json::json;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Args, Default)]
 pub struct WorktreePrune {
@@ -52,22 +54,130 @@ pub struct WorktreeGc {
     pub dry_run: bool,
 }
 
-/// Keep recoverable unmounted overlays registered during native pruning.
-pub(super) fn prune_git_worktrees(repo: &RepoContext) -> Result<()> {
-    let mut locks = Vec::new();
-    for (path, state) in overlay::registrations(repo) {
-        if state.overlay_dir.is_dir() && ensure_unlocked(repo, &path).is_ok() {
-            locks.push(WorktreeLock::acquire(repo, &path)?);
+/// What a registration prune did: the registrations it dropped, and the stale
+/// ones it kept because they may hold work, each with gc's reason for it:
+/// `dirty`, `unreached-commits`, or `status-failed` when it cannot tell.
+pub(super) struct RegistrationPrune {
+    pub(super) pruned: Vec<PathBuf>,
+    pub(super) kept: Vec<(PathBuf, &'static str)>,
+}
+
+/// Drop stale registrations in one pass over Git's admin dirs, all under the
+/// exclusive registry lock, so another simgit cannot change an answer in
+/// between. Stale is decided from each entry's own files, as Git's prune does,
+/// which also finds the corrupt ones `git worktree list` omits. Kept: a
+/// directory still on disk or one that cannot be checked, a remountable
+/// overlay, a locked entry, a detached HEAD no ref reaches, and staged work or
+/// an operation in progress. A worktree is reported by its path, an entry
+/// whose `gitdir` is corrupt by its admin dir.
+pub(super) fn prune_git_worktrees(repo: &RepoContext) -> Result<RegistrationPrune> {
+    let _registry = RegistryLock::exclusive(repo)?;
+    let mut outcome = RegistrationPrune {
+        pruned: Vec::new(),
+        kept: Vec::new(),
+    };
+    let admins = match fs::read_dir(repo.common_git_dir.join("worktrees")) {
+        Ok(admins) => admins,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(outcome),
+        Err(error) => return Err(error).context("read the worktree registry"),
+    };
+    for admin in admins {
+        let admin = admin.context("read the worktree registry")?.path();
+        if !admin.is_dir() {
+            continue;
         }
+        let worktree = match registered_worktree(&admin) {
+            Ok(Some(worktree)) => Some(worktree),
+            // Missing or empty: the entry names no worktree at all.
+            Ok(None) => None,
+            Err(()) => {
+                outcome.kept.push((admin, "status-failed"));
+                continue;
+            }
+        };
+        if let Some(worktree) = &worktree {
+            match (worktree.join(".git").try_exists(), worktree.try_exists()) {
+                // Live, or a directory whose gitfile alone is gone: its index
+                // and Git state live in the registration.
+                (Ok(true), _) | (_, Ok(true)) => continue,
+                (Ok(false), Ok(false)) => {}
+                _ => {
+                    outcome.kept.push((worktree.clone(), "status-failed"));
+                    continue;
+                }
+            }
+        }
+        let label = worktree.clone().unwrap_or_else(|| admin.clone());
+        let locked = |admin: &Path| lock_present(&admin.join("locked"));
+        if locked(&admin)
+            || overlay::read_state(&admin).is_some_and(|state| state.overlay_dir.is_dir())
+        {
+            continue;
+        }
+        match head_safe_to_drop(repo, &admin) {
+            Some(true) => {}
+            Some(false) => {
+                outcome.kept.push((label, "unreached-commits"));
+                continue;
+            }
+            None => {
+                outcome.kept.push((label, "status-failed"));
+                continue;
+            }
+        }
+        match admin_holds_uncommitted(repo, &admin) {
+            Ok(false) => {}
+            Ok(true) => {
+                outcome.kept.push((label, "dirty"));
+                continue;
+            }
+            Err(_) => {
+                outcome.kept.push((label, "status-failed"));
+                continue;
+            }
+        }
+        // Checked again last: a lock taken, or a directory back, meanwhile.
+        let back = worktree
+            .as_deref()
+            .is_some_and(|worktree| !matches!(worktree.try_exists(), Ok(false)));
+        if locked(&admin) || back {
+            continue;
+        }
+        fs::remove_dir_all(&admin)
+            .with_context(|| format!("remove the registration {}", admin.display()))?;
+        outcome.pruned.push(label);
     }
-    {
-        let _registry = RegistryLock::exclusive(repo)?;
-        run_git_common(repo, ["worktree", "prune"])?;
+    Ok(outcome)
+}
+
+/// The worktree an admin dir's `gitdir` file names: `Ok(None)` when the file
+/// is missing or empty, `Err` when it cannot be read or names no directory to
+/// check (`/`).
+pub(super) fn registered_worktree(admin: &Path) -> std::result::Result<Option<PathBuf>, ()> {
+    let gitdir = match fs::read_to_string(admin.join("gitdir")) {
+        Ok(gitdir) => gitdir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    if gitdir.trim().is_empty() {
+        return Ok(None);
     }
-    for lock in locks {
-        lock.release()?;
+    match overlay::resolve_gitdir(admin, &gitdir).parent() {
+        Some(worktree) => Ok(Some(worktree.to_path_buf())),
+        None => Err(()),
     }
-    Ok(())
+}
+
+/// Whether the HEAD in `admin` loses no commit when its registration goes: a
+/// branch keeps its commits, and a detached HEAD must be reached by some ref.
+/// `None` when the HEAD cannot be judged.
+fn head_safe_to_drop(repo: &RepoContext, admin: &Path) -> Option<bool> {
+    match admin_head(repo, admin).ok()? {
+        AdminHead::Branch(_) => Some(true),
+        AdminHead::Detached(head) => head_unreached(repo, Some(&head))
+            .ok()
+            .map(|unreached| !unreached),
+    }
 }
 
 pub fn prune(args: WorktreePrune, json: bool) -> Result<()> {
@@ -75,12 +185,25 @@ pub fn prune(args: WorktreePrune, json: bool) -> Result<()> {
     // Pruning a registration is a mutation of the Git registry, and it is the
     // one `doctor` reports as stale, so it has to be reported here too:
     // "pruned 0 cached baseline(s)" reads as "nothing happened".
-    let before = stale_registrations(&repo)?;
-    prune_git_worktrees(&repo)?;
-    let after = stale_registrations(&repo)?;
-    let pruned_registrations: Vec<String> = before
-        .into_iter()
-        .filter(|path| !after.contains(path))
+    let registrations = prune_git_worktrees(&repo)?;
+    remove_dead_pending(&repo);
+    cow::remove_dead_probes(&repo.common_git_dir);
+    // Under --json these are part of the report: a failure below must still
+    // be the only stderr line.
+    if !json {
+        for (path, reason) in &registrations.kept {
+            let why = match *reason {
+                "dirty" => "it holds uncommitted work",
+                "unreached-commits" => "its detached HEAD is a commit no ref reaches",
+                _ => "cannot tell whether it holds work",
+            };
+            eprintln!("kept stale registration {}: {why}", path.display());
+        }
+    }
+    let pruned_registrations: Vec<String> = registrations
+        .pruned
+        .iter()
+        .map(|path| path.display().to_string())
         .collect();
     let outcome = prune_baseline_cache(&repo, args.all, &|| overlay_lowers(&repo))?;
 
@@ -88,6 +211,10 @@ pub fn prune(args: WorktreePrune, json: bool) -> Result<()> {
         emit(&json!({
             "pruned": outcome.removed,
             "pruned_registrations": pruned_registrations,
+            "kept_registrations": registrations.kept
+                .iter()
+                .map(|(p, why)| json!({ "worktree": p.display().to_string(), "reason": why }))
+                .collect::<Vec<_>>(),
             "retained": outcome.retained,
             "retained_bytes": outcome.retained_bytes,
             "cache_busy": outcome.cache_busy,
@@ -173,18 +300,6 @@ fn commit_reachable(repo: &RepoContext, commit: &str, detached_heads: &[String])
         }
     }
     Ok(false)
-}
-
-/// The worktree paths Git currently reports as prunable registrations.
-fn stale_registrations(repo: &RepoContext) -> Result<Vec<String>> {
-    let output = git_worktree_list(repo)?;
-    if !output.status.success() {
-        return Err(git_failure("git worktree list --porcelain", &output));
-    }
-    Ok(stale_worktree_registrations(&output.stdout)
-        .iter()
-        .filter_map(|entry| entry["worktree"].as_str().map(str::to_owned))
-        .collect())
 }
 
 pub fn gc(args: WorktreeGc, json: bool) -> Result<()> {
@@ -299,19 +414,48 @@ pub(super) fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome>
             skipped.push((entry.path.clone(), "persistent"));
             continue;
         }
-        if ensure_unlocked(repo, &entry.path).is_err() {
-            skipped.push((entry.path.clone(), "locked"));
-            continue;
+        match lock_state(repo, &entry.path) {
+            Some(false) => {}
+            Some(true) => {
+                skipped.push((entry.path.clone(), "locked"));
+                continue;
+            }
+            // No lock found to rule out: nothing about it can be judged.
+            None => {
+                skipped.push((entry.path.clone(), "status-failed"));
+                continue;
+            }
         }
-        if worktree_idle(&entry.path) < older_than {
+        if worktree_idle(repo, &entry.path) < older_than {
             // Say so: a user who just created and merged a workspace and then
             // followed the documented `gc --older-than 1h` otherwise sees no
             // mention of it at all.
             skipped.push((entry.path.clone(), "recently-active"));
             continue;
         }
+        // Commits only this worktree's HEAD holds would dangle; no flag allows it.
+        if entry.branch.is_none() {
+            match head_unreached(repo, entry.head.as_deref()) {
+                Ok(true) => {
+                    skipped.push((entry.path.clone(), "unreached-commits"));
+                    continue;
+                }
+                Err(_) => {
+                    skipped.push((entry.path.clone(), "status-failed"));
+                    continue;
+                }
+                Ok(false) => {}
+            }
+        }
         if !args.discard_dirty {
-            match worktree_dirty(&entry.path) {
+            // A worktree deleted by hand keeps its uncommitted work in its
+            // registration.
+            let dirty = if registration_gone(repo, &entry.path) {
+                registration_holds_uncommitted(repo, &entry.path)
+            } else {
+                worktree_dirty(&entry.path)
+            };
+            match dirty {
                 Ok(true) => {
                     skipped.push((entry.path.clone(), "dirty"));
                     continue;
@@ -344,9 +488,8 @@ pub(super) fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome>
         }
     }
 
-    if !args.dry_run {
-        prune_git_worktrees(repo)?;
-    }
+    // No closing prune: gc drops only what it reaps, and everything it skipped
+    // or never selected keeps its registration.
     Ok(GcOutcome {
         reaped,
         skipped,
@@ -360,6 +503,12 @@ pub(super) fn delete_local_branch(repo: &RepoContext, branch_ref: &str, force: b
     if branch == "main" || branch == "master" {
         bail!("refusing to delete primary branch '{branch}'");
     }
+    delete_branch_unguarded(repo, branch, force)
+}
+
+/// Delete a branch without the primary-branch guard. Only for a branch the
+/// caller created itself, which cannot hold anyone's work yet.
+pub(super) fn delete_branch_unguarded(repo: &RepoContext, branch: &str, force: bool) -> Result<()> {
     let mut command = git_common_command(repo);
     command.args(["branch", if force { "-D" } else { "-d" }, branch]);
     // Git refuses to delete a checked-out branch, so this reads every registration.

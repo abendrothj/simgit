@@ -61,30 +61,47 @@ Linux and in CI; do not treat them as gates on macOS.
   normalized, so one worktree always has exactly one string form. That includes
   `remove`'s `removed` whenever the target resolved to a real worktree. Only
   when nothing resolves do `remove`'s `removed` and `unlock`'s `unlocked` repeat
-  the target verbatim; never invent a resolved form for a worktree that is gone.
+  the target verbatim; never invent a resolved form for a target Git no
+  longer registers.
 - Every `git` child process is spawned with an explicit working directory, never
   an inherited one: these commands routinely delete the caller's cwd.
 - `run` exits with the child's exit status, `128 + signal` when a signal
   killed the child, or `127` when the command cannot be found. The
   retained-workspace notice goes to stderr.
 - `gc` explains itself: every worktree it considered but did not reap appears in
-  `skipped` with a reason — `persistent`, `dirty`, `locked`, or
-  `recently-active`. `--older-than` is an idle-age filter defaulting to 24h.
+  `skipped` with a reason — `persistent`, `dirty`, `locked`,
+  `unreached-commits` (a detached HEAD no ref reaches; no override),
+  `recently-active`, `status-failed` (its state could not be read), or
+  `remove-failed` (its removal failed). `--older-than` is an idle-age filter
+  defaulting to 24h.
 - `prune` reports the stale Git registrations it removed in
-  `pruned_registrations`. Plain `prune` drops a cached baseline that has gone
-  unused for seven days, or whose commit no ref and no detached worktree HEAD
-  reaches; `--all` reclaims every cached baseline immediately. Neither removes
-  a baseline an allocation is using or waits for one: plain `prune` then keeps
-  the cache and reports `cache_busy: true`, and `--all` fails, to be retried.
-- `unlock [TARGET]` clears a stranded `run` lock. A linked worktree's lock is
+  `pruned_registrations`, and under `--json` those it kept because they may
+  hold work in `kept_registrations`, never on stderr. Plain `prune` drops a
+  cached baseline that has gone unused for seven days, or whose commit no ref
+  and no detached worktree HEAD reaches; `--all` reclaims every cached
+  baseline immediately. Neither removes a baseline an allocation is using or
+  waits for one: plain `prune` then keeps the cache and reports
+  `cache_busy: true`, and `--all` fails, to be retried.
+- `unlock [TARGET]` clears simgit's own stranded locks, `run` and allocation
+  alike: those whose content starts with `simgit:`. A linked worktree's lock is
   Git's own `.git/worktrees/<slug>/locked`; `.git/simgit-run.lock` is used only
   when `run` targets the main checkout. It succeeds on a target that is not
   locked and on one that no longer exists, and refuses while the lock's recorded
-  owner PID is alive; there is no override flag, and never add one.
-- `remove` is idempotent: an already-absent target exits 0 with
-  `already_absent: true` rather than failing. With `--delete-branch` that holds
-  for a branch-name target, while an already-absent path target is an error,
-  because the branch such a path once held is unknowable. A directory Git no
+  owner PID is alive. It also refuses any lock not written by simgit, such as
+  one set with `git worktree lock`, naming Git's reason and `git worktree
+  unlock`; `run` reports that reason too. There is no override flag, and never
+  add one.
+- `remove` is idempotent: an already-absent target exits 0 with `already_absent:
+  true` rather than failing. A worktree whose directory was deleted by hand is
+  already absent while Git still registers it: `remove` drops that one
+  registration, and `--delete-branch` deletes its branch under the merged check,
+  by branch or by path. One whose registration holds staged changes, an
+  operation in progress, submodule repositories or refs of its own is dirty
+  and needs `--discard-dirty`. A locked
+  registration, and a detached one whose HEAD no ref reaches, are refused and
+  kept. With `--delete-branch` the idempotence
+  holds for a branch-name target, while a path target Git no longer registers is
+  an error, because the branch it once held is unknowable. A directory Git no
   longer registers is not a worktree, however much it looks like one: an empty
   one is already-absent and is cleaned up where the filesystem allows, and a
   non-empty one is refused rather than deleted.
@@ -92,7 +109,9 @@ Linux and in CI; do not treat them as gates on macOS.
   never rolled back when a later step fails. Such a failure names the commit it
   kept, so a caller can distinguish it from one that committed nothing, and
   `commit` in `remove --json` carries that hash on success. Retrying is safe
-  because `--commit` commits only what the worktree still holds.
+  because `--commit` commits only what the worktree still holds. On a dirty
+  detached worktree `--commit` refuses before committing, naming
+  `git switch -c` first, since its commit would be one no ref reaches.
 - A `--json` failure emits no JSON: nonzero exit, empty stdout, one line of
   diagnostic text on stderr.
 
@@ -113,9 +132,12 @@ this as a compatibility contract rather than a description:
   be gated behind one of those two flags. A third destructive flag is a last
   resort, and adding one means updating this list in the same change.
 - Without those flags no command destroys work. `remove` and `gc` refuse dirty
-  worktrees, `gc` reaps only ephemeral worktrees idle at least `--older-than`
-  and skips locked ones, branch deletion stops at the merged check, `prune`
-  drops only caches that rematerialize, `repair` only remounts, and `unlock`
+  worktrees and detached ones whose HEAD no ref reaches (no override), `gc`
+  reaps only ephemeral worktrees idle at least `--older-than` and skips locked
+  ones, branch deletion stops at the merged check, `prune`
+  drops only caches that rematerialize, stale registrations that hold no
+  work, and simgit's own temporary files once the process that wrote them is
+  gone, `repair` only remounts, and `unlock`
   refuses a live owner with no override. Gates classify `doctor`, `list`,
   `unlock`, `prune`, `repair`, flagless `add`/`remove`/`gc`/`hook`, and `add --attach`
   (which checks out an existing branch without moving or deleting it) as
@@ -176,9 +198,10 @@ second copy.
   add `--discard-dirty` or `--delete-unmerged` without explicit user or
   operator authority; preserve work when safe cleanup refuses it.
 - Recover a crashed agent before reuse or cleanup: confirm the child process is
-  gone, clear the stranded `run` lock with `simgit unlock <path>`, then reuse
-  or safely remove the workspace. `simgit unlock` succeeds on a target that is
-  not locked or no longer exists, and `simgit remove` on an already-absent
+  gone, clear the stranded `run` or allocation lock with `simgit unlock
+  <path>`, then reuse or safely remove the workspace. `simgit unlock` succeeds
+  on a target that is not locked or no longer exists, refuses a lock set with
+  `git worktree lock`, and `simgit remove` on an already-absent
   target succeeds and reports `already_absent: true`, so retried cleanup is
   safe.
 - Agents commit normally and integrate their branches through normal Git
