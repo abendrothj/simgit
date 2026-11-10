@@ -431,15 +431,10 @@ integration. Only explicit user or operator authority for that particular
 worktree may permit destructive cleanup; an `--ephemeral` marker alone is
 never that authority.
 
-A detached worktree (`add --detach`) whose commits no branch or tag reaches is
-refused by `remove` (with or without `--commit`) and skipped by `gc` as
-`unreached-commits`, since removing it would leave those commits dangling. No
-flag overrides this. The fix is `git -C <path> branch <name>`, after which
-cleanup succeeds; `--commit` does not help, because it commits uncommitted
-files, not the commits already made. On any detached worktree with uncommitted
-files, `remove --commit` is refused before it commits, since its commit would
-be one no ref reaches; `git -C <path> switch -c <name>` first, then
-`--commit`.
+A detached worktree (`add --detach`) whose commits no ref reaches is refused by
+`remove` and skipped by `gc` as `unreached-commits`, and no flag overrides it.
+Keep the commits with `git -C <path> branch <name>` first; see
+[removal](reference.md#removal-and-unlock-semantics).
 
 Do not use `gc --older-than 0s` as a follow-up to one job: GC selects *every*
 clean, unlocked ephemeral worktree in the repository, including a different
@@ -459,48 +454,21 @@ worktree's path, or its admin dir `.git/worktrees/<name>` when the entry's
 `gitdir` file cannot be read) and `reason` (`dirty`, `unreached-commits` or
 `status-failed`); report them rather than deleting them.
 
-Safe cleanup is idempotent. When the target no longer resolves to a worktree —
-an earlier attempt already removed it, or the workspace is gone for some other
-reason — `remove` exits successfully and reports `"already_absent": true`
-beside `"removed"`, `"committed"`, `"commit"`, and `"branch_deleted"`; when the
-worktree was present the same output carries `"already_absent": false`.
-`removed` is a string, `committed` and `branch_deleted` are booleans, and
-`commit` is the full hash a `--commit` removal created or `null`. `removed` is
-never evidence that anything was removed: it is present for a path that was
-never allocated just as it is for a real removal. Its two shapes differ. When
-the target resolved to a worktree, `removed` is that worktree's canonical
-symlink-resolved path, even if the provider named it by branch or by a relative
-path — so it is safe to compare against a recorded `cleanup_token`. When
-nothing resolved, `removed` repeats the target string verbatim, because there
-is no worktree left to resolve against. Key the provider's record off
-`already_absent` and `branch_deleted`, never off the presence of `removed`.
-
-An at-least-once cleanup path may therefore retry removal without a separate
-existence check. `--delete-branch` is the one part that distinguishes the two
-target forms once the worktree is gone: a branch-name target still deletes a
-leftover branch of that name under the usual `--delete-unmerged` rule, while an
-already-absent *path* target is an error, because a path that no longer resolves
-cannot say which branch it once held. A worktree deleted by hand while Git still
-registers it does resolve: either form reports `already_absent: true`, drops the
-registration, and with `--delete-branch` deletes its branch. One whose
-registration holds staged changes, an operation in progress, submodule
-repositories or refs of its own is refused as dirty, like a dirty live
-worktree. A locked registration, or a detached one
-whose HEAD no ref reaches, is refused whatever the flags. A provider that
-deletes branches should do it while the worktree still exists, passing
-`cleanup_token`, or afterwards pass the `branch` value from its own allocation
-record. A target that exists but cannot be removed safely still fails.
-
-A removal that fails partway is reported as a failure, not as a partial
-success: `--json` failures emit no JSON, so a provider reads the exit status
-and the stderr line. Two of those failures are worth handling explicitly.
-`remove --commit` commits before it removes, and simgit never rolls that commit
-back, so a failure after committing names the commit it kept — a provider that
-surfaces the stderr line verbatim passes that fact on, and a retry of the same
-command commits nothing a second time, because `--commit` commits only what the
-worktree still holds. A failure after the worktree is gone but before
-`--delete-branch` finished names the branch instead, because the path form can
-no longer identify it; retry that one by branch name.
+Safe cleanup is idempotent: a target that no longer resolves to a worktree
+makes `remove` exit 0 with `"already_absent": true` (`false` when the worktree
+was present). The other fields are `removed` (string), `committed` and
+`branch_deleted` (booleans) and `commit` (the full hash a `--commit` removal
+created, else `null`). `removed` is never evidence that anything was removed.
+When the target resolved to a worktree it is that worktree's canonical path,
+comparable to a recorded `cleanup_token`; when nothing resolved it repeats the
+target string verbatim. Key the provider's record off `already_absent` and
+`branch_deleted`, never off `removed`. A retry needs no separate existence
+check. Which targets are refused, how `--delete-branch` differs for a path and
+a branch name, what a failed `--commit` removal keeps, and the retry after a
+failed `--delete-branch` are in
+[the reference](reference.md#removal-and-unlock-semantics). A provider that
+deletes branches does it while the token still resolves, or afterwards passes
+the `branch` from its own allocation record.
 
 The provider should treat cleanup as idempotent at the job level: record a
 successful removal, and do not reinterpret a missing or mismatched path as
@@ -527,26 +495,15 @@ recovery sequence is:
    "$SIMGIT" unlock "$CLEANUP_TOKEN"
    ```
 
-   `unlock` takes a worktree path or branch, defaulting to the worktree
-   containing the current directory, and clears the lock wherever that
-   workspace keeps it. A linked worktree — which every provider allocation is —
-   is locked through Git's own `.git/worktrees/<slug>/locked`;
-   `.git/simgit-run.lock` exists only when `run` targets the main checkout,
-   which Git cannot lock. A provider never needs to find the file itself, and
-   one that inspects locks directly must look under `.git/worktrees/` for its
-   own allocations.
-
-   Unlocking a workspace that is not locked is a success, and so is unlocking a
-   target that no longer exists at all: both exit 0 with `"was_locked": false`.
-   Recovery may therefore run `unlock` unconditionally, before it knows whether
-   the workspace survived. With `--json` it reports `unlocked`, `was_locked`,
-   and `owner_pid`.
-3. If `unlock` refuses, the recorded owner process is still running and the
-   error names its PID. There is no override flag: stop that process, then
-   unlock again. An `owner_pid` of `null` is a simgit lock written without an
-   owner and is cleared as unknown-owner. A lock set with `git worktree lock`
-   is not simgit's: `unlock` refuses it, naming Git's reason and
-   `git worktree unlock`, and a provider leaves it alone.
+   Unlocking a workspace that is not locked, or one that no longer exists, exits
+   0 with `"was_locked": false`, so recovery may run `unlock` unconditionally.
+   `--json` reports `unlocked`, `was_locked` and `owner_pid`. A provider never
+   needs to find the lock file itself; where locks live is in
+   [Run locks and recovery](reference.md#run-locks-and-recovery).
+3. If `unlock` refuses, the recorded owner is still running and the error names
+   its PID. There is no override flag: stop that process, then unlock again. A
+   lock set with `git worktree lock` is not simgit's: `unlock` refuses it, and a
+   provider leaves it alone.
 4. Then either reuse the workspace — relaunch into the same absolute `path`,
    whose files, index, and branch are exactly as the crashed agent left them —
    or clean it up with the ordinary safe removal of step 5, which retains dirty
@@ -576,6 +533,10 @@ plugin:
 brew install abendrothj/tap/simgit
 claude plugin install simgit --marketplace abendrothj/simgit
 ```
+
+> PRE-RELEASE: the plugin installs only once `v0.5.0` is tagged, and works only
+> once Homebrew serves simgit 0.5.0. Remove this note at release (CONTRIBUTING,
+> "Releasing").
 
 The plugin registers `simgit hook claude-code` for `WorktreeCreate`,
 `WorktreeRemove`, `SubagentStop` and `SessionStart` (see
@@ -646,14 +607,17 @@ from native is that no commit is deleted that no other ref reaches.
 
 ## Codex
 
-Codex reads Claude Code's plugin format and speaks its hook protocol, so the
-same plugin serves both:
+Everything in this section was observed with Codex CLI 0.166. Codex reads
+Claude Code's plugin format and speaks its hook protocol, so the same plugin
+serves both:
 
 ```sh
 brew install abendrothj/tap/simgit
 codex plugin marketplace add abendrothj/simgit
 codex plugin add simgit@simgit
 ```
+
+The pre-release note under [Claude Code](#claude-code) applies here too.
 
 The plugin brings the `simgit-worktrees` skill and the `SessionStart` and
 `SubagentStop` hooks; Codex ignores the Claude Code-only `WorktreeCreate` and

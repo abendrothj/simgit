@@ -93,9 +93,10 @@ and version pinning are operator and agent policy:
 
 ## Commands
 
-The surface is flat — nine verbs, no `worktree` namespace. `--json` is a global
-flag accepted before or after the command; `run` is the only command that
-rejects it, because it owns the child's stdout. Location is always `--path`.
+The surface is flat — ten verbs, no `worktree` namespace. `--json` is a global
+flag accepted before or after the command; `run` and `hook` reject it, because
+`run` owns the child's stdout and the harness fixes `hook`'s. Location is always
+`--path`.
 
 | Command | What it does |
 |---|---|
@@ -197,15 +198,12 @@ Everything here is deliberate, and none of it is guessable:
   untouched for at least that long and defaults to 24h, so reaping a workspace
   you just used takes an explicit `0s`.
 - **A killed launcher keeps its lock on purpose.** `simgit unlock [TARGET]`
-  clears it (and a stranded allocation lock), refuses while the recorded owner
-  PID is alive and names that PID, and leaves any lock set with `git worktree
-  lock` to `git worktree unlock`. There is no override flag.
+  clears it and refuses while the owner is alive. There is no override flag.
+  Details: [run locks and recovery](docs/reference.md#run-locks-and-recovery).
 - **Cleanup is idempotent.** `remove` on an absent target exits 0 with
-  `already_absent: true`, and `unlock` on an unlocked or absent target exits 0
-  with `was_locked: false`, so retried cleanup is safe. Two cases still error:
-  `remove <absent-path> --delete-branch` once Git no longer registers the path,
-  because nothing then names the branch it held, and a path holding files that
-  Git does not register as a worktree, which simgit refuses to delete.
+  `already_absent: true`, and so does `unlock` with `was_locked: false`, so
+  retried cleanup is safe. The exceptions are in
+  [the reference](docs/reference.md#removal-and-unlock-semantics).
 - **A failed `--commit` removal keeps its commit and says so.** The commit is
   made before the worktree is removed and is never rolled back; retrying the
   same command commits nothing twice.
