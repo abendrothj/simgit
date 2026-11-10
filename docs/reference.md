@@ -143,7 +143,7 @@ switching, renaming or detaching its branch inside it changes nothing for
 | `WorktreeCreate` | Under the branch claim: reuse the name's worktree, else the worktree on `simgit/<name>` wherever it is, else attach the branch if it exists, else create it from the base. Never returns the main checkout, and refuses a locked worktree; when the simgit process that locked it, a `run` or an allocation, is gone, the error names `simgit unlock <path>`. A worktree an allocation never finished populating is refused, naming `simgit remove <path> --discard-dirty`. A worktree deleted by hand is created again at its path, on the branch or detached HEAD it had, as `run` does; one whose registration is locked, holds uncommitted work (staged changes, an operation in progress, submodule repositories or refs of its own), or is detached at a commit no ref reaches is kept, and the create fails. | the path only | 1 with one stderr line on failure |
 | `WorktreeRemove` | Only a name's worktree or a worktree on a `simgit/*` branch; others are refused. Removes it (refusing a dirty one without `--discard-dirty`, and a detached one at a commit no ref reaches even with it), then drops its `simgit/*` branch, the one it is on or else the one it was allocated for, if no commit on it is unreached by another ref. No other branch is ever dropped. A path that no longer exists succeeds; if Git still registers it, that one registration is dropped and the branch by the same rule, unless the registration is locked, holds uncommitted work as for `remove`, or is detached at a commit no ref reaches: then both are kept and the hook exits 1, even with `--discard-dirty`. The hook takes no `--commit`, so a refusal names the command that works from a shell: `simgit remove <path> --commit` or `simgit remove <path> --discard-dirty` for uncommitted work, after `git -C <path> switch -c <name>` on a detached worktree, `simgit remove <path>` after keeping a detached commit, and only `--discard-dirty` for a worktree never populated. Each is spelled `cd <main checkout> && simgit ...`, so it works from any directory: simgit finds the repository from the one it runs in, and the hook's worktrees lie outside it. | nothing | 1 when refused or failed |
 | `SubagentStop` | Removes the `simgit/agent-<agent_id>` worktree and branch when it is clean, unlocked and holds no unreached commit. Otherwise keeps it. A worktree deleted by hand has its own registration dropped, and no other, and its branch dropped by the same rule; a registration that is locked or holds uncommitted work as for `remove` is kept, and the stop reports why on one line. It does nothing when the branch is not checked out in a worktree, and does nothing silently when the payload has no `agent_id` or no directory at or above the project has a `.git`. A `.git` that Git refuses is reported on one line. | nothing | always 0 |
-| `SessionStart` | Nothing; the plugin uses it to check the version. | nothing | 0 |
+| `SessionStart` | Shows the [update notice](#update-notice) when a newer release is out, and starts the daily check; the plugin also uses it to check the version. | `{"systemMessage": …}` when a newer release is out, else nothing | 0 |
 | any other | Nothing. | nothing | 0 |
 
 A branch is dropped by `hook` only when `git rev-list --single-worktree
@@ -650,6 +650,10 @@ The latest release is cached in `$XDG_CACHE_HOME/simgit/latest` (default
 starts `curl` without waiting for it, so the check never delays a command.
 That is one request to github.com a day at most; set
 `SIMGIT_NO_UPDATE_CHECK=1` to make none.
+
+In Claude Code, where the plugin runs simgit only through hooks, the
+`SessionStart` hook shows the same notice as a session message, under the
+same switches. No other hook shows it.
 
 ### Release signatures
 

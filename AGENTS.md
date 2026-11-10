@@ -122,8 +122,9 @@ Linux and in CI; do not treat them as gates on macOS.
 - `update` replaces only a binary simgit installed (never Homebrew's or
   cargo's), and only after the release's signature against `sg/minisign.pub`,
   its checksum and its own `--version` all agree; `update --check` changes
-  nothing. The update notice never appears under `--json`, `run`, `hook` or
-  `update`, under `CI`, or when stderr is not a terminal.
+  nothing. The update notice never appears under `--json`, `run`, `update`
+  or a worktree hook, under `CI`, or when stderr is not a terminal; the
+  Claude Code `SessionStart` hook returns it as a `systemMessage` instead.
 - A `--json` failure emits no JSON: nonzero exit, empty stdout, one line of
   diagnostic text on stderr.
 

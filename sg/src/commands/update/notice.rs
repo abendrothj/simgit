@@ -22,27 +22,49 @@ pub(crate) fn after_command(json: bool, quiet: bool) {
     if !eligible(json, quiet, std::io::stderr().is_terminal(), &set) {
         return;
     }
-    let Some(path) = cache_path() else {
-        return;
-    };
-    if let Some(latest) = cached_latest(&path) {
+    if let Some(message) = check() {
+        eprintln!("{message}");
+    }
+}
+
+/// The notice for Claude Code to show when a session starts: someone who uses
+/// simgit only through the plugin never types a command that could show it.
+pub(crate) fn session_start_message() -> Option<String> {
+    let set = |name: &str| std::env::var_os(name).is_some();
+    if switched_off(&set) {
+        return None;
+    }
+    check()
+}
+
+/// The notice, if the cache names a newer release; and a fresh check started
+/// if the cache is a day old.
+fn check() -> Option<String> {
+    let path = cache_path()?;
+    let message = cached_latest(&path).and_then(|latest| {
         let current = current_version();
-        if latest > current {
-            eprintln!(
+        (latest > current).then(|| {
+            format!(
                 "simgit {latest} is available (you have {current}); update with: {}",
                 detect_install_method().command()
-            );
-        }
-    }
+            )
+        })
+    });
     if is_stale(&path, SystemTime::now()) {
         refresh(&path);
     }
+    message
 }
 
 /// Only a person at a terminal sees the notice, and only outside CI and
 /// outside `--json`, `run`, `hook` and `update`.
 fn eligible(json: bool, quiet: bool, stderr_terminal: bool, set: &dyn Fn(&str) -> bool) -> bool {
-    !json && !quiet && stderr_terminal && !set("CI") && !set("SIMGIT_NO_UPDATE_CHECK")
+    !json && !quiet && stderr_terminal && !switched_off(set)
+}
+
+/// `CI` and `SIMGIT_NO_UPDATE_CHECK` turn off the notice and its check.
+fn switched_off(set: &dyn Fn(&str) -> bool) -> bool {
+    set("CI") || set("SIMGIT_NO_UPDATE_CHECK")
 }
 
 /// `$XDG_CACHE_HOME/simgit/latest`, else `$HOME/.cache/simgit/latest`.

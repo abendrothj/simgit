@@ -548,7 +548,8 @@ The plugin registers `simgit hook claude-code` for `WorktreeCreate`,
 timeout in place of Claude Code's 600-second default, so building the first
 baseline of a large repository is not killed mid-allocation. `SessionStart`
 shows one message naming the install or upgrade command when simgit is missing
-or too old. The `SubagentStop` hook runs in shell form with `|| exit 0`
+or too old, and, once a day at most, the
+[update notice](reference.md#update-notice) when a newer release is out. The `SubagentStop` hook runs in shell form with `|| exit 0`
 because exit 2 there stops the subagent from finishing, and an older simgit
 without `hook` exits 2.
 Remove any hand-written worktree hook when you install the plugin. Claude Code

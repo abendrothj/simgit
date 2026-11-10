@@ -38,7 +38,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "simgit hook claude-code --requires 0.5.0 >/dev/null 2>&1 || echo '{\"systemMessage\": \"The simgit plugin needs simgit 0.5.0 or newer: brew install abendrothj/tap/simgit (or brew upgrade simgit)\"}'"
+            "command": "simgit hook claude-code --requires 0.5.0 2>/dev/null || echo '{\"systemMessage\": \"The simgit plugin needs simgit 0.5.0 or newer: brew install abendrothj/tap/simgit (or brew upgrade simgit)\"}'"
           }
         ]
       }

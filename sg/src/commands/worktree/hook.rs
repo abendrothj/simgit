@@ -53,7 +53,12 @@ pub fn hook(args: WorktreeHook, json: bool) -> Result<()> {
         serde_json::from_str(&input).map_err(|error| anyhow!("hook payload is not valid JSON: {error}"))?;
     let HookProvider::ClaudeCode = args.provider;
     match payload["hook_event_name"].as_str() {
-        Some("SessionStart") => Ok(()),
+        Some("SessionStart") => {
+            if let Some(message) = crate::commands::update::notice::session_start_message() {
+                println!("{}", serde_json::json!({ "systemMessage": message }));
+            }
+            Ok(())
+        }
         Some("WorktreeCreate") => on_worktree_create(&payload),
         Some("WorktreeRemove") => on_worktree_remove(&payload, args.discard_dirty),
         Some("SubagentStop") => on_subagent_stop(&payload),
