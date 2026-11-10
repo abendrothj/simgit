@@ -101,6 +101,80 @@ impl FakeRelease {
     fn curl_log(&self) -> String {
         fs::read_to_string(self.root.join("curl.log")).unwrap_or_default()
     }
+
+    /// Publish release `v{LATEST}`: an archive of two identical scripts that
+    /// report `simgit {reports}`, its `SHA256SUMS`, and that manifest signed
+    /// with `keys`.
+    fn publish(&self, reports: &str, keys: &minisign::KeyPair) {
+        let folder = self.release.join(format!("v{LATEST}"));
+        let payload = folder.join(format!("sg-{}", target()));
+        fs::create_dir_all(&payload).unwrap();
+        for name in ["simgit", "sg"] {
+            let script = payload.join(name);
+            fs::write(&script, format!("#!/bin/sh\necho 'simgit {reports}'\n")).unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let asset = format!("sg-{}.tar.gz", target());
+        let packed = Command::new("tar")
+            .current_dir(&folder)
+            .args(["czf", &asset, &format!("sg-{}", target())])
+            .status()
+            .unwrap();
+        assert!(packed.success());
+        let digest = sha256_hex(&fs::read(folder.join(&asset)).unwrap());
+        self.sign_manifest(&format!("{digest}  {asset}\n"), keys);
+    }
+
+    /// Replace the published `SHA256SUMS` with `manifest`, signed with `keys`.
+    fn sign_manifest(&self, manifest: &str, keys: &minisign::KeyPair) {
+        let folder = self.release.join(format!("v{LATEST}"));
+        fs::write(folder.join("SHA256SUMS"), manifest).unwrap();
+        let signature = minisign::sign(
+            None,
+            &keys.sk,
+            std::io::Cursor::new(manifest.as_bytes()),
+            None,
+            None,
+        )
+        .unwrap();
+        fs::write(folder.join("SHA256SUMS.minisig"), signature.into_string()).unwrap();
+    }
+
+    /// The installed binaries' contents, to show a failed update changed nothing.
+    fn snapshot(&self) -> Vec<(String, Option<Vec<u8>>)> {
+        ["simgit", "sg"]
+            .into_iter()
+            .map(|name| (name.to_owned(), fs::read(self.installed.join(name)).ok()))
+            .collect()
+    }
+
+    fn version_of(&self, binary: &Path) -> String {
+        let output = Command::new(binary).arg("--version").output().unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+}
+
+fn target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        other => panic!("no release target for {other:?}"),
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn running_as_root() -> bool {
+    let output = Command::new("id").arg("-u").output().unwrap();
+    String::from_utf8_lossy(&output.stdout).trim() == "0"
 }
 
 fn stderr(output: &Output) -> String {
@@ -153,4 +227,172 @@ fn update_check_names_a_missing_curl() {
     let message = stderr(&output);
     assert!(message.contains("curl"), "{message}");
     assert_eq!(message.trim_end().lines().count(), 1, "{message}");
+}
+
+#[test]
+fn update_replaces_both_binaries_with_a_verified_release() {
+    let fixture = FakeRelease::new();
+    fixture.publish(LATEST, &fixture.keys);
+    let output = fixture.run(&["--json", "update"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["updated"], true, "{report}");
+    assert_eq!(report["previous"], env!("CARGO_PKG_VERSION"), "{report}");
+    assert_eq!(report["current"], LATEST, "{report}");
+    for name in ["simgit", "sg"] {
+        let binary = fixture.installed.join(name);
+        assert_eq!(
+            fixture.version_of(&binary),
+            format!("simgit {LATEST}"),
+            "{name}"
+        );
+    }
+    let leftovers: Vec<_> = fs::read_dir(&fixture.installed).unwrap().collect();
+    assert_eq!(leftovers.len(), 2, "{leftovers:?}");
+}
+
+#[test]
+fn update_refuses_a_bad_signature_and_replaces_nothing() {
+    let fixture = FakeRelease::new();
+    let stranger = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+    fixture.publish(LATEST, &stranger);
+    let before = fixture.snapshot();
+    let output = fixture.run(&["update"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("signature"), "{}", stderr(&output));
+    assert_eq!(fixture.snapshot(), before);
+    assert!(
+        !fixture.curl_log().contains(".tar.gz"),
+        "{}",
+        fixture.curl_log()
+    );
+}
+
+#[test]
+fn update_refuses_a_checksum_mismatch_and_replaces_nothing() {
+    let fixture = FakeRelease::new();
+    fixture.publish(LATEST, &fixture.keys);
+    let asset = format!("sg-{}.tar.gz", target());
+    fixture.sign_manifest(&format!("{}  {asset}\n", "0".repeat(64)), &fixture.keys);
+    let before = fixture.snapshot();
+    let output = fixture.run(&["update"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("checksum"), "{}", stderr(&output));
+    assert_eq!(fixture.snapshot(), before);
+}
+
+#[test]
+fn update_refuses_a_release_reporting_another_version() {
+    let fixture = FakeRelease::new();
+    fixture.publish("9.9.8", &fixture.keys);
+    let before = fixture.snapshot();
+    let output = fixture.run(&["update"]);
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("9.9.8"), "{}", stderr(&output));
+    assert_eq!(fixture.snapshot(), before);
+}
+
+#[test]
+fn update_is_a_no_op_when_already_current() {
+    let fixture = FakeRelease::new();
+    let output = fixture
+        .command(&fixture.installed.join("simgit"))
+        .env("SIMGIT_TEST_LATEST", "0.0.1")
+        .args(["--json", "update"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report,
+        serde_json::json!({"updated": false, "current": env!("CARGO_PKG_VERSION")})
+    );
+    assert!(
+        !fixture.curl_log().contains("/download/"),
+        "{}",
+        fixture.curl_log()
+    );
+}
+
+#[test]
+fn update_refuses_homebrew_and_cargo_installs() {
+    let fixture = FakeRelease::new();
+    fixture.publish(LATEST, &fixture.keys);
+    let brew = fixture.root.join("Cellar/simgit/0.5.0/bin");
+    let cargo = fixture.root.join("cargo/bin");
+    for (folder, command) in [
+        (&brew, "brew upgrade simgit"),
+        (&cargo, "cargo install simgit-cli --locked"),
+    ] {
+        fs::create_dir_all(folder).unwrap();
+        let binary = folder.join("simgit");
+        fs::copy(env!("CARGO_BIN_EXE_simgit"), &binary).unwrap();
+        let before = fs::read(&binary).unwrap();
+        let output = fixture
+            .command(&binary)
+            .env("CARGO_HOME", fixture.root.join("cargo"))
+            .arg("update")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains(command), "{}", stderr(&output));
+        assert_eq!(fs::read(&binary).unwrap(), before);
+    }
+    assert_eq!(
+        fixture.curl_log(),
+        "",
+        "nothing is fetched for a refused update"
+    );
+}
+
+#[test]
+fn update_replaces_the_target_of_a_symlinked_binary() {
+    let fixture = FakeRelease::new();
+    fixture.publish(LATEST, &fixture.keys);
+    let links = fixture.root.join("links");
+    fs::create_dir(&links).unwrap();
+    let link = links.join("simgit");
+    std::os::unix::fs::symlink(fixture.installed.join("simgit"), &link).unwrap();
+    let output = fixture.command(&link).arg("update").output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let installed = fixture.installed.join("simgit");
+    assert_eq!(fixture.version_of(&installed), format!("simgit {LATEST}"));
+}
+
+#[test]
+fn update_reports_an_unwritable_directory_and_replaces_nothing() {
+    if running_as_root() {
+        eprintln!("skipped: root can write anywhere");
+        return;
+    }
+    let fixture = FakeRelease::new();
+    fixture.publish(LATEST, &fixture.keys);
+    let before = fixture.snapshot();
+    fs::set_permissions(&fixture.installed, fs::Permissions::from_mode(0o555)).unwrap();
+    let output = fixture.run(&["--json", "update"]);
+    fs::set_permissions(&fixture.installed, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!output.status.success());
+    let message = stderr(&output);
+    assert!(
+        message.contains(&fixture.installed.display().to_string()),
+        "{message}"
+    );
+    assert_eq!(message.trim_end().lines().count(), 1, "{message}");
+    assert_eq!(fixture.snapshot(), before);
+}
+
+#[test]
+fn update_replaces_only_the_binaries_present() {
+    let fixture = FakeRelease::new();
+    fixture.publish(LATEST, &fixture.keys);
+    fs::remove_file(fixture.installed.join("sg")).unwrap();
+    let output = fixture.run(&["update"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!fixture.installed.join("sg").exists());
+    let installed = fixture.installed.join("simgit");
+    assert_eq!(fixture.version_of(&installed), format!("simgit {LATEST}"));
 }

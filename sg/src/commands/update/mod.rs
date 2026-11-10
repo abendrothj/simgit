@@ -3,11 +3,18 @@
 pub(crate) mod release;
 
 use crate::commands::worktree::emit;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args;
-use release::{current_version, latest_release, release_build};
+use release::{
+    asset_name, checksum_for, curl, current_version, latest_release, public_key, release_build,
+    sha256_hex, verify_manifest, Version, RELEASES_URL,
+};
 use serde_json::json;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use uuid::Uuid;
 
 #[derive(Args)]
 pub struct Update {
@@ -82,6 +89,17 @@ pub(crate) fn detect_install_method() -> InstallMethod {
 
 pub fn update(args: Update, json: bool) -> Result<()> {
     let method = detect_install_method();
+    if !args.check && method != InstallMethod::SelfManaged {
+        let owner = match method {
+            InstallMethod::Homebrew => "Homebrew",
+            InstallMethod::Cargo => "cargo",
+            _ => "a source build",
+        };
+        bail!(
+            "simgit was installed by {owner}; update it with: {}",
+            method.command()
+        );
+    }
     let current = current_version();
     let latest = latest_release()?;
     if args.check {
@@ -102,10 +120,151 @@ pub fn update(args: Update, json: bool) -> Result<()> {
         }
         return Ok(());
     }
-    bail!(
-        "simgit update is not available yet; run: {}",
-        method.command()
-    )
+    if latest <= current {
+        if json {
+            emit(&json!({ "updated": false, "current": current.to_string() }));
+        } else {
+            println!("simgit is up to date ({current})");
+        }
+        return Ok(());
+    }
+    let dir = install(latest)?;
+    if json {
+        emit(&json!({
+            "updated": true,
+            "previous": current.to_string(),
+            "current": latest.to_string(),
+            "path": dir.display().to_string(),
+        }));
+    } else {
+        println!("updated simgit {current} -> {latest} in {}", dir.display());
+    }
+    Ok(())
+}
+
+/// A directory removed when dropped, whatever happened inside it.
+struct Staging(PathBuf);
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Download release `latest`, trust it only once its signature, its checksum
+/// and its own `--version` all agree, then rename it over the binaries in the
+/// running binary's directory. Nothing is replaced unless every check passed.
+/// Returns that directory.
+fn install(latest: Version) -> Result<PathBuf> {
+    let exe = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .context("find the running simgit")?;
+    let dir = exe
+        .parent()
+        .context("the running simgit has no directory")?
+        .to_path_buf();
+    // Staged next to the binaries, so the final renames stay on one
+    // filesystem and are atomic.
+    let staging = Staging(dir.join(format!(".simgit-update-{}", Uuid::new_v4())));
+    fs::create_dir(&staging.0).with_context(|| {
+        format!(
+            "cannot write to {}, where simgit is installed",
+            dir.display()
+        )
+    })?;
+
+    let asset = asset_name()?;
+    let base = format!("{RELEASES_URL}/download/v{latest}");
+    let manifest = download(&format!("{base}/SHA256SUMS"), &staging.0.join("SHA256SUMS"))?;
+    let signature = download(
+        &format!("{base}/SHA256SUMS.minisig"),
+        &staging.0.join("SHA256SUMS.minisig"),
+    )?;
+    verify_manifest(
+        &manifest,
+        &String::from_utf8_lossy(&signature),
+        &public_key(),
+    )?;
+    let expected = checksum_for(&String::from_utf8_lossy(&manifest), asset)?;
+    let archive_path = staging.0.join(asset);
+    let archive = download(&format!("{base}/{asset}"), &archive_path)?;
+    if sha256_hex(&archive) != expected {
+        bail!("checksum mismatch for {asset}; nothing was replaced");
+    }
+
+    let extracted = Command::new("tar")
+        .arg("xzf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&staging.0)
+        .status()
+        .context("run tar to extract the release")?;
+    if !extracted.success() {
+        bail!("could not extract {asset}");
+    }
+    let payload = staging.0.join(asset.trim_end_matches(".tar.gz"));
+    let binary = fs::read(payload.join("simgit")).context("the release has no simgit binary")?;
+    if fs::read(payload.join("sg")).ok().as_deref() != Some(&binary[..]) {
+        bail!("the release's simgit and sg binaries differ; nothing was replaced");
+    }
+
+    // Replace what is installed: `sg` and `simgit` where present, and the
+    // running binary whatever its name.
+    let mut names: Vec<std::ffi::OsString> = ["sg", "simgit"]
+        .into_iter()
+        .filter(|name| dir.join(name).exists())
+        .map(Into::into)
+        .collect();
+    if let Some(own) = exe.file_name() {
+        if !names.iter().any(|name| name == own) {
+            names.push(own.to_owned());
+        }
+    }
+    let mut staged = Vec::new();
+    for name in &names {
+        let path = staging.0.join(format!("new-{}", name.to_string_lossy()));
+        fs::write(&path, &binary).with_context(|| format!("stage {}", path.display()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        let reported = Command::new(&path)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("run the downloaded simgit {latest}"))?;
+        let reported = String::from_utf8_lossy(&reported.stdout).trim().to_owned();
+        if reported != format!("simgit {latest}") {
+            bail!(
+                "the downloaded simgit reports {reported:?}, not simgit {latest}; nothing was replaced"
+            );
+        }
+        staged.push((path, dir.join(name)));
+    }
+    for (from, to) in staged {
+        fs::rename(&from, &to).with_context(|| format!("replace {}", to.display()))?;
+    }
+    Ok(dir)
+}
+
+/// Fetch `url` into `path` and return its bytes.
+fn download(url: &str, path: &Path) -> Result<Vec<u8>> {
+    let output = curl()
+        .arg("-L")
+        .arg("-o")
+        .arg(path)
+        .arg(url)
+        .stdin(Stdio::null())
+        .output();
+    let output = match output {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("simgit update needs curl, which is not on PATH")
+        }
+        result => result.context("run curl")?,
+    };
+    if !output.status.success() {
+        bail!(
+            "could not download {url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    fs::read(path).with_context(|| format!("read {}", path.display()))
 }
 
 #[cfg(test)]
