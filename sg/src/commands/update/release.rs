@@ -152,19 +152,73 @@ pub(crate) fn curl() -> Command {
     command
 }
 
-/// The newest published release, from the redirect GitHub serves for
-/// `releases/latest`.
-pub(crate) fn latest_release() -> Result<Version> {
+/// Where an install learns of new releases: the place its own upgrade command
+/// installs from, so it never hears of one that command cannot install yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Feed {
+    /// GitHub's `releases/latest` redirect, which `simgit update` installs from.
+    GitHub,
+    /// The tap's formula, which `brew upgrade simgit` installs from.
+    Homebrew,
+    /// crates.io's index, which `cargo install simgit-cli` installs from.
+    Crates,
+}
+
+impl Feed {
+    pub(crate) fn url(self) -> String {
+        match self {
+            Feed::GitHub => format!("{RELEASES_URL}/latest"),
+            Feed::Homebrew => {
+                "https://raw.githubusercontent.com/abendrothj/homebrew-tap/main/Formula/simgit.rb"
+                    .to_owned()
+            }
+            Feed::Crates => "https://index.crates.io/si/mg/simgit-cli".to_owned(),
+        }
+    }
+
+    /// The `curl` arguments that put the feed's answer on stdout: GitHub's
+    /// answer is the redirect itself, the others are the response body.
+    pub(crate) fn answer_args(self) -> &'static [&'static str] {
+        match self {
+            Feed::GitHub => &["-o", "/dev/null", "-w", "%{redirect_url}"],
+            Feed::Homebrew | Feed::Crates => &[],
+        }
+    }
+
+    /// The notice's cache file for this feed, in simgit's cache directory.
+    pub(crate) fn cache_name(self) -> &'static str {
+        match self {
+            Feed::GitHub => "latest",
+            Feed::Homebrew => "latest-homebrew",
+            Feed::Crates => "latest-crates",
+        }
+    }
+
+    /// The release an answer names. A partial or foreign answer names none,
+    /// and neither does a pre-release or a yanked crate.
+    pub(crate) fn parse(self, answer: &str) -> Option<Version> {
+        match self {
+            Feed::GitHub => tag_from_redirect(answer),
+            Feed::Homebrew => answer.lines().find_map(|line| {
+                let quoted = line.trim().strip_prefix("version \"")?;
+                Version::parse(quoted.strip_suffix('"')?)
+            }),
+            Feed::Crates => answer
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|entry| entry["yanked"] == false)
+                .filter_map(|entry| Version::parse(entry["vers"].as_str()?))
+                .max(),
+        }
+    }
+}
+
+/// The newest release `feed` offers.
+pub(crate) fn latest_from(feed: Feed) -> Result<Version> {
     let output = curl()
-        .args([
-            "--max-time",
-            "30",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{redirect_url}",
-        ])
-        .arg(format!("{RELEASES_URL}/latest"))
+        .args(["--max-time", "30"])
+        .args(feed.answer_args())
+        .arg(feed.url())
         .stdin(Stdio::null())
         .output();
     let output = match output {
@@ -179,9 +233,10 @@ pub(crate) fn latest_release() -> Result<Version> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let redirect = String::from_utf8_lossy(&output.stdout);
-    tag_from_redirect(&redirect).with_context(|| {
-        format!("could not find the latest simgit release: unexpected answer {redirect:?}")
+    let answer = String::from_utf8_lossy(&output.stdout);
+    feed.parse(&answer).with_context(|| {
+        let shown: String = answer.chars().take(80).collect();
+        format!("could not find the latest simgit release: unexpected answer {shown:?}")
     })
 }
 
@@ -258,6 +313,62 @@ mod tests {
         let keys = keypair();
         let signature = sign(&keys, b"a  sg-x\n");
         assert!(verify_manifest(b"a  sg-x\n", &signature, RELEASE_PUBLIC_KEY).is_err());
+    }
+
+    #[test]
+    fn formula_version_reads_the_version_line() {
+        let formula =
+            "class Simgit < Formula\n  desc \"simgit\"\n  version \"0.6.0\"\n  url \"x\"\n";
+        assert_eq!(Feed::Homebrew.parse(formula), Version::parse("0.6.0"));
+        for text in [
+            "",
+            "class Simgit < Formula\n  version \"0.6",
+            "  version \"0.6.0-rc1\"\n",
+            "<html>404</html>",
+        ] {
+            assert_eq!(Feed::Homebrew.parse(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn crates_index_skips_yanked_and_pre_releases() {
+        let index = concat!(
+            r#"{"name":"simgit-cli","vers":"0.4.0","yanked":false}"#,
+            "\n",
+            r#"{"name":"simgit-cli","vers":"0.6.0","yanked":true}"#,
+            "\n",
+            r#"{"name":"simgit-cli","vers":"0.7.0-rc1","yanked":false}"#,
+            "\n",
+            r#"{"name":"simgit-cli","vers":"0.5.0","yanked":false}"#,
+            "\n",
+            r#"{"name":"simgit-cli","vers":"0.5"#,
+        );
+        assert_eq!(Feed::Crates.parse(index), Version::parse("0.5.0"));
+        assert_eq!(Feed::Crates.parse(""), None);
+    }
+
+    #[test]
+    fn crates_feed_follows_the_index_path_rule() {
+        // crates.io files a name of four or more characters under its first
+        // two characters, then its next two.
+        let name = "simgit-cli";
+        assert_eq!(
+            Feed::Crates.url(),
+            format!(
+                "https://index.crates.io/{}/{}/{name}",
+                &name[..2],
+                &name[2..4]
+            )
+        );
+    }
+
+    #[test]
+    fn github_feed_reads_the_latest_release_redirect() {
+        assert_eq!(
+            Feed::GitHub.parse("https://github.com/abendrothj/simgit/releases/tag/v0.6.0"),
+            Version::parse("0.6.0")
+        );
+        assert_eq!(Feed::GitHub.parse(""), None);
     }
 
     #[test]

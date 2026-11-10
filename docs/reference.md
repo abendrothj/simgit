@@ -610,7 +610,12 @@ multiplier.
 ## `update`
 
 `simgit update --check` reports the running version, the latest release and
-the command that updates this install. It changes nothing.
+the command that updates this install. It changes nothing. "Latest" is what
+that command can install now, read from where it installs from: GitHub's
+latest release for `simgit update`, the `abendrothj/homebrew-tap` formula for
+`brew upgrade`, and crates.io's index (newest version not yanked) for
+`cargo install`. So a Homebrew or cargo install never hears of a release its
+command cannot install yet.
 
 `simgit update` installs the latest release in place, but only where simgit
 installed itself: a release binary placed by `install.sh` or by hand. It
@@ -645,10 +650,12 @@ release is out, naming the command that updates this install. It does so
 only when stderr is a terminal, never under `--json`, `run`, `hook` or
 `update`, and never when `CI` or `SIMGIT_NO_UPDATE_CHECK` is set.
 
-The latest release is cached in `$XDG_CACHE_HOME/simgit/latest` (default
-`~/.cache/simgit/latest`). When the cache is missing or a day old, simgit
-starts `curl` without waiting for it, so the check never delays a command.
-That is one request to github.com a day at most; set
+The answer from this install's source (above) is cached in
+`$XDG_CACHE_HOME/simgit/` (default `~/.cache/simgit/`), in `latest`,
+`latest-homebrew` or `latest-crates`. When the cache is missing or a day
+old, simgit starts `curl` without waiting for it, so the check never delays a
+command. That is one request a day at most, to github.com,
+raw.githubusercontent.com or index.crates.io; set
 `SIMGIT_NO_UPDATE_CHECK=1` to make none.
 
 In Claude Code, where the plugin runs simgit only through hooks, the

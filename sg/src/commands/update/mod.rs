@@ -7,8 +7,8 @@ use crate::commands::worktree::emit;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use release::{
-    asset_name, checksum_for, curl, current_version, latest_release, public_key, release_build,
-    sha256_hex, verify_manifest, Version, RELEASES_URL,
+    asset_name, checksum_for, curl, current_version, latest_from, public_key, release_build,
+    sha256_hex, verify_manifest, Feed, Version, RELEASES_URL,
 };
 use serde_json::json;
 use std::fs;
@@ -42,6 +42,15 @@ impl InstallMethod {
             InstallMethod::Homebrew => "homebrew",
             InstallMethod::Cargo => "cargo",
             InstallMethod::Source => "source",
+        }
+    }
+
+    /// Where an install of this kind learns of new releases.
+    pub(crate) fn feed(self) -> Feed {
+        match self {
+            InstallMethod::SelfManaged => Feed::GitHub,
+            InstallMethod::Homebrew => Feed::Homebrew,
+            InstallMethod::Cargo | InstallMethod::Source => Feed::Crates,
         }
     }
 
@@ -102,7 +111,7 @@ pub fn update(args: Update, json: bool) -> Result<()> {
         );
     }
     let current = current_version();
-    let latest = latest_release()?;
+    let latest = latest_from(method.feed())?;
     if args.check {
         let available = latest > current;
         if json {
@@ -304,6 +313,14 @@ mod tests {
             install_method(lookalike, cargo_home, true),
             InstallMethod::SelfManaged
         );
+    }
+
+    #[test]
+    fn each_install_method_asks_where_its_upgrade_comes_from() {
+        assert_eq!(InstallMethod::SelfManaged.feed(), Feed::GitHub);
+        assert_eq!(InstallMethod::Homebrew.feed(), Feed::Homebrew);
+        assert_eq!(InstallMethod::Cargo.feed(), Feed::Crates);
+        assert_eq!(InstallMethod::Source.feed(), Feed::Crates);
     }
 
     #[test]

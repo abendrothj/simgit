@@ -60,6 +60,10 @@ impl FakeRelease {
              */releases/latest)\n\
              \t[ \"$format\" = '%{redirect_url}' ] || exit 2\n\
              \tprintf 'https://github.com/abendrothj/simgit/releases/tag/v%s' \"$SIMGIT_TEST_LATEST\" ;;\n\
+             */Formula/simgit.rb)\n\
+             \tprintf '  version \"%s\"\\n' \"${SIMGIT_TEST_FORMULA:-0.0.1}\" ;;\n\
+             */si/mg/simgit-cli)\n\
+             \tprintf '{\"name\":\"simgit-cli\",\"vers\":\"%s\",\"yanked\":false}\\n' \"${SIMGIT_TEST_CRATE:-0.0.1}\" ;;\n\
              */releases/download/*)\n\
              \trest=${url#*/releases/download/}\n\
              \tsource=\"$SIMGIT_TEST_ROOT/release/$rest\"\n\
@@ -590,4 +594,109 @@ fn update_run_as_sg_replaces_only_sg() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(!fixture.installed.join("simgit").exists());
     assert_eq!(fixture.version_of(&sg), format!("simgit {LATEST}"));
+}
+
+/// A copy of the simgit under test at `folder`, where a package manager
+/// would have put it.
+fn installed_at(fixture: &FakeRelease, folder: &Path) -> PathBuf {
+    fs::create_dir_all(folder).unwrap();
+    let binary = folder.join("simgit");
+    fs::copy(env!("CARGO_BIN_EXE_simgit"), &binary).unwrap();
+    let _ = fixture;
+    binary
+}
+
+/// `brew upgrade` offers a release only once the tap's formula names it, so
+/// a Homebrew install asks the formula, not GitHub's latest release.
+#[test]
+fn update_check_reads_homebrews_formula_for_a_homebrew_install() {
+    let fixture = FakeRelease::new();
+    let binary = installed_at(&fixture, &fixture.root.join("Cellar/simgit/0.5.0/bin"));
+    let output = fixture
+        .command(&binary)
+        .env("SIMGIT_TEST_FORMULA", "9.9.8")
+        .args(["--json", "update", "--check"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["latest"], "9.9.8", "{report}");
+    assert_eq!(report["install_method"], "homebrew", "{report}");
+    assert_eq!(report["command"], "brew upgrade simgit", "{report}");
+    assert!(
+        fixture.curl_log().contains(
+            "https://raw.githubusercontent.com/abendrothj/homebrew-tap/main/Formula/simgit.rb"
+        ),
+        "{}",
+        fixture.curl_log()
+    );
+}
+
+/// `cargo install` offers a release only once it is on crates.io.
+#[test]
+fn update_check_reads_crates_io_for_a_cargo_install() {
+    let fixture = FakeRelease::new();
+    let binary = installed_at(&fixture, &fixture.root.join("cargo/bin"));
+    let output = fixture
+        .command(&binary)
+        .env("CARGO_HOME", fixture.root.join("cargo"))
+        .env("SIMGIT_TEST_CRATE", "9.9.7")
+        .args(["--json", "update", "--check"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["latest"], "9.9.7", "{report}");
+    assert_eq!(report["install_method"], "cargo", "{report}");
+    assert!(
+        fixture
+            .curl_log()
+            .contains("https://index.crates.io/si/mg/simgit-cli"),
+        "{}",
+        fixture.curl_log()
+    );
+}
+
+/// A Homebrew user hears of a release only once `brew upgrade` can install
+/// it, whatever GitHub already lists.
+#[test]
+fn notice_for_a_homebrew_install_waits_for_the_formula() {
+    let fixture = FakeRelease::new();
+    let binary = installed_at(&fixture, &fixture.root.join("Cellar/simgit/0.5.0/bin"));
+    let cache = fixture.cache().parent().unwrap().to_path_buf();
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("latest"), LATEST_URL).unwrap();
+    let python = which("python3");
+    let run = |formula: &str| {
+        fs::write(
+            cache.join("latest-homebrew"),
+            format!("  version \"{formula}\"\n"),
+        )
+        .unwrap();
+        let output = fixture
+            .command(&python)
+            .env_remove("CI")
+            .env_remove("SIMGIT_NO_UPDATE_CHECK")
+            .current_dir(&fixture.root)
+            .args([
+                "-c",
+                "import os, pty, sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))",
+            ])
+            .arg(&binary)
+            .arg("doctor")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let before = run(env!("CARGO_PKG_VERSION"));
+    assert!(!before.contains("is available"), "{before}");
+    let after = run(LATEST);
+    assert!(
+        after.contains(&format!(
+            "simgit {LATEST} is available (you have {}); update with: brew upgrade simgit",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{after}"
+    );
 }

@@ -3,7 +3,7 @@
 //! file, and a later command reads it.
 
 use super::detect_install_method;
-use super::release::{curl, current_version, tag_from_redirect, Version, RELEASES_URL};
+use super::release::{curl, current_version, Feed, Version};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -38,20 +38,23 @@ pub(crate) fn session_start_message() -> Option<String> {
 }
 
 /// The notice, if the cache names a newer release; and a fresh check started
-/// if the cache is a day old.
+/// if the cache is a day old. Each install method asks its own feed, so the
+/// notice never names a command that cannot install the release yet.
 fn check() -> Option<String> {
-    let path = cache_path()?;
-    let message = cached_latest(&path).and_then(|latest| {
+    let method = detect_install_method();
+    let feed = method.feed();
+    let path = cache_dir()?.join(feed.cache_name());
+    let message = cached_latest(&path, feed).and_then(|latest| {
         let current = current_version();
         (latest > current).then(|| {
             format!(
                 "simgit {latest} is available (you have {current}); update with: {}",
-                detect_install_method().command()
+                method.command()
             )
         })
     });
     if is_stale(&path, SystemTime::now()) {
-        refresh(&path);
+        refresh(&path, feed);
     }
     message
 }
@@ -67,19 +70,19 @@ fn switched_off(set: &dyn Fn(&str) -> bool) -> bool {
     set("CI") || set("SIMGIT_NO_UPDATE_CHECK")
 }
 
-/// `$XDG_CACHE_HOME/simgit/latest`, else `$HOME/.cache/simgit/latest`.
-fn cache_path() -> Option<PathBuf> {
+/// `$XDG_CACHE_HOME/simgit`, else `$HOME/.cache/simgit`.
+fn cache_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(base.join("simgit").join("latest"))
+    Some(base.join("simgit"))
 }
 
-/// The release the cache names. Anything else, such as the empty file of a
-/// check still running or an error page, names none.
-fn cached_latest(path: &Path) -> Option<Version> {
-    tag_from_redirect(&fs::read_to_string(path).ok()?)
+/// The release `feed`'s cached answer names. Anything else, such as the empty
+/// file of a check still running or an error page, names none.
+fn cached_latest(path: &Path, feed: Feed) -> Option<Version> {
+    feed.parse(&fs::read_to_string(path).ok()?)
 }
 
 /// Missing, or last written (by an answer or by the start of a check) a day
@@ -96,7 +99,7 @@ fn is_stale(path: &Path, now: SystemTime) -> bool {
 /// Truncating the file now marks the attempt, so a failing network is tried
 /// once a day, not on every command. Every error is ignored: the notice is
 /// a courtesy.
-fn refresh(path: &Path) {
+fn refresh(path: &Path, feed: Feed) {
     let Some(dir) = path.parent() else {
         return;
     };
@@ -107,15 +110,9 @@ fn refresh(path: &Path) {
         return;
     };
     let _ = curl()
-        .args([
-            "--max-time",
-            "10",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{redirect_url}",
-        ])
-        .arg(format!("{RELEASES_URL}/latest"))
+        .args(["--max-time", "10"])
+        .args(feed.answer_args())
+        .arg(feed.url())
         .stdin(Stdio::null())
         .stdout(cache)
         .stderr(Stdio::null())
@@ -150,13 +147,13 @@ mod tests {
     #[test]
     fn cached_latest_ignores_anything_but_a_release_tag() {
         let path = temp_file("latest");
-        assert_eq!(cached_latest(&path), None, "missing");
+        assert_eq!(cached_latest(&path, Feed::GitHub), None, "missing");
         fs::write(
             &path,
             "https://github.com/abendrothj/simgit/releases/tag/v0.6.0",
         )
         .unwrap();
-        assert_eq!(cached_latest(&path), Version::parse("0.6.0"));
+        assert_eq!(cached_latest(&path, Feed::GitHub), Version::parse("0.6.0"));
         for junk in [
             "",
             "https://github.com/abendrothj/simgit/releases/ta",
@@ -165,7 +162,7 @@ mod tests {
             "https://github.com/abendrothj/simgit/releases/tag/v0.6.0-rc1",
         ] {
             fs::write(&path, junk).unwrap();
-            assert_eq!(cached_latest(&path), None, "{junk:?}");
+            assert_eq!(cached_latest(&path, Feed::GitHub), None, "{junk:?}");
         }
     }
 

@@ -2369,12 +2369,14 @@ const HOOK_CREATE_GIT_CALLS: usize = 16;
 const HOOK_REUSE_GIT_CALLS: usize = 4;
 const HOOK_REMOVE_GIT_CALLS: usize = 11;
 
-const NEWER_RELEASE: &str = "https://github.com/abendrothj/simgit/releases/tag/v9.9.9";
+/// The test binary is a source build, so it learns of releases from
+/// crates.io's index.
+const NEWER_RELEASE: &str = r#"{"name":"simgit-cli","vers":"9.9.9","yanked":false}"#;
 
 impl HookFixture {
     /// The cache `SessionStart` reads the latest release from.
     fn update_cache(&self) -> PathBuf {
-        self.root.join(".cache/simgit/latest")
+        self.root.join(".cache/simgit/latest-crates")
     }
 
     /// `SessionStart` with the update check on and `curl` replaced by one that
@@ -2444,7 +2446,7 @@ fn session_start_shows_a_newer_release_to_the_person() {
 #[test]
 fn session_start_says_nothing_when_current_in_ci_or_switched_off() {
     let fixture = HookFixture::new();
-    fixture.cache_release("https://github.com/abendrothj/simgit/releases/tag/v0.0.1");
+    fixture.cache_release(r#"{"name":"simgit-cli","vers":"0.0.1","yanked":false}"#);
     let current = fixture.session_start("0", &[]);
     assert_eq!(current.status.code(), Some(0), "{}", stderr(&current));
     assert!(
