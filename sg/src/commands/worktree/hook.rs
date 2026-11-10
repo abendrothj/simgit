@@ -1,16 +1,20 @@
 //! `simgit hook <provider>`: adapt an agent harness's hook payload to simgit.
 
-use super::launch::{resolve_branch_worktree, Resolved};
+use super::launch::{resolve_registered, Resolved};
+use super::locks::{process_alive, temp_owner};
 use super::{
-    canonical_path, discover_repo, ensure_unlocked, git_common_command, git_failure,
-    git_output_common, list_worktrees, output_retrying_half_written_registration,
-    prune_git_worktrees, teardown_worktree, worktree_dirty, worktree_path_for_branch, BranchClaim,
-    RepoContext, WorktreeAdd, WorktreeEntry,
+    canonical_path, default_worktree_path, discover_repo, drop_deleted_registration,
+    ensure_unlocked, git_common_command, git_failure, git_output_common, list_worktrees,
+    output_retrying_half_written_registration, refuse_unfinished, registration_gone,
+    release_allocation_lock, safe_path_component, teardown_worktree, worktree_dirty,
+    worktree_path_for_branch, BranchClaim, Caller, RepoContext, WorktreeAdd, WorktreeEntry,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, ValueEnum};
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 #[derive(Args)]
 pub struct WorktreeHook {
@@ -35,13 +39,7 @@ pub fn hook(args: WorktreeHook, json: bool) -> Result<()> {
     if json {
         bail!("--json is not supported with `hook` because the harness defines its output");
     }
-    let running = env!("CARGO_PKG_VERSION");
-    if !version_at_least(running, &args.requires)? {
-        bail!(
-            "simgit hook requires simgit >= {}, found {running}",
-            args.requires
-        );
-    }
+    require_version(&args.requires)?;
     let mut input = String::new();
     std::io::stdin()
         .read_to_string(&mut input)
@@ -57,6 +55,56 @@ pub fn hook(args: WorktreeHook, json: bool) -> Result<()> {
         Some("SubagentStop") => on_subagent_stop(&payload),
         _ => Ok(()),
     }
+}
+
+/// Refuse to run when this simgit is older than `required`.
+fn require_version(required: &str) -> Result<()> {
+    let running = env!("CARGO_PKG_VERSION");
+    if !version_at_least(running, required)? {
+        bail!("simgit hook requires simgit >= {required}, found {running}");
+    }
+    Ok(())
+}
+
+/// The arguments after `hook`, when the raw arguments are a `hook` invocation:
+/// the first argument that is not a flag (`--json` is the only global one)
+/// names the command.
+pub fn hook_arguments(
+    arguments: &[std::ffi::OsString],
+) -> Option<impl Iterator<Item = &std::ffi::OsString>> {
+    let mut arguments = arguments
+        .iter()
+        .take_while(|argument| *argument != "--")
+        .skip_while(|argument| argument.to_str().is_some_and(|text| text.starts_with('-')));
+    arguments
+        .next()
+        .is_some_and(|command| command == "hook")
+        .then_some(arguments)
+}
+
+/// Check `hook ... --requires X.Y.Z` in raw arguments, before clap parses
+/// them: a newer plugin's flags are unknown here, and the person should be
+/// told to upgrade rather than shown a usage error. Arguments that are not a
+/// `hook` invocation, or name no `--requires` value, are left to clap.
+pub fn check_requires_before_parsing(arguments: &[std::ffi::OsString]) -> Result<()> {
+    let Some(mut arguments) = hook_arguments(arguments) else {
+        return Ok(());
+    };
+    while let Some(argument) = arguments.next() {
+        let Some(argument) = argument.to_str() else {
+            continue;
+        };
+        let required = match argument.strip_prefix("--requires=") {
+            Some(value) => value,
+            None if argument == "--requires" => match arguments.next().and_then(|v| v.to_str()) {
+                Some(value) => value,
+                None => return Ok(()),
+            },
+            None => continue,
+        };
+        return require_version(required);
+    }
+    Ok(())
 }
 
 /// Compare numeric `X.Y.Z` versions; a malformed `required` is an error.
@@ -77,16 +125,20 @@ fn version_at_least(running: &str, required: &str) -> Result<bool> {
     Ok(running >= required)
 }
 
-/// The project repository: `$CLAUDE_PROJECT_DIR`, else the payload's `cwd`.
-fn project_repo(payload: &serde_json::Value) -> Result<RepoContext> {
-    let dir = match std::env::var_os("CLAUDE_PROJECT_DIR") {
-        Some(dir) if !dir.is_empty() => dir.into(),
+/// The project directory: `$CLAUDE_PROJECT_DIR`, else the payload's `cwd`.
+fn project_dir(payload: &serde_json::Value) -> Result<PathBuf> {
+    match std::env::var_os("CLAUDE_PROJECT_DIR") {
+        Some(dir) if !dir.is_empty() => Ok(dir.into()),
         _ => payload["cwd"]
             .as_str()
             .map(|cwd| Path::new(cwd).to_path_buf())
-            .context("hook payload has no cwd and CLAUDE_PROJECT_DIR is unset")?,
-    };
-    discover_repo(&dir)
+            .context("hook payload has no cwd and CLAUDE_PROJECT_DIR is unset"),
+    }
+}
+
+/// The project repository, found from `project_dir`.
+fn project_repo(payload: &serde_json::Value) -> Result<RepoContext> {
+    discover_repo(&project_dir(payload)?)
 }
 
 /// The branch simgit keeps for a Claude Code worktree name.
@@ -111,6 +163,10 @@ fn default_base(repo: &RepoContext) -> Result<String> {
     .to_owned())
 }
 
+/// Where a fetch lands: `<pid>-<uuid>` under this prefix, so that `prune`
+/// can tell a killed create's ref from a running one's.
+const FETCH_REFS: &str = "refs/simgit/fetch/";
+
 /// The change number in a `pr-<n>` name: `pr-` plus ASCII digits only, kept as
 /// text so it reaches the refspec verbatim whatever its size.
 fn change_number(name: &str) -> Option<&str> {
@@ -128,7 +184,11 @@ fn fetch_change(repo: &RepoContext, number: &str) -> Result<String> {
         format!("pull/{number}/head"),
         format!("merge-requests/{number}/head"),
     ] {
-        let temporary = format!("refs/simgit/fetch/{}", uuid::Uuid::new_v4());
+        let temporary = format!(
+            "{FETCH_REFS}{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
         let fetched = fetch_ref(repo, &format!("+{remote_ref}:{temporary}"))?;
         if !fetched.status.success() {
             let complaint = String::from_utf8_lossy(&fetched.stderr);
@@ -159,11 +219,56 @@ fn fetch_change(repo: &RepoContext, number: &str) -> Result<String> {
     )
 }
 
+/// Delete the fetch refs that creates killed before deleting them left, once
+/// the process each names is gone; a running one's, and one that names no
+/// process, are kept. Best effort, like `remove_dead_pending`.
+pub(super) fn remove_dead_fetch_refs(repo: &RepoContext) {
+    let Ok(listed) = git_output_common(repo, ["for-each-ref", "--format=%(refname)", FETCH_REFS])
+    else {
+        return;
+    };
+    let dead: String = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter(|reference| {
+            reference
+                .strip_prefix(FETCH_REFS)
+                .and_then(|name| temp_owner(name, '-'))
+                .is_some_and(|pid| !process_alive(pid))
+        })
+        .map(|reference| format!("delete {reference}\n"))
+        .collect();
+    if !listed.status.success() || dead.is_empty() {
+        return;
+    }
+    // One transaction for them all rather than a `git` per ref.
+    let mut command = git_common_command(repo);
+    command
+        .args(["update-ref", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Ok(mut child) = command.spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(dead.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
 /// `git fetch origin <refspec>`, retried when its connectivity check died on a
 /// worktree registration another allocation was half-way through writing.
 fn fetch_ref(repo: &RepoContext, refspec: &str) -> Result<std::process::Output> {
     // No terminal prompt: a credential request must fail, not hang the hook.
+    // Git's own prompts obey the variable; ssh's need the terminal gone.
     let mut command = git_common_command(repo);
+    // SAFETY: between fork and exec the closure only calls `setsid`, which is
+    // async-signal-safe, and reads `errno`.
+    unsafe {
+        command.pre_exec(|| match crate::setsid() {
+            -1 => Err(std::io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
     command.env("GIT_TERMINAL_PROMPT", "0").args([
         "fetch",
         "--quiet",
@@ -198,22 +303,35 @@ fn on_worktree_create(payload: &serde_json::Value) -> Result<()> {
     let repo = project_repo(payload)?;
     let branch = branch_for_name(&repo, name)?;
     let claim = BranchClaim::acquire_blocking(&repo, &branch)?;
-    // A worktree deleted by hand leaves its registration, which keeps the
-    // branch checked out at a missing path; prune it so the branch reattaches.
-    if worktree_path_for_branch(&repo, &branch)?.is_some_and(|path| !path.exists()) {
-        prune_git_worktrees(&repo)?;
-    }
     let main = repo.main_worktree.clone();
-    // The base applies only to a new branch; reuse and attach reject it.
+    // The worktree at the allocation path is this name's whatever branch it
+    // is on now, so a `git switch` inside it never leads to a second one.
+    let home = allocation_path(&repo, &branch)?;
     let reference = format!("refs/heads/{branch}");
-    let exists = git_output_common(&repo, ["show-ref", "--verify", "--quiet", &reference])?;
-    let base = match exists.status.code() {
-        Some(0) => None,
-        Some(1) => Some(match change_number(name) {
-            Some(number) => fetch_change(&repo, number)?,
-            None => default_base(&repo)?,
-        }),
-        _ => return Err(git_failure("look up branch", &exists)),
+    let mut entries = list_worktrees(&repo)?;
+    let registered = entries
+        .iter()
+        .position(|entry| !entry.is_main && canonical_path(&entry.path) == home)
+        .or_else(|| {
+            entries
+                .iter()
+                .position(|entry| entry.branch.as_deref() == Some(reference.as_str()))
+        })
+        .map(|index| entries.swap_remove(index));
+    // The base applies only to a new branch; reuse and attach reject it.
+    let base = match registered {
+        Some(_) => None,
+        None => {
+            let exists = git_output_common(&repo, ["show-ref", "--verify", "--quiet", &reference])?;
+            match exists.status.code() {
+                Some(0) => None,
+                Some(1) => Some(match change_number(name) {
+                    Some(number) => fetch_change(&repo, number)?,
+                    None => default_base(&repo)?,
+                }),
+                _ => return Err(git_failure("look up branch", &exists)),
+            }
+        }
     };
     let template = WorktreeAdd {
         branch: Some(branch),
@@ -225,19 +343,23 @@ fn on_worktree_create(payload: &serde_json::Value) -> Result<()> {
         require_cow: false,
         ephemeral: false,
     };
-    let path = match resolve_branch_worktree(&repo, &main, template, claim)? {
+    // One deleted by hand is created again at its path, as `run` does.
+    let path = match resolve_registered(&repo, &main, template, claim, registered, Caller::Hook)? {
         Resolved::Existing(path) => {
-            // Still registered after the prune above: Git keeps a locked one.
+            // An overlay whose mount is gone is not reattached: `simgit repair`
+            // remounts it.
             let resolved = path
                 .canonicalize()
                 .with_context(|| format!("{} is registered but missing", path.display()))?;
             if resolved == main.canonicalize()? {
                 bail!("{} is the main checkout, not a worktree", path.display());
             }
-            ensure_unlocked(&repo, &path)?;
+            let lock = ensure_unlocked(&repo, &path)?;
+            refuse_unfinished(&repo, &lock, &path)?;
             path
         }
         Resolved::Created(created) => {
+            release_allocation_lock(&repo, &created.target)?;
             eprintln!("mode: {}", created.mode.label());
             created.target
         }
@@ -318,9 +440,58 @@ fn registered_at(repo: &RepoContext, path: &Path) -> Result<Option<WorktreeEntry
         .find(|entry| canonical_path(&entry.path) == path))
 }
 
-/// Remove the payload's `worktree_path` if it is a worktree on a `simgit/*`
-/// branch, then drop the branch unless it holds unreached commits. A path that
-/// no longer exists is already removed; a registration it left is pruned.
+/// Where `WorktreeCreate` allocates `branch`: `create_worktree`'s default path
+/// from the main checkout.
+fn allocation_path(repo: &RepoContext, branch: &str) -> Result<PathBuf> {
+    Ok(canonical_path(
+        &repo
+            .main_worktree
+            .join(default_worktree_path(repo, branch)?),
+    ))
+}
+
+/// The `simgit/<name>` branch whose allocation path is `path`, whatever branch
+/// the worktree there is on now. The directory name spells `<name>` unless it
+/// held a character such as `/`; then the `simgit/*` branches are searched.
+fn allocated_for(repo: &RepoContext, path: &Path) -> Result<Option<String>> {
+    let Some(file_name) = path.file_name() else {
+        return Ok(None);
+    };
+    // `safe_path_component` names each one `simgit-<name>-<digest>`.
+    let Some(spelled) = file_name
+        .to_str()
+        .and_then(|name| name.strip_prefix("simgit-"))
+        .and_then(|rest| rest.rsplit_once('-'))
+        .map(|(name, _)| format!("simgit/{name}"))
+    else {
+        return Ok(None);
+    };
+    let home = allocation_path(repo, &spelled)?;
+    if home == path {
+        return Ok(Some(spelled));
+    }
+    if home.parent() != path.parent() {
+        return Ok(None);
+    }
+    let output = git_output_common(
+        repo,
+        ["for-each-ref", "--format=%(refname)", "refs/heads/simgit/"],
+    )?;
+    if !output.status.success() {
+        return Err(git_failure("list simgit branches", &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|reference| reference.strip_prefix("refs/heads/"))
+        .find(|branch| safe_path_component(branch) == file_name.to_string_lossy())
+        .map(str::to_owned))
+}
+
+/// Remove the payload's `worktree_path` if it is the hook's: on a `simgit/*`
+/// branch, or at the allocation path of one whatever branch it is on now.
+/// Then drop that `simgit/*` branch unless it holds unreached commits; no
+/// other branch is ever dropped. A path that no longer exists is already
+/// removed; a registration it left is dropped only when that loses nothing.
 fn on_worktree_remove(payload: &serde_json::Value, discard_dirty: bool) -> Result<()> {
     let given = Path::new(
         payload["worktree_path"]
@@ -348,32 +519,41 @@ fn on_worktree_remove(payload: &serde_json::Value, discard_dirty: bool) -> Resul
         bail!("{} is the main checkout, not a worktree", given.display());
     }
     let branch_ref = entry.branch.clone();
-    let Some(branch) = branch_ref
+    let current = branch_ref
         .as_deref()
         .and_then(|branch| branch.strip_prefix("refs/heads/"))
         .filter(|branch| branch.starts_with("simgit/"))
-    else {
+        .map(str::to_owned);
+    let branch = match current {
+        Some(branch) => Some(branch),
+        None => allocated_for(&repo, &resolved)?,
+    };
+    let Some(branch) = branch else {
         if !entry.path.exists() {
             return Ok(());
         }
         bail!(
-            "{} is not on a simgit/ branch; simgit leaves it alone",
+            "{} is not on a simgit/ branch or at a hook allocation path; simgit leaves it alone",
             given.display()
         );
     };
-    // A parallel duplicate of this hook takes the same claim, and finds the
-    // work done once it has it.
-    let _claim = BranchClaim::acquire_blocking(&repo, branch)?;
+    // A parallel duplicate of this hook, or a create of the same name, takes
+    // the same claim; a duplicate finds the work done once it has it.
+    let _claim = BranchClaim::acquire_blocking(&repo, &branch)?;
     let Some(entry) = registered_at(&repo, &resolved)?.filter(|entry| entry.branch == branch_ref)
     else {
         return Ok(());
     };
-    if entry.path.exists() {
-        teardown_worktree(&repo, &entry.path, discard_dirty)?;
+    // Deleted by hand: the drop `run` uses, which never discards what the
+    // registration holds, whatever `--discard-dirty` says.
+    if registration_gone(&repo, &entry.path) {
+        // There is no `run` to repeat here: name the removal that works by hand.
+        let then = Caller::Hook.then_remove(&repo, &entry.path);
+        drop_deleted_registration(&repo, &entry, &then, Caller::Hook)?;
     } else {
-        prune_git_worktrees(&repo)?;
+        teardown_worktree(&repo, &entry.path, discard_dirty, Caller::Hook)?;
     }
-    drop_branch_if_reached(&repo, branch)?;
+    drop_branch_if_reached(&repo, &branch)?;
     Ok(())
 }
 
@@ -397,10 +577,22 @@ fn subagent_stop_note(error: &anyhow::Error) -> String {
 }
 
 fn remove_finished_subagent(payload: &serde_json::Value) -> Result<()> {
-    let id = payload["agent_id"]
-        .as_str()
-        .context("SubagentStop payload has no agent_id")?;
-    let repo = project_repo(payload)?;
+    // Every subagent stop runs this: one without an id, or outside any
+    // repository, names no simgit worktree, so it has nothing to report. A
+    // `.git` Git refuses is a repository, and its refusal is worth the line.
+    let Some(id) = payload["agent_id"].as_str() else {
+        return Ok(());
+    };
+    let Ok(dir) = project_dir(payload) else {
+        return Ok(());
+    };
+    if !dir
+        .ancestors()
+        .any(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+    {
+        return Ok(());
+    }
+    let repo = discover_repo(&dir)?;
     let branch = branch_for_name(&repo, &format!("agent-{id}"))?;
     let reference = format!("refs/heads/{branch}");
     // A plain subagent has no branch: leave without listing or claiming, so
@@ -436,15 +628,20 @@ fn remove_finished_subagent(payload: &serde_json::Value) -> Result<()> {
             );
         }
         ensure_unlocked(&repo, &entry.path)?;
+    } else if registration_gone(&repo, &entry.path) {
+        // Deleted by hand: drop its own registration, as WorktreeRemove does,
+        // and no other; a refusal is reported like any other and keeps it.
+        let then = Caller::Hook.then_remove(&repo, &entry.path);
+        drop_deleted_registration(&repo, &entry, &then, Caller::Hook)?;
     } else {
-        // Deleted by hand: only its registration is left to clean up.
-        prune_git_worktrees(&repo)?;
+        // An overlay worktree whose directory is not mounted: nothing to clean up.
+        return Ok(());
     }
     if holds_unreached_commits(&repo, &branch)? {
         bail!("{branch} holds unpushed commits; keeping it");
     }
     if present {
-        teardown_worktree(&repo, &entry.path, false)?;
+        teardown_worktree(&repo, &entry.path, false, Caller::Hook)?;
     }
     drop_branch_if_reached(&repo, &branch)?;
     Ok(())
@@ -455,8 +652,8 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    // Git's own messages can span lines (Linux adds "Stopping at filesystem
-    // boundary ..."); the stop note must still be one stderr line.
+    // Git's own messages can span lines (on Linux, "Stopping at filesystem
+    // boundary ..." follows some); the stop note must still be one stderr line.
     #[test]
     fn subagent_stop_note_is_one_line_for_a_multi_line_git_error() {
         let error = anyhow!("fatal: not a git repository\nStopping at filesystem boundary.")

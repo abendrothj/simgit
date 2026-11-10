@@ -66,8 +66,8 @@ Linux and in CI; do not treat them as gates on macOS.
 - Every `git` child process is spawned with an explicit working directory, never
   an inherited one: these commands routinely delete the caller's cwd.
 - `run` exits with the child's exit status, `128 + signal` when a signal
-  killed the child, or `127` when the command cannot be found. The
-  retained-workspace notice goes to stderr.
+  killed the child, `126` when it cannot be executed, or `127` when it cannot
+  be found. The retained-workspace notice goes to stderr.
 - `gc` explains itself: every worktree it considered but did not reap appears in
   `skipped` with a reason — `persistent`, `dirty`, `locked`,
   `unreached-commits` (a detached HEAD no ref reaches; no override),
@@ -136,8 +136,8 @@ this as a compatibility contract rather than a description:
   reaps only ephemeral worktrees idle at least `--older-than` and skips locked
   ones, branch deletion stops at the merged check, `prune`
   drops only caches that rematerialize, stale registrations that hold no
-  work, and simgit's own temporary files once the process that wrote them is
-  gone, `repair` only remounts, and `unlock`
+  work, and simgit's own temporary files and fetch refs once the process that
+  wrote them is gone, `repair` only remounts, and `unlock`
   refuses a live owner with no override. Gates classify `doctor`, `list`,
   `unlock`, `prune`, `repair`, flagless `add`/`remove`/`gc`/`hook`, and `add --attach`
   (which checks out an existing branch without moving or deleting it) as

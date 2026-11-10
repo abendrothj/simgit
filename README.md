@@ -178,9 +178,11 @@ Codex, a shell, or anything else. Those tools' `--continue` and `resume --last`
 select *conversations*; simgit's picker selects *files and branches*.
 
 `run` retains the worktree after the child exits and exits the way a shell
-would: with the child's own code, `128 + signal` when a signal killed it, and
-`127` when the command cannot be found. The notice naming the retained
-workspace goes to stderr, never into the child's stdout.
+would; the codes are in
+[the reference](docs/reference.md#run-locks-and-recovery).
+
+The child's `PWD` is the workspace. The notice naming the retained workspace
+goes to stderr, never into the child's stdout.
 `--ephemeral` only makes a workspace *eligible* for GC; it is never authority to
 discard dirty files or unmerged commits.
 

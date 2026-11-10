@@ -6,7 +6,8 @@
           {
             "type": "command",
             "command": "simgit",
-            "args": ["hook", "claude-code", "--requires", "0.5.0"]
+            "args": ["hook", "claude-code", "--requires", "0.5.0"],
+            "timeout": 1800
           }
         ]
       }

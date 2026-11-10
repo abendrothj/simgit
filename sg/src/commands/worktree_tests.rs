@@ -1350,6 +1350,74 @@ fn a_lock_is_never_observed_empty() -> Result<()> {
     Ok(())
 }
 
+/// `run` takes over its new worktree's allocation lock: between the two, no
+/// reader may find the worktree unlocked, or a lock that is empty or does not
+/// name its owner, or gc could reap the worktree before the command starts.
+#[test]
+fn taking_over_an_allocation_lock_never_leaves_the_worktree_unlocked() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let base = resolve_commit(&repo, "HEAD")?;
+    let target = fixture.root.join("handed");
+    // Registered and still under its allocation lock, as `create_worktree` returns it.
+    allocate_git_worktree(
+        &repo,
+        "handed",
+        &target,
+        &base,
+        WorktreeKind::NewBranch,
+        &[],
+    )?;
+    let path = worktree_lock_path(&repo, &target)?;
+    let allocation = fs::read_to_string(&path)?;
+    assert!(allocation.starts_with("simgit: allocating"), "{allocation}");
+    let self_pid = std::process::id() as i32;
+    let done = AtomicBool::new(false);
+    let (taken, (reads, unlocked)) = std::thread::scope(|scope| {
+        let reader = scope.spawn(|| {
+            let (mut reads, mut unlocked) = (0, 0);
+            while !done.load(Ordering::Relaxed) {
+                match fs::read_to_string(&path) {
+                    Ok(contents) if lock_owner_pid(&contents) == Some(self_pid) => reads += 1,
+                    _ => unlocked += 1,
+                }
+            }
+            (reads, unlocked)
+        });
+        let taken = (0..100).try_for_each(|_| -> Result<()> {
+            let lock = WorktreeLock::take_over_allocation(&repo, &target)?;
+            let contents = fs::read_to_string(&path)?;
+            assert!(
+                contents.starts_with("simgit: workspace in use"),
+                "{contents}"
+            );
+            // Keep the lock file, and put Git's allocation lock back in one step.
+            std::mem::forget(lock);
+            let staged = path.with_file_name("allocation.staged");
+            fs::write(&staged, &allocation)?;
+            fs::rename(&staged, &path)?;
+            Ok(())
+        });
+        done.store(true, Ordering::Relaxed);
+        (taken, reader.join().expect("reader thread"))
+    });
+    taken?;
+    assert!(reads > 0, "the reader never saw the lock");
+    assert_eq!(
+        unlocked,
+        0,
+        "{unlocked} of {} reads found no lock naming its owner",
+        reads + unlocked
+    );
+    let leftovers: Vec<_> = files_under(path.parent().unwrap())?
+        .into_iter()
+        .filter(|file| file.to_string_lossy().ends_with(".pending"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+    Ok(())
+}
+
 /// Every file under `dir`, at any depth.
 fn files_under(dir: &Path) -> Result<HashSet<PathBuf>> {
     let mut files = HashSet::new();
@@ -1491,7 +1559,7 @@ fn an_unregistered_leftover_directory_does_not_resolve_as_a_worktree() -> Result
         _ => panic!("a registered worktree must resolve as found"),
     }
 
-    teardown_worktree(&repo, &target, false)?;
+    teardown_worktree(&repo, &target, false, Caller::Cli)?;
     fs::create_dir_all(&target)?;
 
     match lookup_worktree_target(&repo, Some(&spec))? {
@@ -1538,7 +1606,8 @@ fn teardown_refuses_a_clean_detached_worktree_with_unreached_commits() -> Result
     let base = resolve_commit(&repo, "HEAD")?;
     let detached = fixture.root.join("detached");
     add_git_worktree(&repo, "", &detached, &base, WorktreeKind::Detached, &[])?;
-    teardown_worktree(&repo, &detached, false).expect("a fresh detached worktree is reached");
+    teardown_worktree(&repo, &detached, false, Caller::Cli)
+        .expect("a fresh detached worktree is reached");
 
     add_git_worktree(&repo, "", &detached, &base, WorktreeKind::Detached, &[])?;
     fs::write(detached.join("agent.txt"), "result")?;
@@ -1547,7 +1616,7 @@ fn teardown_refuses_a_clean_detached_worktree_with_unreached_commits() -> Result
     let head = resolve_commit_at(&detached)?;
 
     for discard_dirty in [false, true] {
-        let error = teardown_worktree(&repo, &detached, discard_dirty).unwrap_err();
+        let error = teardown_worktree(&repo, &detached, discard_dirty, Caller::Cli).unwrap_err();
         assert!(format!("{error:#}").contains("branch <name>"), "{error:#}");
     }
     assert!(detached.is_dir());

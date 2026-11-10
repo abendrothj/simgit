@@ -36,10 +36,27 @@ pub(super) fn clone_supported(common_git_dir: &Path, destination_dir: &Path) -> 
         fs::write(&source, destination.as_os_str().as_encoded_bytes())?;
         // Probe with the exact operation `clone_tree` performs, so a positive
         // probe can never select a clone mechanism that then fails.
-        let cloned = clone_file(&source, &destination).is_ok();
+        let cloned = clone_file(&source, &destination);
         let _ = fs::remove_file(&destination);
         let _ = fs::remove_file(&source);
-        Ok(cloned)
+        match cloned {
+            Ok(()) => Ok(true),
+            // The destination could not be written at all, so the clone was
+            // never attempted: that is no verdict on the filesystem.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ReadOnlyFilesystem
+                ) =>
+            {
+                Err(error).with_context(|| {
+                    format!("write a clone probe in {}", destination_dir.display())
+                })
+            }
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -63,7 +80,7 @@ pub(super) fn remove_dead_probes(common_git_dir: &Path) {
         else {
             continue;
         };
-        if temp_owner(token).is_none_or(process_alive) {
+        if temp_owner(token, '.').is_none_or(process_alive) {
             continue;
         }
         let Ok(recorded) = fs::read(&source) else {

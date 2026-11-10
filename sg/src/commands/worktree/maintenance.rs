@@ -1,9 +1,10 @@
+use super::hook::remove_dead_fetch_refs;
 use super::locks::remove_dead_pending;
 use super::{
     admin_head, admin_holds_uncommitted, cow, discover_repo, emit, git_common_command, git_failure,
     git_output_common, head_unreached, is_ephemeral, list_worktrees, lock_present, lock_state,
     overlay, parse_duration, registration_gone, registration_holds_uncommitted, teardown_worktree,
-    worktree_dirty, worktree_idle, AdminHead, RegistryLock, RepoContext,
+    worktree_dirty, worktree_idle, AdminHead, Caller, RegistryLock, RepoContext,
 };
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -188,6 +189,7 @@ pub fn prune(args: WorktreePrune, json: bool) -> Result<()> {
     let registrations = prune_git_worktrees(&repo)?;
     remove_dead_pending(&repo);
     cow::remove_dead_probes(&repo.common_git_dir);
+    remove_dead_fetch_refs(&repo);
     // Under --json these are part of the report: a failure below must still
     // be the only stderr line.
     if !json {
@@ -471,7 +473,7 @@ pub(super) fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome>
             reaped.push(entry.path);
             continue;
         }
-        match teardown_worktree(repo, &entry.path, args.discard_dirty) {
+        match teardown_worktree(repo, &entry.path, args.discard_dirty, Caller::Cli) {
             Ok(()) => {
                 if args.delete_branches {
                     if let Some(branch) = &entry.branch {
