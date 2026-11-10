@@ -610,8 +610,8 @@ multiplier.
 ```text
 simgit/
 ├── sg/                 the CLI (`simgit`; `sg` is the short alias)
-│   ├── src/commands/worktree.rs    registration, allocation, removal, listing
-│   └── src/commands/worktree/      doctor, locks, maintenance, launch, CoW, overlay
+│   └── src/commands/worktree/      shared types in `mod.rs`, one module per command,
+│                                   repo discovery, CoW, overlay
 ├── tests/              CoW scaling benchmarks + overlay integration test
 ├── skills/             first-party `simgit-worktrees` agent skill
 ├── packaging/          Homebrew formula (prebuilt-binary install)

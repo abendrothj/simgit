@@ -27,8 +27,13 @@ Linux and in CI; do not treat them as gates on macOS.
 - `sg/src/bin/simgit.rs` and `sg/src/bin/sg.rs` are one-line wrappers around it.
   `simgit` is the canonical executable name; `sg` is an equivalent alias built
   from the same code. Use `simgit` in docs and examples.
-- Command lifecycle lives in `sg/src/commands/worktree.rs`; the backends live in
-  `sg/src/commands/worktree/{cow,overlay,launch,index}.rs`.
+- Each command lives in its own module under `sg/src/commands/worktree/`:
+  `add.rs`, `remove.rs`, `registry.rs` (`list` and target lookup), `launch.rs`
+  (`run`), `maintenance.rs` (`gc`, `prune`, `repair`), `locks.rs` (`unlock`)
+  and `doctor.rs`. `repo.rs` holds repository discovery and the `git` helpers,
+  `mod.rs` the shared types, and `{cow,overlay,index}.rs` the backends.
+- Unit tests sit at the bottom of the file they test; their shared fixtures
+  are in `sg/src/commands/worktree/test_support.rs`.
 - `simgit hook` (the Claude Code adapter) lives in
   `sg/src/commands/worktree/hook.rs`.
 

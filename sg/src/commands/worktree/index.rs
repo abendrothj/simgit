@@ -127,3 +127,54 @@ fn read_u32(buffer: &[u8], offset: usize) -> Result<u32> {
 fn write_u32(buffer: &mut [u8], offset: usize, value: u32) {
     buffer[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::worktree::cow;
+    use crate::commands::worktree::repo::{discover_repo, resolve_commit, run_command};
+    use crate::commands::worktree::test_support::Fixture;
+    use anyhow::{Context, Result};
+    use std::fs;
+    use std::process::Command;
+
+    #[test]
+    fn adopted_stat_data_equals_gits_own_refresh() -> Result<()> {
+        // The baseline index is copied into a clone that has its own inodes and
+        // ctimes. Adoption must reproduce, byte for byte, the index Git writes
+        // after inspecting every cloned file: anything less and Git either
+        // rehashes the whole tree on first use or trusts stale stat data.
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        if !cow::ROOT_CLONE || !cow::clone_supported(&repo.common_git_dir, &fixture.root)? {
+            return Ok(());
+        }
+        let base = resolve_commit(&repo, "HEAD")?;
+        let baseline = cow::ensure_baseline(&repo, &base)?.tree;
+        let published = cow::baseline_index(&baseline).context("baseline publishes an index")?;
+
+        let clone = fixture.root.join("clone");
+        cow::clone_root(&baseline, &clone)?;
+
+        let adopted = fixture.root.join("adopted.index");
+        fs::copy(&published, &adopted)?;
+        adopt_stat_data(&adopted, &clone)?;
+
+        let refreshed = fixture.root.join("refreshed.index");
+        fs::copy(&published, &refreshed)?;
+        let mut refresh = Command::new("git");
+        refresh
+            .env("GIT_INDEX_FILE", &refreshed)
+            .arg(format!("--git-dir={}", repo.common_git_dir.display()))
+            .arg(format!("--work-tree={}", clone.display()))
+            .args(["update-index", "--really-refresh"]);
+        run_command(&mut refresh, "git update-index --really-refresh")?;
+
+        assert_eq!(
+            fs::read(&adopted)?,
+            fs::read(&refreshed)?,
+            "adopted stat data differs from Git's own refresh"
+        );
+        Ok(())
+    }
+}

@@ -24,9 +24,10 @@ simgit/
 │   ├── src/lib.rs                 CLI surface (`run_cli`), parser and dispatch
 │   ├── src/bin/simgit.rs          canonical binary — one-line wrapper
 │   ├── src/bin/sg.rs              `sg` alias — same code, one-line wrapper
-│   ├── src/commands/worktree.rs   command and lifecycle orchestration
-│   ├── src/commands/worktree/     launch/picker, CoW baseline, overlay, index backends,
-│   │                              locks, gc/prune maintenance, `hook.rs` (Claude Code adapter)
+│   ├── src/commands/worktree/     `mod.rs` (shared types), one module per command (add,
+│   │                              remove, registry for list, launch for run, maintenance,
+│   │                              locks, doctor), repo discovery, CoW/overlay/index backends,
+│   │                              `hook.rs` (Claude Code adapter)
 │   └── tests/                     CLI workflow, installer, and `claude_code_hook.rs` tests
 ├── skills/           `simgit-worktrees` agent skill
 ├── .claude-plugin/   Claude Code and Codex plugin manifest and marketplace entry
@@ -45,9 +46,10 @@ Issues labeled [good first issue](https://github.com/abendrothj/simgit/labels/go
 simgit is a small CLI that creates real Git linked worktrees populated via
 filesystem copy-on-write. It has no daemon and no runtime services — each
 invocation shells out to `git` and, where supported, populates the working tree
-via `clonefile`/reflink or a `fuse-overlayfs` mount from a cached baseline. The
-command lifecycle lives in `sg/src/commands/worktree.rs`; filesystem-specific
-CoW baseline and overlay recovery logic lives in the adjacent backend modules.
+via `clonefile`/reflink or a `fuse-overlayfs` mount from a cached baseline. Each
+command lives in its own module under `sg/src/commands/worktree/`;
+filesystem-specific CoW baseline and overlay recovery logic lives in the
+adjacent backend modules.
 
 `simgit run` is a single flat verb — there is no nested `worktree` namespace.
 `sg/src/commands/worktree/launch.rs` handles workspace selection and child

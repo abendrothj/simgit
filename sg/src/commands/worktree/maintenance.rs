@@ -1,18 +1,24 @@
 use super::hook::remove_dead_fetch_refs;
 use super::locks::remove_dead_pending;
-use super::{
-    admin_dirs, admin_head, admin_holds_uncommitted, admin_is_ephemeral, canonical_path, cow,
-    discover_repo, emit, git_common_command, git_failure, git_output_common, head_unreached,
-    list_worktrees, lock_present, lock_state, overlay, parse_duration, registration_gone,
-    registration_holds_uncommitted, teardown_worktree, worktree_dirty, worktree_idle, AdminHead,
-    Caller, RegistryLock, RepoContext,
+use super::locks::{lock_present, lock_state, RegistryLock};
+use super::registry::{
+    admin_dirs, admin_head, admin_is_ephemeral, list_worktrees, registration_gone, worktree_dirty,
+    worktree_idle, AdminHead,
 };
+use super::remove::{
+    admin_holds_uncommitted, head_unreached, registration_holds_uncommitted, teardown_worktree,
+};
+use super::repo::{
+    canonical_path, discover_repo, git_common_command, git_failure, git_output_common,
+};
+use super::{cow, emit, overlay, Caller, RepoContext};
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Args, Default)]
 pub struct WorktreePrune {
@@ -579,4 +585,590 @@ pub(super) fn delete_branch_unguarded(repo: &RepoContext, branch: &str, force: b
         );
     }
     Err(git_failure("delete worktree branch", &output))
+}
+
+/// Parse a compact duration like `90s`, `30m`, `24h`, `7d`. A bare number is
+/// seconds.
+fn parse_duration(text: &str) -> Result<Duration> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| c.is_ascii_alphabetic())
+        .unwrap_or(text.len());
+    let (value, unit) = text.split_at(split);
+    let count: u64 = value
+        .parse()
+        .with_context(|| format!("invalid duration '{text}'"))?;
+    let multiplier = match unit {
+        "s" | "" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        other => bail!("invalid duration unit '{other}' (use s, m, h, or d)"),
+    };
+    let seconds = count
+        .checked_mul(multiplier)
+        .with_context(|| format!("duration '{text}' is too large"))?;
+    Ok(Duration::from_secs(seconds))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::worktree::add::WorktreeKind;
+    use crate::commands::worktree::registry::{list_worktrees, mark_ephemeral, worktree_admin_dir};
+    use crate::commands::worktree::repo::{
+        discover_repo, git_failure, git_output_at, git_output_common, resolve_commit, run_git_at,
+        state_dir,
+    };
+    use crate::commands::worktree::test_support::{
+        add_git_worktree, branch_exists, git, resolve_commit_at, Fixture,
+    };
+    use crate::commands::worktree::{cow, overlay};
+    use anyhow::{Context, Result};
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn parse_duration_accepts_units_and_rejects_overflow() {
+        assert_eq!(parse_duration("90s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+        assert_eq!(parse_duration("24h").unwrap(), Duration::from_secs(86_400));
+        assert_eq!(parse_duration("7d").unwrap(), Duration::from_secs(604_800));
+        assert_eq!(parse_duration("45").unwrap(), Duration::from_secs(45));
+        assert!(parse_duration("5w").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("18446744073709551615d").is_err());
+    }
+
+    #[test]
+    fn gc_reaps_ephemeral_and_by_prefix_but_spares_others() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+
+        let eph = fixture.root.join("eph");
+        add_git_worktree(&repo, "exp/eph", &eph, &base, WorktreeKind::NewBranch, &[])?;
+        mark_ephemeral(&eph)?;
+        let keep = fixture.root.join("keep");
+        add_git_worktree(
+            &repo,
+            "exp/keep",
+            &keep,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        let other = fixture.root.join("other");
+        add_git_worktree(
+            &repo,
+            "feat/other",
+            &other,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        mark_ephemeral(&other)?;
+
+        // Ephemeral-only is the default selection; nothing has to ask for it.
+        let args = WorktreeGc {
+            prefix: Some("exp".to_owned()),
+            older_than: "0s".to_owned(),
+            ..Default::default()
+        };
+        let outcome = run_gc(&repo, &args)?;
+        assert_eq!(outcome.reaped, vec![eph]);
+        assert_eq!(outcome.skipped, vec![(keep.clone(), "persistent")]);
+
+        let branches: Vec<_> = list_worktrees(&repo)?
+            .iter()
+            .filter_map(|worktree| worktree.branch.clone())
+            .collect();
+        assert!(branches
+            .iter()
+            .any(|branch| branch == "refs/heads/exp/keep"));
+        assert!(branches
+            .iter()
+            .any(|branch| branch == "refs/heads/feat/other"));
+        assert!(!branches.iter().any(|branch| branch == "refs/heads/exp/eph"));
+        Ok(())
+    }
+
+    #[test]
+    fn gc_skips_dirty_worktrees_without_discard_dirty() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let mut dirty = Vec::new();
+        for name in ["untracked", "modified", "staged"] {
+            let path = fixture.root.join(name);
+            add_git_worktree(&repo, name, &path, &base, WorktreeKind::NewBranch, &[])?;
+            dirty.push(path);
+        }
+        let [untracked, modified, staged] = &dirty[..] else {
+            unreachable!()
+        };
+        fs::write(untracked.join("scratch.txt"), "uncommitted")?;
+        fs::write(modified.join("file.txt"), "edited\n")?;
+        fs::write(staged.join("staged.txt"), "staged\n")?;
+        git(staged, ["add", "staged.txt"])?;
+
+        let gc = |discard_dirty| {
+            run_gc(
+                &repo,
+                &WorktreeGc {
+                    older_than: "0s".to_owned(),
+                    include_persistent: true,
+                    discard_dirty,
+                    ..Default::default()
+                },
+            )
+        };
+        let outcome = gc(false)?;
+        assert!(outcome.reaped.is_empty());
+        let mut skipped = outcome.skipped;
+        skipped.sort();
+        let mut expected: Vec<_> = dirty.iter().cloned().map(|path| (path, "dirty")).collect();
+        expected.sort();
+        assert_eq!(skipped, expected);
+        // The skipped worktrees still hold every kind of uncommitted work.
+        assert_eq!(
+            fs::read_to_string(untracked.join("scratch.txt"))?,
+            "uncommitted"
+        );
+        assert_eq!(fs::read_to_string(modified.join("file.txt"))?, "edited\n");
+        assert_eq!(fs::read_to_string(staged.join("staged.txt"))?, "staged\n");
+        assert!(git_output_at(staged, ["diff", "--cached", "--name-only"])?
+            .stdout
+            .starts_with(b"staged.txt"));
+
+        let mut reaped = gc(true)?.reaped;
+        reaped.sort();
+        assert_eq!(
+            reaped,
+            expected
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    /// A detached worktree's commits live only in its HEAD; reaping it would
+    /// leave them dangling, and no flag permits that.
+    #[test]
+    fn gc_skips_a_detached_worktree_whose_commits_no_ref_reaches() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let detached = fixture.root.join("detached");
+        add_git_worktree(&repo, "", &detached, &base, WorktreeKind::Detached, &[])?;
+        mark_ephemeral(&detached)?;
+        fs::write(detached.join("agent.txt"), "result")?;
+        run_git_at(&detached, ["add", "."])?;
+        run_git_at(&detached, ["commit", "-q", "-m", "agent result"])?;
+        let head = resolve_commit_at(&detached)?;
+
+        for discard_dirty in [false, true] {
+            let outcome = run_gc(
+                &repo,
+                &WorktreeGc {
+                    older_than: "0s".to_owned(),
+                    discard_dirty,
+                    ..Default::default()
+                },
+            )?;
+            assert!(outcome.reaped.is_empty());
+            assert_eq!(
+                outcome.skipped,
+                vec![(detached.clone(), "unreached-commits")]
+            );
+        }
+        assert!(detached.is_dir());
+        assert_eq!(resolve_commit_at(&detached)?, head);
+        Ok(())
+    }
+
+    #[test]
+    fn gc_reaps_a_detached_worktree_at_a_reached_commit() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let detached = fixture.root.join("detached");
+        add_git_worktree(&repo, "", &detached, &base, WorktreeKind::Detached, &[])?;
+        mark_ephemeral(&detached)?;
+
+        let outcome = run_gc(
+            &repo,
+            &WorktreeGc {
+                older_than: "0s".to_owned(),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(outcome.reaped, vec![detached]);
+        assert!(outcome.skipped.is_empty());
+        Ok(())
+    }
+
+    /// A workspace created moments ago is the one a user is most likely to ask
+    /// about, and the documented recipe (`gc --older-than 1h`) always spares it.
+    /// Silence there reads as a bug in gc; the age filter has to say so.
+    #[test]
+    fn gc_reports_worktrees_it_spared_as_recently_active() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let fresh = fixture.root.join("fresh");
+        add_git_worktree(
+            &repo,
+            "agent/fresh",
+            &fresh,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        mark_ephemeral(&fresh)?;
+
+        let outcome = run_gc(
+            &repo,
+            &WorktreeGc {
+                older_than: "1h".to_owned(),
+                ..Default::default()
+            },
+        )?;
+        assert!(outcome.reaped.is_empty());
+        assert_eq!(outcome.skipped, vec![(fresh.clone(), "recently-active")]);
+        assert!(fresh.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn gc_deletes_merged_branches_when_requested() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("merged");
+        add_git_worktree(
+            &repo,
+            "agent/merged",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+
+        let outcome = run_gc(
+            &repo,
+            &WorktreeGc {
+                older_than: "0s".to_owned(),
+                include_persistent: true,
+                delete_branches: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(outcome.reaped, vec![target]);
+        assert!(outcome.retained_branches.is_empty());
+        assert_eq!(outcome.deleted_branches, vec!["agent/merged"]);
+        assert!(!branch_exists(&repo, "agent/merged")?);
+        Ok(())
+    }
+
+    #[test]
+    fn gc_retains_unmerged_branches_without_delete_unmerged() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("unmerged");
+        add_git_worktree(
+            &repo,
+            "agent/unmerged",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        fs::write(target.join("agent.txt"), "result")?;
+        run_git_at(&target, ["add", "."])?;
+        run_git_at(&target, ["commit", "-q", "-m", "agent result"])?;
+
+        let outcome = run_gc(
+            &repo,
+            &WorktreeGc {
+                older_than: "0s".to_owned(),
+                include_persistent: true,
+                delete_branches: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(outcome.reaped, vec![target]);
+        assert_eq!(outcome.retained_branches, vec!["agent/unmerged"]);
+        assert!(branch_exists(&repo, "agent/unmerged")?);
+        Ok(())
+    }
+
+    #[test]
+    fn gc_deletes_unmerged_branches_when_permitted() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("unmerged");
+        add_git_worktree(
+            &repo,
+            "agent/unmerged",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        fs::write(target.join("agent.txt"), "result")?;
+        run_git_at(&target, ["add", "."])?;
+        run_git_at(&target, ["commit", "-q", "-m", "agent result"])?;
+
+        let outcome = run_gc(
+            &repo,
+            &WorktreeGc {
+                older_than: "0s".to_owned(),
+                include_persistent: true,
+                delete_branches: true,
+                delete_unmerged: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(outcome.reaped, vec![target]);
+        assert!(outcome.retained_branches.is_empty());
+        assert_eq!(outcome.deleted_branches, vec!["agent/unmerged"]);
+        assert!(!branch_exists(&repo, "agent/unmerged")?);
+        Ok(())
+    }
+
+    #[test]
+    fn gc_refuses_delete_unmerged_without_delete_branches() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("kept");
+        add_git_worktree(
+            &repo,
+            "agent/kept",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+
+        let outcome = run_gc(
+            &repo,
+            &WorktreeGc {
+                older_than: "0s".to_owned(),
+                include_persistent: true,
+                delete_unmerged: true,
+                ..Default::default()
+            },
+        );
+        let error = match outcome {
+            Ok(_) => panic!("--delete-unmerged alone must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("--delete-branches"),
+            "error must name the missing flag: {error}"
+        );
+        assert!(target.is_dir(), "nothing may be reaped before validation");
+        assert!(branch_exists(&repo, "agent/kept")?);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_leaves_a_baseline_an_allocation_holds() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let output = git_output_common(
+            &repo,
+            ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "orphan"],
+        )?;
+        if !output.status.success() {
+            return Err(git_failure("git commit-tree", &output));
+        }
+        let orphan = String::from_utf8(output.stdout)?.trim().to_owned();
+
+        // An allocation using a baseline holds the cache lock shared, so even one
+        // nothing reaches is kept, plain prune says why, and --all refuses.
+        let in_use = cow::ensure_baseline(&repo, &orphan)?;
+        let tree = in_use.tree.clone();
+        let busy = prune_baseline_cache(&repo, false, &HashSet::new)?;
+        assert!(busy.cache_busy);
+        assert!(busy.removed.is_empty(), "{:?}", busy.removed);
+        assert!(prune_baseline_cache(&repo, true, &HashSet::new).is_err());
+        assert!(tree.join("file.txt").is_file());
+
+        drop(in_use);
+        let freed = prune_baseline_cache(&repo, false, &HashSet::new)?;
+        assert!(!freed.cache_busy);
+        assert_eq!(freed.removed, vec![orphan]);
+        assert!(!tree.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn prune_finishes_deleting_what_a_killed_prune_moved_aside() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        // A fresh `ready` must not make it look like a build in progress.
+        let moved = state_dir(&repo.common_git_dir)
+            .join("baselines")
+            .join(format!(".doomed-{}-1", "a".repeat(40)));
+        fs::create_dir_all(moved.join("tree"))?;
+        fs::write(moved.join("ready"), "a")?;
+        let outcome = prune_baseline_cache(&repo, false, &HashSet::new)?;
+        assert!(!moved.exists());
+        assert!(outcome.retained.is_empty(), "{:?}", outcome.retained);
+        Ok(())
+    }
+
+    #[test]
+    fn pruning_preserves_baselines_used_by_active_overlays() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let commit = resolve_commit(&repo, "HEAD")?;
+        let baseline = cow::ensure_baseline(&repo, &commit)?.tree;
+        // Other tests in this process fork children (`pre_exec`), and one forked
+        // while this test held the cache lock holds a copy of it until it execs.
+        // `prune --all` rightly refuses a busy cache instead of waiting, so wait
+        // out that moment here; no simgit process forks while it holds a lock.
+        let prune_all = |protected: &dyn Fn() -> HashSet<PathBuf>| {
+            for _ in 0..100 {
+                match prune_baseline_cache(&repo, true, protected) {
+                    Err(error) if format!("{error:#}").contains("in use by an allocation") => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    outcome => return outcome,
+                }
+            }
+            prune_baseline_cache(&repo, true, protected)
+        };
+        let protected = || HashSet::from([baseline.clone()]);
+        let protected_run = prune_all(&protected)?;
+        assert!(protected_run.removed.is_empty());
+        assert_eq!(protected_run.retained.len(), 1);
+        assert!(
+            protected_run.retained_bytes > 0,
+            "a retained baseline must report its disk cost"
+        );
+        assert!(baseline.is_dir());
+        let full_run = prune_all(&HashSet::new)?;
+        assert_eq!(full_run.removed.len(), 1);
+        assert_eq!(full_run.retained_bytes, 0);
+        assert!(!baseline.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn pruning_drops_baselines_nothing_reaches_any_more() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let new_commit = |message: &str| -> Result<String> {
+            let output = git_output_common(
+                &repo,
+                ["commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", message],
+            )?;
+            if !output.status.success() {
+                return Err(git_failure("git commit-tree", &output));
+            }
+            Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+        };
+        let on_branch = resolve_commit(&repo, "HEAD")?;
+        // What a force-push leaves behind: a commit no ref points at any more.
+        let rewritten = new_commit("rewritten")?;
+        let detached = new_commit("detached")?;
+        let detached_path = fixture.root.join("detached");
+        add_git_worktree(
+            &repo,
+            "",
+            &detached_path,
+            &detached,
+            WorktreeKind::Detached,
+            &[],
+        )?;
+        for commit in [&on_branch, &rewritten, &detached] {
+            cow::ensure_baseline(&repo, commit)?;
+        }
+        // A baseline whose commit Git has since collected.
+        let collected = "1".repeat(on_branch.len());
+        let collected_dir = state_dir(&repo.common_git_dir)
+            .join("baselines")
+            .join(&collected);
+        fs::create_dir_all(collected_dir.join("tree"))?;
+        fs::write(collected_dir.join("ready"), &collected)?;
+        // The branch moves on: its old tip is still reachable, as an ancestor.
+        git(
+            &fixture.repo,
+            ["commit", "-q", "--allow-empty", "-m", "advance"],
+        )?;
+
+        let sorted = |mut names: Vec<String>| {
+            names.sort();
+            names
+        };
+        let first = prune_baseline_cache(&repo, false, &HashSet::new)?;
+        assert_eq!(
+            sorted(first.removed),
+            sorted(vec![rewritten.clone(), collected])
+        );
+        assert_eq!(
+            sorted(first.retained),
+            sorted(vec![on_branch.clone(), detached.clone()])
+        );
+
+        // Once the detached worktree is gone, nothing reaches its commit.
+        git(
+            &fixture.repo,
+            [
+                "worktree",
+                "remove",
+                detached_path.to_str().context("utf-8 path")?,
+            ],
+        )?;
+        let second = prune_baseline_cache(&repo, false, &HashSet::new)?;
+        assert_eq!(second.removed, vec![detached]);
+        assert_eq!(second.retained, vec![on_branch]);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_retains_old_unmounted_overlay_registration() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let worktree = fixture.root.join("recoverable");
+        add_git_worktree(
+            &repo,
+            "recoverable",
+            &worktree,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        let admin = worktree_admin_dir(&worktree)?;
+        let overlay_dir = overlay::root(&repo.common_git_dir).join("saved");
+        fs::create_dir_all(overlay_dir.join("upper"))?;
+        overlay::write_marker(
+            &admin,
+            &overlay::State {
+                overlay_dir,
+                lower: None,
+            },
+        )?;
+        fs::remove_file(worktree.join(".git"))?;
+        fs::File::open(admin.join("gitdir"))?
+            .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+        prune_git_worktrees(&repo)?;
+        assert!(admin.is_dir());
+        assert!(!admin.join("locked").exists());
+        assert_eq!(
+            overlay::worktree_for_branch(&repo, "recoverable"),
+            Some(worktree)
+        );
+        Ok(())
+    }
 }

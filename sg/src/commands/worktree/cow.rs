@@ -1,5 +1,6 @@
 use super::locks::{process_alive, temp_owner, BaselineBuildClaim};
-use super::{run_command, state_dir, RepoContext};
+use super::repo::{run_command, state_dir};
+use super::RepoContext;
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use std::fs;
@@ -32,7 +33,7 @@ pub(super) fn clone_supported(common_git_dir: &Path, destination_dir: &Path) -> 
         // clear both after a kill; see `remove_dead_probes`.
         let token = format!("{}.{}", std::process::id(), Uuid::new_v4());
         let source = probe.join(format!("{token}.source"));
-        let destination = super::absolute_path(destination_dir.join(probe_name(&token)))?;
+        let destination = super::repo::absolute_path(destination_dir.join(probe_name(&token)))?;
         fs::write(&source, destination.as_os_str().as_encoded_bytes())?;
         // Probe with the exact operation `clone_tree` performs, so a positive
         // probe can never select a clone mechanism that then fails.
@@ -700,4 +701,70 @@ fn touch(path: &Path) -> Result<()> {
     let contents = fs::read(path)?;
     fs::write(path, contents)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::worktree::repo::{discover_repo, resolve_commit, state_dir};
+    use crate::commands::worktree::test_support::Fixture;
+    use anyhow::Result;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn concurrent_baseline_creation_publishes_one_complete_tree() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let commit = resolve_commit(&repo, "HEAD")?;
+        let barrier = Arc::new(Barrier::new(6));
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let repo_path = fixture.repo.clone();
+            let commit = commit.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || -> Result<PathBuf> {
+                let repo = discover_repo(&repo_path)?;
+                barrier.wait();
+                ensure_baseline(&repo, &commit).map(|baseline| baseline.tree)
+            }));
+        }
+        let paths = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("baseline thread"))
+            .collect::<Result<Vec<_>>>()?;
+        assert!(paths.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(fs::read_to_string(paths[0].join("file.txt"))?, "content\n");
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_published_baseline_is_not_deleted_implicitly() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let commit = resolve_commit(&repo, "HEAD")?;
+        let incomplete = state_dir(&repo.common_git_dir)
+            .join("baselines")
+            .join(&commit);
+        fs::create_dir_all(&incomplete)?;
+        fs::write(incomplete.join("sentinel"), "do not delete")?;
+        assert!(ensure_baseline(&repo, &commit).is_err());
+        assert!(incomplete.join("sentinel").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn required_reflink_backend_is_available() -> Result<()> {
+        if std::env::var_os("SIMGIT_REQUIRE_REFLINK").is_none() {
+            return Ok(());
+        }
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        assert!(
+            clone_supported(&repo.common_git_dir, &fixture.root)?,
+            "SIMGIT_REQUIRE_REFLINK=1 but the test filesystem rejected reflink cloning"
+        );
+        Ok(())
+    }
 }

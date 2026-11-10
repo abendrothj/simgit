@@ -1,15 +1,21 @@
 //! Command launch and workspace selection, independent of the chosen agent.
 
-use super::locks::held_by_live_simgit;
-use super::{
-    admin_dirs, canonical_path, check_creation_args, create_worktree, deleted_worktree_settings,
-    discover_repo, drop_deleted_registration, ensure_unlocked, git_failure, git_output_common,
-    list_worktrees, mark_ephemeral, nearest_existing_directory, overlay, refuse_occupied,
-    refuse_sparse_overlay, refuse_unfinished, registration_gone, remove_file_if_present,
-    select_populate_mode, shell_quote, short_branch, working_tree_at, worktree_admin_dir,
-    worktree_description, BranchClaim, Caller, CreatedWorktree, RepoContext, WorktreeAdd,
-    WorktreeEntry, WorktreeLock,
+use super::add::{
+    check_creation_args, create_worktree, refuse_occupied, refuse_sparse_overlay,
+    select_populate_mode, CreatedWorktree,
 };
+use super::locks::held_by_live_simgit;
+use super::locks::{ensure_unlocked, refuse_unfinished, BranchClaim, WorktreeLock};
+use super::registry::{
+    admin_dirs, list_worktrees, mark_ephemeral, registration_gone, short_branch,
+    worktree_admin_dir, worktree_description, WorktreeEntry,
+};
+use super::remove::{deleted_worktree_settings, drop_deleted_registration, remove_file_if_present};
+use super::repo::{
+    canonical_path, discover_repo, git_failure, git_output_common, nearest_existing_directory,
+    working_tree_at,
+};
+use super::{overlay, shell_quote, Caller, RepoContext, WorktreeAdd};
 use crate::{kill, signal};
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -596,5 +602,58 @@ fn pick_worktree(
             "Enter a number from 1 to {}, or q to cancel.",
             entries.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::worktree::add::create_worktree;
+    use crate::commands::worktree::locks::BranchClaim;
+    use crate::commands::worktree::repo::discover_repo;
+    use crate::commands::worktree::test_support::{Fixture, SpawnLoad};
+    use crate::commands::worktree::WorktreeAdd;
+    use anyhow::Result;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolve_reuses_a_worktree_named_by_a_path_relative_to_cwd() -> Result<()> {
+        let _load = SpawnLoad::start();
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let template = |path: Option<PathBuf>| WorktreeAdd {
+            branch: Some("rel/branch".to_owned()),
+            detach: false,
+            attach: false,
+            path,
+            sparse: Vec::new(),
+            base: None,
+            require_cow: false,
+            ephemeral: false,
+        };
+        let existing = fixture.root.join("rel-worktree");
+        let claim = BranchClaim::acquire(&repo, "rel/branch")?;
+        let created = create_worktree(
+            &repo,
+            &fixture.root,
+            &template(Some(existing.clone())),
+            Some(claim),
+        )?;
+
+        // The process cwd is not fixture.root, so only `cwd` can resolve this.
+        // Blocking: a child forked by a parallel test holds the first claim's
+        // lock until it execs, so a fail-fast acquire can lose that race.
+        let claim = BranchClaim::acquire_blocking(&repo, "rel/branch")?;
+        let resolved = resolve_branch_worktree(
+            &repo,
+            &fixture.root,
+            template(Some(PathBuf::from("rel-worktree"))),
+            claim,
+        )?;
+        match resolved {
+            Resolved::Existing(path) => assert_eq!(path, created.target),
+            Resolved::Created(_) => panic!("expected the existing worktree"),
+        }
+        Ok(())
     }
 }
