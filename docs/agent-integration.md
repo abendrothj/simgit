@@ -302,6 +302,10 @@ Missing parents are created. The directory may already exist if it is empty, so
 a provider that pre-creates one directory per job is supported; a non-empty
 directory is refused. The provider must still generate a distinct path per
 allocation: two concurrent allocations to the same path never both succeed.
+Allocations of one commit that has no cached baseline yet build it once: the
+others wait for that build, with a notice on stderr and no time limit, so a
+provider's allocation timeout must allow for one full checkout
+([details](reference.md#run-locks-and-recovery)).
 
 `add` does not refuse an inside-source destination; it warns on stderr that the
 worktree will appear as untracked clutter in `git status` and can be deleted by
@@ -476,9 +480,9 @@ permission to remove some other worktree. Never construct cleanup targets from
 an agent-supplied branch name; the allocation record's `cleanup_token`, or its
 recorded `branch`, are the only acceptable targets.
 
-Allocation also leaves an empty path claim file under
-`.git/simgit/claims/paths/` for every destination path ever allocated. They
-are kept on purpose and need no cleanup; see
+Allocation also leaves an empty claim file for every destination path, branch
+and new baseline commit it has claimed, under `.git/simgit/claims/paths/`,
+`branches/` and `baselines/`. They are kept on purpose and need no cleanup; see
 [Run locks and recovery](reference.md#run-locks-and-recovery).
 
 ### 6. Recover a crashed agent
@@ -517,8 +521,8 @@ Clear the lock with `simgit unlock` as in step 2; it refuses while that PID is
 alive. After that, the worktree shows every tracked file as deleted, so safe
 removal refuses it as dirty, and `run` and the Claude Code hook refuse to reuse
 it ([details](reference.md#run-locks-and-recovery)). The branch claim, the
-path claim and the baseline-cache lock it held are operating-system file locks
-released with the process. Since `add` never returned, no agent ever ran there
+path claim, the baseline build claim and the baseline-cache lock it held are
+operating-system file locks released with the process. Since `add` never returned, no agent ever ran there
 and the provider holds no allocation record for it; report the path to the operator, whose explicit
 authority `remove --discard-dirty` still requires even though it loses nothing
 here.

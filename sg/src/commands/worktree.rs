@@ -160,8 +160,8 @@ pub fn add(mut args: WorktreeAdd, json: bool) -> Result<()> {
     let repo = discover_repo(&cwd)?;
     let created = create_worktree(&repo, &cwd, &args, None)?;
     // Only now, with every marker written: until then gc and prune must see
-    // the worktree locked. No test can stretch this gap since the release
-    // stopped running git, so keep it last.
+    // the worktree locked. Keep it last; see
+    // `create_worktree_writes_its_markers_before_releasing_the_lock`.
     release_allocation_lock(&repo, &created.target)?;
 
     if json {
@@ -2266,9 +2266,6 @@ fn refuse_unreached_head(repo: &RepoContext, target: &Path, caller: Caller) -> R
         AdminHead::Branch(_) => return Ok(()),
         AdminHead::Detached(head) => head,
     };
-    if overlay::branch(repo, target).is_some() {
-        return Ok(());
-    }
     let entry = WorktreeEntry {
         path: target.to_path_buf(),
         head: Some(head),

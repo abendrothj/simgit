@@ -491,8 +491,16 @@ pub(super) struct BaselineBuildClaim {
 impl BaselineBuildClaim {
     pub(super) fn acquire(repo: &RepoContext, commit: &str) -> Result<Self> {
         let file = open_claim_file(repo, "baselines", commit.as_bytes())?;
-        file.lock()
-            .with_context(|| format!("claim building the baseline for {commit}"))?;
+        let context = || format!("claim building the baseline for {commit}");
+        match file.try_lock() {
+            Ok(()) => {}
+            // The wait has no bound: it lasts as long as the other build.
+            Err(fs::TryLockError::WouldBlock) => {
+                eprintln!("waiting for another simgit to build the baseline for {commit}");
+                file.lock().with_context(context)?;
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error).with_context(context),
+        }
         Ok(Self { _file: file })
     }
 }

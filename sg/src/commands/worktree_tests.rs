@@ -411,6 +411,35 @@ fn worktree_paths_with_spaces_are_supported() -> Result<()> {
     Ok(())
 }
 
+/// gc and prune judge an unlocked worktree by its markers, so they must all be
+/// written while the allocation lock holds: `create_worktree` returns with
+/// both in place, and its callers release the lock only afterwards.
+#[test]
+fn create_worktree_writes_its_markers_before_releasing_the_lock() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let args = WorktreeAdd {
+        branch: Some("agent/marked".to_owned()),
+        detach: false,
+        attach: false,
+        path: Some(fixture.root.join("marked")),
+        sparse: Vec::new(),
+        base: None,
+        require_cow: false,
+        ephemeral: true,
+    };
+    let created = create_worktree(&repo, &fixture.root, &args, None)?;
+    let admin = overlay::admin_dir(&repo, &created.target).context("admin dir")?;
+    assert!(admin.join("simgit-ephemeral").is_file());
+    assert!(admin.join("simgit-mode").is_file());
+    assert_eq!(
+        fs::read_to_string(admin.join("locked"))?.trim_end(),
+        allocation_lock_reason()
+    );
+    release_allocation_lock(&repo, &created.target)?;
+    Ok(())
+}
+
 #[test]
 fn overlay_marker_round_trips_through_common_admin_dir() -> Result<()> {
     let fixture = Fixture::new()?;

@@ -667,7 +667,6 @@ fn is_object_id(name: &str) -> bool {
     matches!(name.len(), 40 | 64) && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Bytes allocated under `path`, skipping anything unreadable.
 /// The disk a cached baseline takes: the size recorded when it was published,
 /// or, for one published before sizes were recorded or still being built, a
 /// walk of its files.
@@ -678,6 +677,7 @@ fn baseline_size(path: &Path) -> u64 {
         .unwrap_or_else(|| tree_size(path))
 }
 
+/// Bytes allocated under `path`, skipping anything unreadable.
 fn tree_size(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {
         return 0;

@@ -412,7 +412,8 @@ uses a baseline it also holds the baseline cache lock shared, which keeps
 `prune` from removing that baseline (see [Baselines and `prune`](#baselines-and-prune)).
 An allocation that finds no baseline for its commit claims building it, so
 allocations of one new commit build it once: the others wait for that build
-and reuse it. It takes the build claim before the cache lock, never while
+and reuse it, and each says `waiting for another simgit to build the baseline
+for <commit>` on stderr first. The wait has no time limit. It takes the build claim before the cache lock, never while
 holding it, and `prune` never takes it.
 The branch claims (`.git/simgit/claims/branches/`), the path claims
 (`.git/simgit/claims/paths/`), the build claims

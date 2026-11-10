@@ -4104,8 +4104,8 @@ fn remove_and_gc_keep_a_detached_worktree_when_git_cannot_answer() {
 /// the end of each allocation, after its clean check: gc must meet that lock
 /// and must not name a racer as reapable before its allocation is complete.
 /// Writing the markers and dropping the lock follow with no git call between
-/// them, so no wrapper can separate the two; that order is kept by the code
-/// (`add` releases last), not pinned here.
+/// them, so no wrapper can separate the two; the unit test
+/// `create_worktree_writes_its_markers_before_releasing_the_lock` pins that order.
 #[test]
 fn allocation_survives_a_concurrent_prune() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -5837,17 +5837,30 @@ fn concurrent_first_allocations_build_one_baseline() {
 
 /// `gc` reads each worktree's markers and lock from the registry it already
 /// listed: a `git` per worktree before it decides anything made a routine
-/// `gc` take seconds at a few hundred worktrees.
+/// `gc` take seconds at a few hundred worktrees. With nothing due it runs no
+/// `git` per worktree; a due worktree costs its one `git status`, no more.
 #[test]
 fn gc_runs_no_git_per_worktree() {
     let fixture = Fixture::new();
     let log = fixture.root.join("gc-git.log");
     let env = git_wrapper(&fixture, &format!("echo >> '{}'\n", log.display()));
+    let gits = |extra: &[&str]| {
+        let _ = fs::remove_file(&log);
+        let output = fixture
+            .command()
+            .envs(env.iter().cloned())
+            .args(["--json", "gc"])
+            .args(extra)
+            .output()
+            .unwrap();
+        success(&output);
+        fs::read_to_string(&log).unwrap_or_default().lines().count()
+    };
     let mut made = 0;
-    let mut gits_at = |count: usize| {
+    let mut grow_to = |count: usize| {
         while made < count {
             let name = format!("agent/g{made}");
-            // Half persistent, half ephemeral and recent, so every check runs.
+            // Half persistent, half ephemeral, so each kind is judged.
             let mut args = vec!["add", name.as_str()];
             if made % 2 == 1 {
                 args.push("--ephemeral");
@@ -5855,22 +5868,58 @@ fn gc_runs_no_git_per_worktree() {
             success(&fixture.run(&args));
             made += 1;
         }
-        let _ = fs::remove_file(&log);
-        let output = fixture
-            .command()
-            .envs(env.iter().cloned())
-            .args(["--json", "gc"])
-            .output()
-            .unwrap();
-        success(&output);
-        fs::read_to_string(&log).unwrap_or_default().lines().count()
     };
-    let few = gits_at(4);
-    let many = gits_at(16);
+    // `--older-than 0s` makes every ephemeral worktree due, so the checks
+    // after the age filter run too; `--dry-run` keeps them for the next count.
+    let due = ["--older-than", "0s", "--dry-run"];
+    grow_to(4);
+    let (idle_few, due_few) = (gits(&[]), gits(&due));
+    grow_to(16);
+    let (idle_many, due_many) = (gits(&[]), gits(&due));
     assert_eq!(
-        few, many,
-        "gc ran {few} git calls at 4 worktrees, {many} at 16"
+        idle_few, idle_many,
+        "gc ran {idle_few} git calls at 4 worktrees, {idle_many} at 16"
     );
+    // Six more ephemeral worktrees, one `git status` each.
+    assert_eq!(
+        due_many - due_few,
+        6,
+        "due gc ran {due_few} git calls at 4 worktrees, {due_many} at 16"
+    );
+}
+
+/// Branches are deleted after their worktrees are gone, so a failure there
+/// must still report what was reaped, keeping every branch it cannot vouch for.
+#[test]
+fn gc_reports_what_it_reaped_when_branch_deletion_fails() {
+    let fixture = Fixture::new();
+    for index in 0..2 {
+        success(&fixture.run(&["add", &format!("agent/f{index}"), "--ephemeral"]));
+    }
+    let env = git_wrapper(
+        &fixture,
+        "case \" $* \" in *' branch -d '*|*' for-each-ref '*) exit 1 ;; esac\n",
+    );
+    let output = fixture
+        .command()
+        .envs(env.iter().cloned())
+        .args(["--json", "gc", "--older-than", "0s", "--delete-branches"])
+        .output()
+        .unwrap();
+    success(&output);
+    let gc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(gc["reaped"].as_array().unwrap().len(), 2, "{gc}");
+    assert_eq!(gc["deleted_branches"], serde_json::json!([]), "{gc}");
+    let mut retained: Vec<&str> = gc["retained_branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|branch| branch.as_str().unwrap())
+        .collect();
+    retained.sort_unstable();
+    assert_eq!(retained, ["agent/f0", "agent/f1"], "{gc}");
+    assert!(branch_exists(&fixture.repo, "agent/f0"));
+    assert!(branch_exists(&fixture.repo, "agent/f1"));
 }
 
 /// Reaping is linear: teardown rechecks one registration's HEAD instead of
@@ -6137,4 +6186,96 @@ fn prune_checks_baseline_reachability_in_one_call() {
         .join(".git/simgit/baselines")
         .join(&gone)
         .exists());
+}
+
+/// A baseline whose commit only a detached worktree's HEAD reaches is still in
+/// use: `prune` relies on `rev-list --all` counting that HEAD.
+#[test]
+fn prune_keeps_a_baseline_only_a_detached_worktree_reaches() {
+    let fixture = Fixture::new();
+    git(&fixture.repo, &["switch", "-qc", "soon-gone"]);
+    fs::write(fixture.repo.join("detached.txt"), "x\n").unwrap();
+    git(&fixture.repo, &["add", "detached.txt"]);
+    git(&fixture.repo, &["commit", "-qm", "detached"]);
+    let commit = git_stdout(&fixture.repo, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    git(&fixture.repo, &["switch", "-q", "-"]);
+    let added = fixture
+        .command()
+        .env_remove("SIMGIT_POPULATE")
+        .args(["add", "--detach", "--base", &commit, "--path"])
+        .arg(fixture.root.join("detached"))
+        .output()
+        .unwrap();
+    success(&added);
+    let baseline = fixture.repo.join(".git/simgit/baselines").join(&commit);
+    if !baseline.is_dir() {
+        eprintln!("skipped: no backend here uses a baseline");
+        return;
+    }
+    git(&fixture.repo, &["branch", "-qD", "soon-gone"]);
+    success(&fixture.run(&["--json", "prune"]));
+    assert!(
+        baseline.is_dir(),
+        "prune dropped a baseline a worktree's HEAD reaches"
+    );
+}
+
+/// An allocation that finds another building its commit's baseline waits for
+/// that build, and says so on stderr rather than hanging silently.
+#[test]
+fn an_allocation_waiting_for_a_baseline_build_says_so() {
+    use std::io::BufRead;
+
+    let fixture = Fixture::new();
+    let doctor = fixture
+        .command()
+        .env_remove("SIMGIT_POPULATE")
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    success(&doctor);
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    if doctor["cow_supported"] != true {
+        eprintln!("skipped: no backend here uses a baseline");
+        return;
+    }
+    // The first build stalls in its checkout until the test releases it,
+    // bounded so a failing test cannot hang.
+    let started = fixture.root.join("build-started");
+    let release = fixture.root.join("build-release");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "case \" $* \" in *' checkout-index '*) if [ ! -e '{started}' ]; then : > '{started}'; \
+             i=0; while [ ! -e '{release}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i + 1)); done; fi ;; esac\n",
+            started = started.display(),
+            release = release.display(),
+        ),
+    );
+    let add = |branch: &str| {
+        fixture
+            .command()
+            .envs(env.iter().cloned())
+            .env_remove("SIMGIT_POPULATE")
+            .args(["--json", "add", branch])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let first = add("agent/builds");
+    wait_for(&started);
+    let mut second = add("agent/waits");
+    let mut stderr = std::io::BufReader::new(second.stderr.take().unwrap());
+    let mut notice = String::new();
+    stderr.read_line(&mut notice).unwrap();
+    fs::write(&release, "").unwrap();
+    assert!(
+        notice.contains("waiting for another simgit to build the baseline"),
+        "{notice:?}"
+    );
+    success(&first.wait_with_output().unwrap());
+    success(&second.wait_with_output().unwrap());
 }

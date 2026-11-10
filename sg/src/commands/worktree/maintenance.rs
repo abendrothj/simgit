@@ -474,7 +474,7 @@ pub(super) fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome>
     }
     if !reaped_branches.is_empty() {
         (deleted_branches, retained_branches) =
-            delete_branches_together(repo, reaped_branches, args.delete_unmerged)?;
+            delete_branches_together(repo, reaped_branches, args.delete_unmerged);
     }
 
     // No closing prune: gc drops only what it reaps, and everything it skipped
@@ -488,45 +488,64 @@ pub(super) fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome>
 }
 
 /// Delete `branches` with as few `git branch` calls as possible, each of
-/// which reads every registration, and sort them into deleted and kept by
-/// which refs are left afterwards, never by parsing Git's messages.
-/// `main` and `master` are always kept; without `force`, so is any branch
-/// Git refuses as not fully merged.
+/// which reads every registration, and sort them into deleted and kept,
+/// never by parsing Git's messages. `main` and `master` are always kept;
+/// without `force`, so is any branch Git refuses as not fully merged.
+///
+/// It never fails: gc calls it after the worktrees are gone, and its report is
+/// the only record of them. A branch it cannot confirm deleted counts as kept.
 fn delete_branches_together(
     repo: &RepoContext,
     branches: Vec<String>,
     force: bool,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let (primary, deletable): (Vec<String>, Vec<String>) = branches
+) -> (Vec<String>, Vec<String>) {
+    let (mut retained, deletable): (Vec<String>, Vec<String>) = branches
         .into_iter()
         .partition(|branch| branch == "main" || branch == "master");
-    {
-        let _registry = RegistryLock::shared(repo)?;
-        // Chunks keep each argument list well under ARG_MAX.
-        for chunk in deletable.chunks(500) {
-            let mut command = git_common_command(repo);
-            command
-                .args(["branch", if force { "-D" } else { "-d" }])
-                .args(chunk);
-            // Git deletes what it can and refuses the rest; the refs below say which.
-            command.output().context("delete worktree branches")?;
+    let mut deleted = Vec::new();
+    // Branches of a `git branch` call that refused some: only the refs left
+    // afterwards say which.
+    let mut unsure = Vec::new();
+    // Chunks keep each argument list well under ARG_MAX.
+    for chunk in deletable.chunks(500) {
+        let mut command = git_common_command(repo);
+        command
+            .args(["branch", if force { "-D" } else { "-d" }])
+            .args(chunk);
+        let output = RegistryLock::shared(repo)
+            .and_then(|_registry| command.output().context("delete worktree branches"));
+        match output {
+            // Git exits 0 only when it deleted every branch it was given.
+            Ok(output) if output.status.success() => deleted.extend_from_slice(chunk),
+            Ok(_) => unsure.extend_from_slice(chunk),
+            // Git never ran, so every branch is still there.
+            Err(_) => retained.extend_from_slice(chunk),
         }
     }
-    let output = git_output_common(repo, ["for-each-ref", "--format=%(refname)", "refs/heads/"])?;
-    if !output.status.success() {
-        return Err(git_failure("list branches after deleting", &output));
+    if unsure.is_empty() {
+        return (deleted, retained);
     }
-    let left: HashSet<String> = String::from_utf8_lossy(&output.stdout)
+    let left = git_output_common(repo, ["for-each-ref", "--format=%(refname)", "refs/heads/"])
+        .ok()
+        .filter(|output| output.status.success());
+    let Some(left) = left else {
+        retained.extend(unsure);
+        return (deleted, retained);
+    };
+    let left: HashSet<String> = String::from_utf8_lossy(&left.stdout)
         .lines()
         .map(str::to_owned)
         .collect();
     // Full names: a tag or remote of the same name makes `refname:short`
     // write a branch as `heads/<name>`.
-    let (mut retained, deleted): (Vec<String>, Vec<String>) = deletable
-        .into_iter()
-        .partition(|branch| left.contains(&format!("refs/heads/{branch}")));
-    retained.extend(primary);
-    Ok((deleted, retained))
+    for branch in unsure {
+        if left.contains(&format!("refs/heads/{branch}")) {
+            retained.push(branch);
+        } else {
+            deleted.push(branch);
+        }
+    }
+    (deleted, retained)
 }
 
 pub(super) fn delete_local_branch(repo: &RepoContext, branch_ref: &str, force: bool) -> Result<()> {
