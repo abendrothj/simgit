@@ -29,6 +29,12 @@ serde_json.workspace  = true
 anyhow.workspace      = true
 uuid.workspace        = true
 sha1.workspace        = true
+minisign-verify.workspace = true
+sha2.workspace        = true
+
+[dev-dependencies]
+# Signs test releases for `simgit update`.
+minisign = "0.10"
 
 # cargo-binstall: fetch the prebuilt `simgit` and `sg` binaries from GitHub
 # Releases. Archives are named sg-<target>.tar.gz and contain both binaries.
