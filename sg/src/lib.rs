@@ -99,6 +99,8 @@ enum Commands {
     Prune(commands::worktree::WorktreePrune),
     /// Remount overlay-backed worktrees after a reboot or interrupted mount.
     Repair,
+    /// Check for, or install, a newer simgit release.
+    Update(commands::update::Update),
 }
 
 // The libc signal and session calls used across the crate, declared once. A
@@ -215,6 +217,7 @@ fn run() -> Result<()> {
         Commands::Gc(args) => commands::worktree::gc(args, json),
         Commands::Prune(args) => commands::worktree::prune(args, json),
         Commands::Repair => commands::worktree::repair(json),
+        Commands::Update(args) => commands::update::update(args, json),
     };
     if one_line_errors {
         result.map_err(|error| anyhow::anyhow!(one_line(&format!("{error:#}"))))

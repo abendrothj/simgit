@@ -11,6 +11,7 @@ mod maintenance;
 mod remove;
 mod repo_discovery;
 mod run;
+mod update;
 
 /// A command with the developer's Git configuration out of reach: a global
 /// `init.defaultBranch` or `commit.gpgsign` must not change what a test sees.
