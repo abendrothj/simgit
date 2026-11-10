@@ -6,6 +6,7 @@ use super::detect_install_method;
 use super::release::{curl, current_version, Feed, Version};
 use std::fs;
 use std::io::IsTerminal;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime};
@@ -116,6 +117,9 @@ fn refresh(path: &Path, feed: Feed) {
         .stdin(Stdio::null())
         .stdout(cache)
         .stderr(Stdio::null())
+        // Its own process group, so the hangup or group kill that follows
+        // simgit's exit (a closed terminal, a hook runner) does not end it.
+        .process_group(0)
         .spawn();
 }
 
