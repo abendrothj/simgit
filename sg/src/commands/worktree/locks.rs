@@ -1,7 +1,8 @@
-use super::{
-    discover_repo, emit, lookup_worktree_target, overlay, remove_file_if_present, shell_quote,
-    simgit_anywhere, state_dir, still_locked, worktree_admin_dir, RepoContext, TargetLookup,
-};
+use super::add::still_locked;
+use super::registry::{lookup_worktree_target, worktree_admin_dir, TargetLookup};
+use super::remove::remove_file_if_present;
+use super::repo::{discover_repo, state_dir};
+use super::{emit, overlay, shell_quote, simgit_anywhere, RepoContext};
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde_json::json;
@@ -682,4 +683,463 @@ pub fn unlock(args: WorktreeUnlock, json: bool) -> Result<()> {
         println!("{label} (was not locked)");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::worktree::add::{allocate_git_worktree, WorktreeKind};
+    use crate::commands::worktree::overlay;
+    use crate::commands::worktree::repo::{discover_repo, resolve_commit, state_dir};
+    use crate::commands::worktree::test_support::{
+        add_git_worktree, file_identity, files_under, Fixture,
+    };
+    use anyhow::{Context, Result};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    #[test]
+    fn a_blocking_claim_waits_for_the_holder() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = Arc::new(discover_repo(&fixture.repo)?);
+        let held = BranchClaim::acquire(&repo, "b")?;
+        let started = std::time::Instant::now();
+        let waiter = {
+            let repo = Arc::clone(&repo);
+            std::thread::spawn(move || {
+                let claim = BranchClaim::acquire_blocking(&repo, "b");
+                (claim.is_ok(), started.elapsed())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+        let (acquired, elapsed) = waiter.join().expect("waiter thread");
+        assert!(acquired);
+        assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+        Ok(())
+    }
+
+    /// Recovery from a stranded lock turns entirely on the lock naming its holder:
+    /// without that, clearing one is a guess about whether a command is still
+    /// writing the checkout.
+    #[test]
+    fn a_lock_names_its_owner_and_an_exited_owner_is_not_alive() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("locked");
+        add_git_worktree(
+            &repo,
+            "locked",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        let path = worktree_lock_path(&repo, &target)?;
+        let self_pid = std::process::id() as i32;
+
+        let lock = WorktreeLock::acquire(&repo, &target)?;
+        assert_eq!(lock_owner_of(&path), Some(self_pid));
+        assert!(process_alive(self_pid));
+        assert!(ensure_unlocked(&repo, &target).is_err());
+
+        let refused = match WorktreeLock::acquire(&repo, &target) {
+            Ok(_) => panic!("a second launcher acquired a lock this process holds"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            refused.contains(&format!("pid {self_pid}")) && refused.contains("simgit unlock"),
+            "a second launcher is not told who holds the lock: {refused}"
+        );
+        lock.release()?;
+        assert!(ensure_unlocked(&repo, &target).is_ok());
+
+        // A process that has exited holds nothing, so its lock is clearable.
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn()?;
+        let dead_pid = child.id() as i32;
+        child.wait()?;
+        assert!(!process_alive(dead_pid));
+
+        // Locks written before simgit recorded a pid have an unknown owner, which
+        // must not be mistaken for a live one.
+        assert_eq!(lock_owner_pid("simgit: workspace in use\n"), None);
+        Ok(())
+    }
+
+    /// `unlock` judges a lock, then removes it. Removing whatever was at the path
+    /// by then deleted the live lock of a `run` that started after another
+    /// `unlock` cleared the stranded one, leaving that command unprotected.
+    #[test]
+    fn unlock_removes_only_the_lock_it_read() -> Result<()> {
+        use super::{read_lock, remove_read_lock};
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("recovered");
+        add_git_worktree(
+            &repo,
+            "recovered",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        let path = worktree_lock_path(&repo, &target)?;
+        let label = target.display().to_string();
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn()?;
+        let dead_pid = child.id();
+        child.wait()?;
+        let strand = || {
+            fs::write(
+                &path,
+                format!("simgit: workspace in use (pid {dead_pid})\n"),
+            )
+        };
+
+        // No lock read means no lock to remove.
+        assert!(read_lock(&path)?.is_none());
+
+        // Cleared by another unlock, then taken by a run: that lock stays.
+        strand()?;
+        let judged = read_lock(&path)?.expect("a stranded lock");
+        fs::remove_file(&path)?;
+        let live = WorktreeLock::acquire(&repo, &target)?;
+        assert!(remove_read_lock(&path, &judged, &label).is_err());
+        assert_eq!(
+            lock_owner_of(&path),
+            Some(std::process::id() as i32),
+            "unlock removed a live run's lock"
+        );
+        live.release()?;
+
+        // Cleared by another unlock and not retaken: the workspace is unlocked.
+        strand()?;
+        let judged = read_lock(&path)?.expect("a stranded lock");
+        fs::remove_file(&path)?;
+        remove_read_lock(&path, &judged, &label)?;
+        assert!(!path.exists());
+
+        // Unchanged since it was read: removed.
+        strand()?;
+        let judged = read_lock(&path)?.expect("a stranded lock");
+        remove_read_lock(&path, &judged, &label)?;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    /// A lock created empty and written afterwards reads, for an instant, as Git's
+    /// lock with no reason, which `run` and `unlock` refuse as not simgit's.
+    #[test]
+    fn a_lock_is_never_observed_empty() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("watched");
+        add_git_worktree(
+            &repo,
+            "watched",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        let path = worktree_lock_path(&repo, &target)?;
+        let self_pid = std::process::id() as i32;
+        let done = AtomicBool::new(false);
+        let (acquired, (reads, ownerless)) = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let (mut reads, mut ownerless) = (0, 0);
+                while !done.load(Ordering::Relaxed) {
+                    if let Ok(contents) = fs::read_to_string(&path) {
+                        reads += 1;
+                        if lock_owner_pid(&contents) != Some(self_pid) {
+                            ownerless += 1;
+                        }
+                    }
+                }
+                (reads, ownerless)
+            });
+            let acquired =
+                (0..100).try_for_each(|_| WorktreeLock::acquire(&repo, &target)?.release());
+            done.store(true, Ordering::Relaxed);
+            (acquired, reader.join().expect("reader thread"))
+        });
+        acquired?;
+        assert!(reads > 0, "the reader never saw the lock");
+        assert_eq!(
+            ownerless, 0,
+            "{ownerless} of {reads} reads saw a lock that did not name its owner"
+        );
+
+        // Neither a lock taken nor one refused leaves its pending file behind.
+        let held = WorktreeLock::acquire(&repo, &target)?;
+        assert!(WorktreeLock::acquire(&repo, &target).is_err());
+        held.release()?;
+        let leftovers: Vec<_> = files_under(path.parent().unwrap())?
+            .into_iter()
+            .filter(|file| file.to_string_lossy().ends_with(".pending"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        Ok(())
+    }
+
+    /// `run` takes over its new worktree's allocation lock: between the two, no
+    /// reader may find the worktree unlocked, or a lock that is empty or does not
+    /// name its owner, or gc could reap the worktree before the command starts.
+    #[test]
+    fn taking_over_an_allocation_lock_never_leaves_the_worktree_unlocked() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("handed");
+        // Registered and still under its allocation lock, as `create_worktree` returns it.
+        allocate_git_worktree(
+            &repo,
+            "handed",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        let path = worktree_lock_path(&repo, &target)?;
+        let allocation = fs::read_to_string(&path)?;
+        assert!(allocation.starts_with("simgit: allocating"), "{allocation}");
+        let self_pid = std::process::id() as i32;
+        let done = AtomicBool::new(false);
+        let (taken, (reads, unlocked)) = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let (mut reads, mut unlocked) = (0, 0);
+                while !done.load(Ordering::Relaxed) {
+                    match fs::read_to_string(&path) {
+                        Ok(contents) if lock_owner_pid(&contents) == Some(self_pid) => reads += 1,
+                        _ => unlocked += 1,
+                    }
+                }
+                (reads, unlocked)
+            });
+            let taken = (0..100).try_for_each(|_| -> Result<()> {
+                let lock = WorktreeLock::take_over_allocation(&repo, &target)?;
+                let contents = fs::read_to_string(&path)?;
+                assert!(
+                    contents.starts_with("simgit: workspace in use"),
+                    "{contents}"
+                );
+                // Keep the lock file, and put Git's allocation lock back in one step.
+                std::mem::forget(lock);
+                let staged = path.with_file_name("allocation.staged");
+                fs::write(&staged, &allocation)?;
+                fs::rename(&staged, &path)?;
+                Ok(())
+            });
+            done.store(true, Ordering::Relaxed);
+            (taken, reader.join().expect("reader thread"))
+        });
+        taken?;
+        assert!(reads > 0, "the reader never saw the lock");
+        assert_eq!(
+            unlocked,
+            0,
+            "{unlocked} of {} reads found no lock naming its owner",
+            reads + unlocked
+        );
+        let leftovers: Vec<_> = files_under(path.parent().unwrap())?
+            .into_iter()
+            .filter(|file| file.to_string_lossy().ends_with(".pending"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        Ok(())
+    }
+
+    /// Two allocators that find a path claim left by a killed one used to both
+    /// conclude it was stale, both unlink it and both retake it, so both went on
+    /// to allocate the one path.
+    #[test]
+    fn two_takeovers_of_a_stale_path_claim_never_both_succeed() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        // Claim files are named for the target alone, so a scratch repository
+        // shows which file a claim on it uses without locking the real one.
+        let scratch = Fixture::new()?;
+        let scratch_repo = discover_repo(&scratch.repo)?;
+        let scratch_claims = state_dir(&scratch_repo.common_git_dir).join("claims");
+        let claims = state_dir(&repo.common_git_dir).join("claims");
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn()?;
+        let dead_pid = child.id();
+        child.wait()?;
+
+        // What a killed allocator leaves behind: its claim file, naming it.
+        let leave_claim = |target: &Path, pid: u32| -> Result<PathBuf> {
+            let before = files_under(&scratch_claims)?;
+            let probe = PathClaim::acquire(&scratch_repo, target)?;
+            let created: Vec<_> = files_under(&scratch_claims)?
+                .difference(&before)
+                .cloned()
+                .collect();
+            drop(probe);
+            assert_eq!(created.len(), 1, "a claim made {created:?}");
+            let claim = claims.join(created[0].strip_prefix(&scratch_claims)?);
+            fs::create_dir_all(claim.parent().unwrap())?;
+            fs::write(
+                &claim,
+                format!("simgit: allocating a worktree here (pid {pid})\n"),
+            )?;
+            Ok(claim)
+        };
+
+        for round in 0..50 {
+            let target = fixture.root.join(format!("contested-{round}"));
+            let stale = leave_claim(&target, dead_pid)?;
+            let original = file_identity(&stale);
+
+            let barrier = Barrier::new(2);
+            let won = std::thread::scope(|scope| {
+                let racers: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            let claim = PathClaim::acquire(&repo, &target);
+                            // Hold it until both have tried: only claims held at
+                            // the same time compete.
+                            barrier.wait();
+                            claim.is_ok()
+                        })
+                    })
+                    .collect();
+                racers
+                    .into_iter()
+                    .map(|racer| racer.join().expect("racer thread"))
+                    .filter(|won| *won)
+                    .count()
+            });
+            assert_eq!(
+                won, 1,
+                "round {round}: {won} allocators took one stale claim"
+            );
+            // The claim is the OS lock on one file that is never replaced: a lock
+            // on a replacement would not exclude a holder of the original.
+            assert_eq!(
+                file_identity(&stale),
+                original,
+                "round {round}: taking over and releasing the claim replaced its file"
+            );
+
+            // A claim file naming a live process, but not locked, holds nothing.
+            // It is a fresh target: a child a parallel test forks can hold a
+            // lock this process released until it execs.
+            let target = fixture.root.join(format!("unlocked-{round}"));
+            let unlocked = leave_claim(&target, std::process::id())?;
+            let original = file_identity(&unlocked);
+            let claim = PathClaim::acquire(&repo, &target);
+            assert!(
+                claim.is_ok(),
+                "round {round}: an unlocked claim file was refused"
+            );
+            assert_eq!(file_identity(&unlocked), original, "round {round}");
+            drop(claim);
+            assert_eq!(file_identity(&unlocked), original, "round {round}");
+        }
+        Ok(())
+    }
+
+    /// Git 2.48+ under `worktree.useRelativePaths` records a worktree relative to
+    /// its admin dir. Written by hand here, so it runs on any Git: a deleted
+    /// worktree's registration and lock must still be found by its path.
+    #[test]
+    fn a_relative_gitdir_still_finds_a_deleted_worktrees_lock() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("relative");
+        add_git_worktree(
+            &repo,
+            "relative",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        let admin = overlay::admin_dir(&repo, &target).context("no admin dir")?;
+        fs::remove_dir_all(&target)?;
+        fs::write(admin.join("gitdir"), "../../../../relative/.git\n")?;
+
+        assert_eq!(overlay::admin_dir(&repo, &target), Some(admin.clone()));
+        assert!(ensure_unlocked(&repo, &target).is_ok());
+        fs::write(admin.join("locked"), "usb")?;
+        let refused = ensure_unlocked(&repo, &target).unwrap_err().to_string();
+        assert!(refused.contains("usb"), "{refused}");
+        Ok(())
+    }
+
+    /// A `locked` symlink to nothing is a lock to Git, which then cannot read its
+    /// reason or unlock it either; the advice must be the one thing that works.
+    #[test]
+    fn a_dangling_lock_is_refused_with_advice_that_works() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("dangling");
+        add_git_worktree(
+            &repo,
+            "dangling",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        let lock = worktree_lock_path(&repo, &target)?;
+        std::os::unix::fs::symlink(fixture.root.join("nowhere"), &lock)?;
+        let advice = format!("rm {}", lock.display());
+
+        let checked = ensure_unlocked(&repo, &target).unwrap_err().to_string();
+        assert!(checked.contains(&advice), "{checked}");
+        let acquired = match WorktreeLock::acquire(&repo, &target) {
+            Ok(_) => panic!("acquired a workspace Git counts as locked"),
+            Err(error) => error.to_string(),
+        };
+        assert!(acquired.contains(&advice), "{acquired}");
+        assert!(fs::symlink_metadata(&lock).is_ok());
+        Ok(())
+    }
+
+    /// An absolute `gitdir` spelled through a symlink names the same worktree as
+    /// its real path, as Git's own path lookup treats it.
+    #[test]
+    fn a_gitdir_spelled_through_a_symlink_still_finds_the_lock() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let target = fixture.root.join("aliased");
+        add_git_worktree(
+            &repo,
+            "aliased",
+            &target,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        let admin = overlay::admin_dir(&repo, &target).context("no admin dir")?;
+        fs::remove_dir_all(&target)?;
+        let alias = fixture.root.join("alias");
+        std::os::unix::fs::symlink(&fixture.root, &alias)?;
+        fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", alias.join("aliased/.git").display()),
+        )?;
+
+        assert_eq!(overlay::admin_dir(&repo, &target), Some(admin.clone()));
+        assert_eq!(
+            overlay::admin_dir(&repo, &alias.join("aliased")),
+            Some(admin.clone())
+        );
+        assert!(ensure_unlocked(&repo, &target).is_ok());
+        fs::write(admin.join("locked"), "usb")?;
+        assert!(ensure_unlocked(&repo, &target).is_err());
+        Ok(())
+    }
 }

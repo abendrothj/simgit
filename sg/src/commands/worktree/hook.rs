@@ -1,14 +1,18 @@
 //! `simgit hook <provider>`: adapt an agent harness's hook payload to simgit.
 
+use super::add::release_allocation_lock;
 use super::launch::{resolve_registered, Resolved};
+use super::locks::{ensure_unlocked, refuse_unfinished, BranchClaim};
 use super::locks::{process_alive, temp_owner};
-use super::{
-    canonical_path, default_worktree_path, discover_repo, drop_deleted_registration,
-    ensure_unlocked, git_common_command, git_failure, git_output_common, list_worktrees,
-    output_retrying_half_written_registration, refuse_unfinished, registration_gone,
-    release_allocation_lock, safe_path_component, teardown_worktree, worktree_dirty,
-    worktree_path_for_branch, BranchClaim, Caller, RepoContext, WorktreeAdd, WorktreeEntry,
+use super::registry::{
+    list_worktrees, registration_gone, worktree_dirty, worktree_path_for_branch, WorktreeEntry,
 };
+use super::remove::{drop_deleted_registration, teardown_worktree};
+use super::repo::{
+    canonical_path, default_worktree_path, discover_repo, git_common_command, git_failure,
+    git_output_common, output_retrying_half_written_registration, safe_path_component,
+};
+use super::{Caller, RepoContext, WorktreeAdd};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, ValueEnum};
 use std::io::{Read, Write};
@@ -664,7 +668,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        crate::commands::worktree::tests::isolate_git_config();
+        crate::commands::worktree::test_support::isolate_git_config();
         let status = Command::new("git")
             .current_dir(dir)
             .args(args)

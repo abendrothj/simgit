@@ -1,4 +1,6 @@
-use super::{admin_head, canonical_path, run_command, state_dir, AdminHead, RepoContext};
+use super::registry::{admin_head, AdminHead};
+use super::repo::{canonical_path, run_command, state_dir};
+use super::RepoContext;
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::fs;
@@ -335,4 +337,102 @@ pub(super) fn upper_visible(upper: &Path, view: &Path) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::worktree::add::WorktreeKind;
+    use crate::commands::worktree::registry::worktree_admin_dir;
+    use crate::commands::worktree::repo::{discover_repo, resolve_commit};
+    use crate::commands::worktree::test_support::{add_git_worktree, Fixture};
+    use anyhow::Result;
+    use std::fs;
+    use uuid::Uuid;
+
+    #[test]
+    fn overlay_marker_round_trips_through_common_admin_dir() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        let worktree = fixture.root.join("wt");
+        add_git_worktree(&repo, "wt", &worktree, &base, WorktreeKind::NewBranch, &[])?;
+        assert!(state(&repo, &worktree).is_none());
+
+        let state = State {
+            overlay_dir: fixture.root.join("overlays/abc"),
+            lower: Some(fixture.root.join("baseline")),
+        };
+        write_marker(&worktree_admin_dir(&worktree)?, &state)?;
+        assert_eq!(super::state(&repo, &worktree), Some(state));
+
+        let saved_gitlink = fixture.root.join("saved-gitlink");
+        fs::rename(worktree.join(".git"), &saved_gitlink)?;
+        let registrations = registrations(&repo);
+        assert!(registrations.iter().any(|(path, _)| path == &worktree));
+        assert_eq!(branch(&repo, &worktree).as_deref(), Some("refs/heads/wt"));
+        assert_eq!(worktree_for_branch(&repo, "wt"), Some(worktree.clone()));
+        fs::rename(saved_gitlink, worktree.join(".git"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn admin_dir_does_not_escape_to_the_common_git_dir_when_unmounted() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let repo = discover_repo(&fixture.repo)?;
+        let base = resolve_commit(&repo, "HEAD")?;
+        // Mirrors production overlay worktrees, whose mountpoint lives inside the
+        // common git dir itself (e.g. `.git/simgit/worktrees/<name>`).
+        let worktree = repo.common_git_dir.join("simgit/worktrees/nested");
+        add_git_worktree(
+            &repo,
+            "nested",
+            &worktree,
+            &base,
+            WorktreeKind::NewBranch,
+            &[],
+        )?;
+        let admin = admin_dir(&repo, &worktree).expect("admin dir while mounted");
+        assert_ne!(admin, repo.common_git_dir);
+
+        // An unmounted overlay exposes an empty mountpoint. Git's directory
+        // discovery would otherwise climb past it and find the outer repo.
+        fs::remove_file(worktree.join(".git"))?;
+        assert_eq!(admin_dir(&repo, &worktree), Some(admin));
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_health_requires_the_view_to_reflect_upperdir_data() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("simgit-overlay-health-{}", Uuid::new_v4()));
+        let upper = root.join("upper");
+        let view = root.join("view");
+        fs::create_dir_all(upper.join("nested"))?;
+        fs::create_dir_all(view.join("nested"))?;
+        fs::write(upper.join("nested/result.txt"), "agent result")?;
+        fs::write(view.join("nested/result.txt"), "agent result")?;
+        assert!(upper_visible(&upper, &view));
+        fs::write(view.join("nested/result.txt"), "stale result")?;
+        assert!(!upper_visible(&upper, &view));
+        let original = vec![b'x'; 32 * 1024 + 1];
+        fs::write(upper.join("nested/result.txt"), &original)?;
+        fs::write(view.join("nested/result.txt"), &original)?;
+        assert!(upper_visible(&upper, &view));
+
+        let mut changed = original.clone();
+        changed[16 * 1024 + 1] = b'y';
+        fs::write(view.join("nested/result.txt"), &changed)?;
+        assert!(!upper_visible(&upper, &view));
+        fs::write(
+            view.join("nested/result.txt"),
+            &original[..original.len() - 1],
+        )?;
+        assert!(!upper_visible(&upper, &view));
+        changed = original;
+        changed.push(b'y');
+        fs::write(view.join("nested/result.txt"), &changed)?;
+        assert!(!upper_visible(&upper, &view));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }

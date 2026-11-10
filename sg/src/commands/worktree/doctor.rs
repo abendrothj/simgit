@@ -1,8 +1,10 @@
-use super::{
-    absolute_path, cow, default_worktree_path, discover_repo, emit, enclosing_working_tree,
-    filesystem_name, git_worktree_list, lexical_normalize, nearest_existing_directory,
-    resolved_path, select_populate_mode, stale_worktree_registrations, RepoContext,
+use super::add::select_populate_mode;
+use super::registry::{git_worktree_list, stale_worktree_registrations};
+use super::repo::{
+    absolute_path, default_worktree_path, discover_repo, enclosing_working_tree, filesystem_name,
+    lexical_normalize, nearest_existing_directory, resolved_path,
 };
+use super::{cow, emit, RepoContext};
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::fs;
