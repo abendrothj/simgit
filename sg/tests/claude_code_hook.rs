@@ -2317,3 +2317,37 @@ fn marketplace_ref_names_a_release_no_newer_than_the_crate() {
         "ref {reference} is newer than the crate"
     );
 }
+
+/// The hook runs on every subagent's start and end: its `git` calls may fall
+/// but never quietly grow. The listings left are guards: one before the
+/// branch claim, a recheck under it, and after teardown, whether the branch
+/// is checked out elsewhere.
+#[test]
+fn hook_keeps_its_git_calls() {
+    let fixture = HookFixture::new();
+    let log = fixture.root.join("hook-git.log");
+    let env = git_wrapper(&fixture, &format!("echo \"$*\" >> '{}'\n", log.display()));
+    let calls = |payload: Value| {
+        let _ = fs::remove_file(&log);
+        let output = hook_with_env(&fixture, &[], &payload, &env);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        (output, fs::read_to_string(&log).unwrap_or_default())
+    };
+    let (created, create) = calls(create_payload("counted", &fixture.repo));
+    let path = stdout_path(&created);
+    let (_, reuse) = calls(create_payload("counted", &fixture.repo));
+    let (_, remove) = calls(remove_payload(&path));
+    for (name, log, limit) in [
+        ("create", &create, HOOK_CREATE_GIT_CALLS),
+        ("reuse", &reuse, HOOK_REUSE_GIT_CALLS),
+        ("remove", &remove, HOOK_REMOVE_GIT_CALLS),
+    ] {
+        let count = log.lines().count();
+        assert!(count <= limit, "{name} made {count} calls:\n{log}");
+    }
+}
+
+/// The counts `hook_keeps_its_git_calls` holds the hook to, in checkout mode.
+const HOOK_CREATE_GIT_CALLS: usize = 16;
+const HOOK_REUSE_GIT_CALLS: usize = 4;
+const HOOK_REMOVE_GIT_CALLS: usize = 11;

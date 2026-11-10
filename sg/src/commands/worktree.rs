@@ -32,13 +32,14 @@ pub use locks::{unlock, WorktreeUnlock};
 pub use maintenance::{gc, prune, repair, WorktreeGc, WorktreePrune};
 
 use locks::{
-    allocation_lock_reason, ensure_unlocked, lock_present, lock_state, refuse_unfinished,
-    unfinished, unfinished_worktree, BranchClaim, PathClaim, RegistryLock, WorktreeLock,
+    allocation_lock_reason, ensure_unlocked, lock_present, lock_state, read_lock,
+    refuse_unfinished, remove_read_lock, unfinished, unfinished_worktree, worktree_lock_path,
+    BranchClaim, PathClaim, RegistryLock, WorktreeLock,
 };
 use maintenance::{delete_branch_unguarded, delete_local_branch, registered_worktree};
 
 #[cfg(test)]
-use locks::{lock_owner_of, lock_owner_pid, process_alive, worktree_lock_path};
+use locks::{lock_owner_of, lock_owner_pid, process_alive};
 #[cfg(test)]
 use maintenance::{prune_baseline_cache, prune_git_worktrees, run_gc};
 
@@ -158,6 +159,9 @@ pub fn add(mut args: WorktreeAdd, json: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = discover_repo(&cwd)?;
     let created = create_worktree(&repo, &cwd, &args, None)?;
+    // Only now, with every marker written: until then gc and prune must see
+    // the worktree locked. No test can stretch this gap since the release
+    // stopped running git, so keep it last.
     release_allocation_lock(&repo, &created.target)?;
 
     if json {
@@ -495,12 +499,19 @@ fn register_worktree(
 /// Drop the lock `register_worktree` took, once the worktree is whole or its
 /// allocation has failed.
 fn release_allocation_lock(repo: &RepoContext, target: &Path) -> Result<()> {
+    // Remove this allocation's own lock file directly. `git worktree unlock`
+    // does no more, but reads every registration to find it, under the
+    // registry lock, which made each allocation wait on all the others.
     (|| {
-        let mut command = git_common_command(repo);
-        command.args(["worktree", "unlock"]).arg(target);
-        // Git finds the worktree by reading every registration.
-        let _registry = RegistryLock::shared(repo)?;
-        run_command(&mut command, "unlock allocated worktree")
+        let path = worktree_lock_path(repo, target)?;
+        match read_lock(&path)? {
+            None => Ok(()),
+            Some(read) if read.contents.trim_end() == allocation_lock_reason() => {
+                remove_read_lock(&path, &read, &target.display().to_string())
+            }
+            // Cleared by hand and locked again since: that lock is not ours.
+            Some(_) => bail!("{} is now locked by something else", target.display()),
+        }
     })()
     .with_context(|| still_locked(target))
 }
@@ -1459,7 +1470,9 @@ pub fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     }
     let cwd = std::env::current_dir()?;
     let repo = discover_repo(&cwd)?;
-    let (target, gone) = match lookup_worktree_target(&repo, args.target.as_deref())? {
+    // One listing serves the lookup and the entry: each reads every registration.
+    let entries = list_worktrees(&repo)?;
+    let (target, gone) = match lookup_worktree_target_in(&repo, &entries, args.target.as_deref())? {
         TargetLookup::Found(path) => (path, false),
         // Deleted by hand: only the registration is left, and it still names
         // the branch for --delete-branch.
@@ -1472,9 +1485,7 @@ pub fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         // much it looks like one: finishing that teardown is its own path.
         TargetLookup::Stray(path) => return remove_stray(&path, &args, json),
     };
-    let entry = list_worktrees(&repo)?
-        .into_iter()
-        .find(|entry| entry.path == target);
+    let entry = entries.into_iter().find(|entry| entry.path == target);
     // Git cannot remove the main worktree, so refuse before --commit commits
     // the user's files in it and teardown then fails. First, so a main entry
     // with no lock to find (a bare repository) is still named as such.
@@ -1712,24 +1723,41 @@ enum TargetLookup {
 /// name, or (when omitted) the worktree containing the current directory — to
 /// an absolute worktree path.
 fn lookup_worktree_target(repo: &RepoContext, target: Option<&str>) -> Result<TargetLookup> {
+    // No target is the worktree the caller stands in: no listing, which a
+    // broken registration elsewhere could make fail.
+    if target.is_none() {
+        return Ok(TargetLookup::Found(repo.top_level.clone()));
+    }
+    lookup_worktree_target_in(repo, &list_worktrees(repo)?, target)
+}
+
+/// `lookup_worktree_target` against a listing of the registry already made,
+/// so a caller that needs the entry too lists it once.
+fn lookup_worktree_target_in(
+    repo: &RepoContext,
+    entries: &[WorktreeEntry],
+    target: Option<&str>,
+) -> Result<TargetLookup> {
     let Some(spec) = target else {
         return Ok(TargetLookup::Found(repo.top_level.clone()));
     };
     let as_path = absolute_path(PathBuf::from(spec))?;
     let canonical = canonical_path(&as_path);
     let stray = if as_path.exists() {
-        if is_registered_worktree(repo, &canonical)? {
+        if is_registered_worktree(repo, entries, &canonical) {
             return Ok(TargetLookup::Found(canonical));
         }
         // An unregistered directory must not shadow a branch of the same name,
         // so it is remembered rather than returned here.
         Some(canonical)
-    } else if registration_gone(repo, &canonical) && is_registered_worktree(repo, &canonical)? {
+    } else if registration_gone(repo, &canonical)
+        && is_registered_worktree(repo, entries, &canonical)
+    {
         return Ok(TargetLookup::Gone(canonical));
     } else {
         None
     };
-    if let Some(path) = worktree_path_for_branch(repo, spec)? {
+    if let Some(path) = path_for_branch(entries, spec) {
         return Ok(if registration_gone(repo, &path) {
             TargetLookup::Gone(path)
         } else {
@@ -1751,14 +1779,11 @@ fn lookup_worktree_target(repo: &RepoContext, target: Option<&str>) -> Result<Ta
 /// registration but could not unlink the directory leaves a shell behind, and
 /// treating that as a live worktree makes every later command interrogate a
 /// checkout Git has already forgotten.
-fn is_registered_worktree(repo: &RepoContext, path: &Path) -> Result<bool> {
-    if list_worktrees(repo)?
+fn is_registered_worktree(repo: &RepoContext, entries: &[WorktreeEntry], path: &Path) -> bool {
+    entries
         .iter()
         .any(|entry| canonical_path(&entry.path).as_path() == path)
-    {
-        return Ok(true);
-    }
-    Ok(overlay::state(repo, path).is_some())
+        || overlay::state(repo, path).is_some()
 }
 
 /// Whether a worktree's directory is gone while its registration stays: what
@@ -1770,11 +1795,16 @@ fn registration_gone(repo: &RepoContext, path: &Path) -> bool {
 
 /// Find the worktree checked out on `branch`, if any, via Git's registry.
 fn worktree_path_for_branch(repo: &RepoContext, branch: &str) -> Result<Option<PathBuf>> {
+    Ok(path_for_branch(&list_worktrees(repo)?, branch))
+}
+
+/// `worktree_path_for_branch` against a listing already made.
+fn path_for_branch(entries: &[WorktreeEntry], branch: &str) -> Option<PathBuf> {
     let wanted = format!("refs/heads/{branch}");
-    Ok(list_worktrees(repo)?
-        .into_iter()
+    entries
+        .iter()
         .find(|entry| entry.branch.as_deref() == Some(wanted.as_str()))
-        .map(|entry| entry.path))
+        .map(|entry| entry.path.clone())
 }
 
 fn worktree_description(
@@ -1927,10 +1957,8 @@ fn parse_worktree_list(stdout: &[u8]) -> Vec<WorktreeEntry> {
 }
 
 fn worktree_admin_dir(worktree: &Path) -> Result<PathBuf> {
-    Ok(PathBuf::from(git_path_output(
-        worktree,
-        ["rev-parse", "--absolute-git-dir"],
-    )?))
+    overlay::live_git_dir(worktree)
+        .with_context(|| format!("{} names no git dir", worktree.display()))
 }
 
 fn mark_ephemeral(worktree: &Path) -> Result<()> {
@@ -2001,10 +2029,10 @@ fn listed(repo: &RepoContext, admins: &HashMap<PathBuf, PathBuf>, worktree: &Pat
     }
 }
 
-fn is_ephemeral(repo: &RepoContext, worktree: &Path) -> bool {
-    overlay::admin_dir(repo, worktree)
-        .map(|admin| admin.join("simgit-ephemeral").is_file())
-        .unwrap_or(false)
+/// Whether the worktree whose admin dir is `admin` is marked ephemeral; one
+/// with no admin dir is not.
+fn admin_is_ephemeral(admin: Option<&Path>) -> bool {
+    admin.is_some_and(|admin| admin.join("simgit-ephemeral").is_file())
 }
 
 /// Time since the worktree was last touched, approximated by the mtime of its
@@ -2012,8 +2040,9 @@ fn is_ephemeral(repo: &RepoContext, worktree: &Path) -> bool {
 /// The index is found through the registry, so a deleted worktree ages too.
 /// With neither to read nothing records activity, so it counts as idle; gc's
 /// lock and uncommitted-work checks still decide whether it can go.
-fn worktree_idle(repo: &RepoContext, worktree: &Path) -> Duration {
-    let index = overlay::admin_dir(repo, worktree).map(|a| a.join("index"));
+/// `admin` is the worktree's admin dir, `None` when it has none.
+fn worktree_idle(admin: Option<&Path>, worktree: &Path) -> Duration {
+    let index = admin.map(|a| a.join("index"));
     let probe = match index {
         Some(index) if index.is_file() => index,
         _ => worktree.to_path_buf(),
@@ -2224,13 +2253,28 @@ fn worktree_dirty(worktree: &Path) -> Result<bool> {
 /// The HEAD comes from the registry, never from the worktree's own gitfile: a
 /// missing gitfile makes git walk up and measure the main checkout instead.
 fn refuse_unreached_head(repo: &RepoContext, target: &Path, caller: Caller) -> Result<()> {
-    let entry = list_worktrees(repo)?
-        .into_iter()
-        .find(|entry| entry.path == target)
+    // Read this one registration's HEAD rather than listing every worktree:
+    // gc runs this once per worktree it reaps.
+    let admin = overlay::admin_dir(repo, target)
         .with_context(|| format!("{} is not a registered worktree", target.display()))?;
-    if entry.branch.is_some() || overlay::branch(repo, target).is_some() {
+    let head = match admin_head(repo, &admin).with_context(|| {
+        format!(
+            "cannot tell whether {} holds unreached commits",
+            target.display()
+        )
+    })? {
+        AdminHead::Branch(_) => return Ok(()),
+        AdminHead::Detached(head) => head,
+    };
+    if overlay::branch(repo, target).is_some() {
         return Ok(());
     }
+    let entry = WorktreeEntry {
+        path: target.to_path_buf(),
+        head: Some(head),
+        branch: None,
+        is_main: false,
+    };
     refuse_unreached_entry(repo, &entry, &caller.then_remove(repo, target))
 }
 
@@ -2323,16 +2367,8 @@ fn emit(value: &serde_json::Value) {
 }
 
 fn discover_repo(path: &Path) -> Result<RepoContext> {
-    let top_level = git_path_output(path, ["rev-parse", "--show-toplevel"])
-        .context("not in a Git working tree")?;
-    let common = git_path_output(
-        path,
-        ["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .context("resolve Git common directory")?;
-    let top_level = PathBuf::from(top_level);
-    let common_git_dir = PathBuf::from(common);
-    let main_worktree = find_main_worktree(path, &top_level, &common_git_dir);
+    let (top_level, common_git_dir) = working_tree_at(path)?;
+    let main_worktree = find_main_worktree(&top_level, &common_git_dir);
     let superproject = find_superproject(&main_worktree, &common_git_dir);
     Ok(RepoContext {
         top_level,
@@ -2340,6 +2376,26 @@ fn discover_repo(path: &Path) -> Result<RepoContext> {
         main_worktree,
         superproject,
     })
+}
+
+/// The top level of the working tree at `path` and its repository's common
+/// git dir, from one git: every command starts here.
+fn working_tree_at(path: &Path) -> Result<(PathBuf, PathBuf)> {
+    let found = git_path_output(
+        path,
+        [
+            "rev-parse",
+            "--show-toplevel",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+    )
+    .context("not in a Git working tree")?;
+    let mut lines = found.lines();
+    let (Some(top_level), Some(common)) = (lines.next(), lines.next()) else {
+        bail!("not in a Git working tree: git rev-parse printed {found:?}");
+    };
+    Ok((PathBuf::from(top_level), PathBuf::from(common)))
 }
 
 /// The outermost superproject of the submodule checked out at `main_worktree`,
@@ -2380,7 +2436,7 @@ fn find_superproject(main_worktree: &Path, common_git_dir: &Path) -> Option<Supe
         ["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
     .ok()?;
-    let super_main = find_main_worktree(&working_tree, &working_tree, Path::new(&common));
+    let super_main = find_main_worktree(&working_tree, Path::new(&common));
     let relative = main_worktree.strip_prefix(&working_tree).ok()?;
     let module_dir = format!(
         "{}-{}",
@@ -2404,7 +2460,7 @@ fn find_superproject(main_worktree: &Path, common_git_dir: &Path) -> Option<Supe
 /// it is unset, and fails in a bare repository. With no main working tree (a
 /// bare repository not called `.git`), or none recorded (a linked worktree of a
 /// `--separate-git-dir` repository), this is the common git dir, as before.
-fn find_main_worktree(path: &Path, top_level: &Path, common_git_dir: &Path) -> PathBuf {
+fn find_main_worktree(top_level: &Path, common_git_dir: &Path) -> PathBuf {
     let common = canonical_path(common_git_dir);
     let configured = Command::new("git")
         .current_dir(common_git_dir)
@@ -2423,8 +2479,9 @@ fn find_main_worktree(path: &Path, top_level: &Path, common_git_dir: &Path) -> P
             .parent()
             .unwrap_or(common_git_dir)
             .to_path_buf()
-    } else if worktree_admin_dir(path).is_ok_and(|admin| canonical_path(&admin) == common) {
-        // Standing in the main working tree of a `--separate-git-dir` repository.
+    } else if worktree_admin_dir(top_level).is_ok_and(|admin| canonical_path(&admin) == common) {
+        // Standing in the main working tree of a `--separate-git-dir`
+        // repository. Ask its top level, where `.git` is: a subdirectory has none.
         top_level.to_path_buf()
     } else {
         common_git_dir.to_path_buf()

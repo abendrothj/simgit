@@ -1,4 +1,4 @@
-use super::locks::{process_alive, temp_owner};
+use super::locks::{process_alive, temp_owner, BaselineBuildClaim};
 use super::{run_command, state_dir, RepoContext};
 use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
@@ -225,11 +225,7 @@ pub(super) fn ensure_baseline(repo: &RepoContext, commit: &str) -> Result<Baseli
 
     let lock = BaselineCacheLock::shared(&repo.common_git_dir)?;
     if is_published(&final_dir) {
-        touch(&final_dir.join("ready"))?;
-        return Ok(Baseline {
-            tree: final_tree,
-            _lock: lock,
-        });
+        return reuse_published(&final_dir, final_tree, lock);
     }
     // Publishing is atomic and `prune` only moves baselines while it holds
     // the lock exclusively, so under the shared lock a partial entry is damage.
@@ -241,6 +237,15 @@ pub(super) fn ensure_baseline(repo: &RepoContext, commit: &str) -> Result<Baseli
     }
     drop(lock);
 
+    // Build once: whoever holds the claim builds, and those waiting behind it
+    // find the published baseline when they get it.
+    let _build = BaselineBuildClaim::acquire(repo, commit)?;
+    let lock = BaselineCacheLock::shared(&repo.common_git_dir)?;
+    if is_published(&final_dir) {
+        return reuse_published(&final_dir, final_tree, lock);
+    }
+    drop(lock);
+
     fs::create_dir_all(&root)?;
     let temporary = root.join(format!(".{commit}.{}", Uuid::new_v4()));
     let cache = temporary.join("cache");
@@ -248,7 +253,14 @@ pub(super) fn ensure_baseline(repo: &RepoContext, commit: &str) -> Result<Baseli
     let built = fs::create_dir_all(&temporary_tree)
         .map_err(anyhow::Error::from)
         .and_then(|()| materialize_baseline(repo, commit, &temporary_tree))
-        .and_then(|()| Ok(fs::write(cache.join("ready"), commit)?));
+        .and_then(|()| Ok(fs::write(cache.join("ready"), commit)?))
+        // A published baseline never changes, so its size is measured once.
+        .and_then(|()| {
+            Ok(fs::write(
+                cache.join("size"),
+                tree_size(&cache).to_string(),
+            )?)
+        });
     if let Err(error) = built {
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
@@ -272,6 +284,12 @@ pub(super) fn ensure_baseline(repo: &RepoContext, commit: &str) -> Result<Baseli
         tree: final_tree,
         _lock: lock,
     })
+}
+
+/// Hand out a published baseline, marking it used for `prune`'s idle age.
+fn reuse_published(final_dir: &Path, tree: PathBuf, lock: BaselineCacheLock) -> Result<Baseline> {
+    touch(&final_dir.join("ready"))?;
+    Ok(Baseline { tree, _lock: lock })
 }
 
 fn materialize_baseline(repo: &RepoContext, commit: &str, destination: &Path) -> Result<()> {
@@ -497,7 +515,7 @@ pub(super) fn baseline_inventory(common_git_dir: &Path) -> Result<BaselineInvent
     };
     for entry in entries {
         let entry = entry?;
-        retained_bytes += tree_size(&entry.path());
+        retained_bytes += baseline_size(&entry.path());
         retained.push(entry.file_name().to_string_lossy().into_owned());
     }
     retained.sort();
@@ -570,13 +588,13 @@ pub(super) fn prune_baselines(
                 doomed.push(path);
                 outcome.removed.push(name);
             } else {
-                outcome.retained_bytes += tree_size(&path);
+                outcome.retained_bytes += baseline_size(&path);
                 outcome.retained.push(name);
             }
         } else if all || old || (ready.is_file() && is_object_id(&name) && !reachable(&name)?) {
             candidates.push((name, path));
         } else {
-            outcome.retained_bytes += tree_size(&path);
+            outcome.retained_bytes += baseline_size(&path);
             outcome.retained.push(name);
         }
     }
@@ -591,7 +609,7 @@ pub(super) fn prune_baselines(
             }
             outcome.cache_busy = true;
             for (name, path) in candidates {
-                outcome.retained_bytes += tree_size(&path);
+                outcome.retained_bytes += baseline_size(&path);
                 outcome.retained.push(name);
             }
             return finish_pruning(outcome, doomed);
@@ -601,7 +619,7 @@ pub(super) fn prune_baselines(
         let protected = protected();
         for (name, path) in candidates {
             if protected.contains(&path.join("tree")) {
-                outcome.retained_bytes += tree_size(&path);
+                outcome.retained_bytes += baseline_size(&path);
                 outcome.retained.push(name);
                 continue;
             }
@@ -650,6 +668,16 @@ fn is_object_id(name: &str) -> bool {
 }
 
 /// Bytes allocated under `path`, skipping anything unreadable.
+/// The disk a cached baseline takes: the size recorded when it was published,
+/// or, for one published before sizes were recorded or still being built, a
+/// walk of its files.
+fn baseline_size(path: &Path) -> u64 {
+    fs::read_to_string(path.join("size"))
+        .ok()
+        .and_then(|recorded| recorded.trim().parse().ok())
+        .unwrap_or_else(|| tree_size(path))
+}
+
 fn tree_size(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {
         return 0;

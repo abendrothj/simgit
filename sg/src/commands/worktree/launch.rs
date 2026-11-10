@@ -6,8 +6,9 @@ use super::{
     discover_repo, drop_deleted_registration, ensure_unlocked, git_failure, git_output_common,
     list_worktrees, mark_ephemeral, nearest_existing_directory, overlay, refuse_occupied,
     refuse_sparse_overlay, refuse_unfinished, registration_gone, remove_file_if_present,
-    select_populate_mode, shell_quote, short_branch, worktree_admin_dir, worktree_description,
-    BranchClaim, Caller, CreatedWorktree, RepoContext, WorktreeAdd, WorktreeEntry, WorktreeLock,
+    select_populate_mode, shell_quote, short_branch, working_tree_at, worktree_admin_dir,
+    worktree_description, BranchClaim, Caller, CreatedWorktree, RepoContext, WorktreeAdd,
+    WorktreeEntry, WorktreeLock,
 };
 use crate::{kill, signal};
 use anyhow::{bail, Context, Result};
@@ -300,9 +301,9 @@ pub fn run_in_worktree(args: WorktreeRun, json: bool) -> Result<()> {
         }
     };
     overlay::repair(&repo, &target)?;
-    let actual = discover_repo(&target)?;
-    if actual.common_git_dir != repo.common_git_dir
-        || actual.top_level.canonicalize()? != target.canonicalize()?
+    let (top_level, common_git_dir) = working_tree_at(&target)?;
+    if common_git_dir != repo.common_git_dir
+        || top_level.canonicalize()? != target.canonicalize()?
     {
         bail!("registered worktree is unavailable: {}", target.display());
     }

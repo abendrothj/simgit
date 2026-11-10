@@ -3565,33 +3565,55 @@ fn remove_and_gc_keep_staged_work_of_a_deleted_worktree() {
 /// even when the index matches HEAD.
 #[test]
 fn a_deleted_worktree_with_an_operation_in_progress_counts_as_dirty() {
-    let fixture = Fixture::new();
-    for marker in [
-        "MERGE_HEAD",
-        "CHERRY_PICK_HEAD",
-        "REVERT_HEAD",
-        "rebase-merge",
-        "rebase-apply",
-        "sequencer",
-    ] {
-        fixture.create(&["--ephemeral"]);
-        let head = rev_parse(&fixture.worktree, "HEAD");
-        let admin = std::path::PathBuf::from(registration(&fixture, &fixture.worktree));
-        if marker.ends_with("_HEAD") {
-            fs::write(admin.join(marker), format!("{head}\n")).unwrap();
-        } else {
-            fs::create_dir(admin.join(marker)).unwrap();
-        }
-        fs::remove_dir_all(&fixture.worktree).unwrap();
+    deleted_worktree_with_marker_counts_as_dirty("MERGE_HEAD");
+}
 
-        assert_deleted_worktree_kept_as_dirty(&fixture, "chat/test");
-        success(&fixture.run(&["remove", "chat/test", "--discard-dirty"]));
-        assert_eq!(
-            registered_head(&fixture, &fixture.worktree),
-            None,
-            "{marker}"
-        );
+#[test]
+fn a_deleted_worktree_mid_cherry_pick_counts_as_dirty() {
+    deleted_worktree_with_marker_counts_as_dirty("CHERRY_PICK_HEAD");
+}
+
+#[test]
+fn a_deleted_worktree_mid_revert_counts_as_dirty() {
+    deleted_worktree_with_marker_counts_as_dirty("REVERT_HEAD");
+}
+
+#[test]
+fn a_deleted_worktree_mid_rebase_merge_counts_as_dirty() {
+    deleted_worktree_with_marker_counts_as_dirty("rebase-merge");
+}
+
+#[test]
+fn a_deleted_worktree_mid_rebase_apply_counts_as_dirty() {
+    deleted_worktree_with_marker_counts_as_dirty("rebase-apply");
+}
+
+#[test]
+fn a_deleted_worktree_mid_sequencer_counts_as_dirty() {
+    deleted_worktree_with_marker_counts_as_dirty("sequencer");
+}
+
+/// One test per marker, so they run in parallel: each is kept as dirty until
+/// `--discard-dirty`, which then drops it.
+fn deleted_worktree_with_marker_counts_as_dirty(marker: &str) {
+    let fixture = Fixture::new();
+    fixture.create(&["--ephemeral"]);
+    let head = rev_parse(&fixture.worktree, "HEAD");
+    let admin = std::path::PathBuf::from(registration(&fixture, &fixture.worktree));
+    if marker.ends_with("_HEAD") {
+        fs::write(admin.join(marker), format!("{head}\n")).unwrap();
+    } else {
+        fs::create_dir(admin.join(marker)).unwrap();
     }
+    fs::remove_dir_all(&fixture.worktree).unwrap();
+
+    assert_deleted_worktree_kept_as_dirty(&fixture, "chat/test");
+    success(&fixture.run(&["remove", "chat/test", "--discard-dirty"]));
+    assert_eq!(
+        registered_head(&fixture, &fixture.worktree),
+        None,
+        "{marker}"
+    );
 }
 
 /// On an unborn HEAD there is no commit to compare with: anything in the
@@ -3804,7 +3826,7 @@ fn prunes_keep_an_unreached_registration_whose_lock_is_released_meanwhile() {
         let log = fs::read_to_string(&log).unwrap_or_default();
         log.lines().position(|logged| logged == line)
     };
-    // `discover_repo`'s three rev-parse calls come before the registry lock:
+    // `discover_repo`'s two rev-parse calls come before the registry lock:
     // once they are done, a prune without that lock would reach Git at once.
     let discovered = format!("{} discovered", second.id());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -3813,7 +3835,7 @@ fn prunes_keep_an_unreached_registration_whose_lock_is_released_meanwhile() {
         .lines()
         .filter(|line| *line == discovered)
         .count()
-        < 3
+        < 2
     {
         assert!(
             std::time::Instant::now() < deadline,
@@ -4079,9 +4101,11 @@ fn remove_and_gc_keep_a_detached_worktree_when_git_cannot_answer() {
 ///
 /// gc runs beside them too, with `--include-persistent --dry-run`, so the
 /// allocation lock is all that keeps a racer from it. The wrapper stretches
-/// the moments just before and after each allocation drops that lock, and gc
-/// must name a racer as reapable only once its allocation has written
-/// everything, its mode marker included.
+/// the end of each allocation, after its clean check: gc must meet that lock
+/// and must not name a racer as reapable before its allocation is complete.
+/// Writing the markers and dropping the lock follow with no git call between
+/// them, so no wrapper can separate the two; that order is kept by the code
+/// (`add` releases last), not pinned here.
 #[test]
 fn allocation_survives_a_concurrent_prune() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -4104,11 +4128,10 @@ fn allocation_survives_a_concurrent_prune() {
     };
     let unlock = git_wrapper(
         &fixture,
-        "if [ \"$2\" = worktree ] && [ \"$3\" = unlock ]; then\n\
-           sleep 0.2\n\
+        "if [ \"$3\" = status ]; then\n\
            \"$SIMGIT_TEST_REAL_GIT\" \"$@\"\n\
            status=$?\n\
-           sleep 0.2\n\
+           sleep 0.1\n\
            exit $status\n\
          fi\n",
     );
@@ -4132,7 +4155,7 @@ fn allocation_survives_a_concurrent_prune() {
             }
             outputs
         });
-        // Apart from prune, which waits for each unlock to finish.
+        // Apart from prune.
         let collector = scope.spawn(|| {
             let mut outputs = Vec::new();
             let (mut met_lock, mut met_reapable) = (false, false);
@@ -4617,29 +4640,34 @@ fn failed_rollback_keeps_the_original_cause() {
 fn a_failing_hook_stays_the_cause_when_unlock_fails_too() {
     use std::os::unix::fs::PermissionsExt;
 
+    if running_as_root() {
+        eprintln!("skipped: root ignores directory permissions");
+        return;
+    }
     let fixture = Fixture::new();
+    // The allocation removes its own lock file, so a hook that leaves its
+    // registration unwritable makes that release fail after the hook does.
     let hook = fixture.repo.join(".git/hooks/post-checkout");
     fs::write(
         &hook,
-        "#!/bin/sh\necho 'simulated hook failure' >&2\nexit 1\n",
+        "#!/bin/sh\nchmod a-w \"$(git rev-parse --absolute-git-dir)\"\n\
+         echo 'simulated hook failure' >&2\nexit 1\n",
     )
     .unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
-    let env = git_wrapper(
-        &fixture,
-        "if [ \"$2\" = worktree ] && [ \"$3\" = unlock ]; then\n\
-           echo 'fatal: simulated unlock failure' >&2\n\
-           exit 1\n\
-         fi\n",
-    );
 
     let failed = fixture
         .command()
-        .envs(env)
         .args(["add", "agent/hooked", "--path"])
         .arg(&fixture.worktree)
         .output()
         .unwrap();
+    for admin in fs::read_dir(fixture.repo.join(".git/worktrees"))
+        .unwrap()
+        .flatten()
+    {
+        fs::set_permissions(admin.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(!failed.status.success(), "{stderr}");
     assert!(
@@ -4897,6 +4925,31 @@ fn default_path_with_separate_git_dir() {
             .canonicalize()
             .unwrap()
             .join(".simgit/checkout")
+    );
+    // The same from a subdirectory, where the checkout's `.git` is a level up.
+    let sub = checkout.join("sub");
+    fs::create_dir(&sub).unwrap();
+    assert_eq!(
+        default_parent(&fixture, &sub, "agent/deeper"),
+        fixture
+            .root
+            .canonicalize()
+            .unwrap()
+            .join(".simgit/checkout")
+    );
+    let doctor: serde_json::Value = serde_json::from_slice(
+        &fixture
+            .command()
+            .current_dir(&sub)
+            .args(["--json", "doctor"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        doctor["repository_details"]["is_main_worktree"], true,
+        "{doctor}"
     );
 }
 
@@ -5730,4 +5783,358 @@ fn gc_cannot_reap_a_fresh_ephemeral_worktree_before_run_starts_its_command() {
     // gc saw the worktree marked ephemeral and still locked.
     assert!(gc.contains("skipped (locked)"), "{gc}");
     assert!(path.exists());
+}
+
+/// Ten agents starting on a commit with no baseline yet wait for one build
+/// instead of each checking out the whole tree and throwing all but one away.
+#[test]
+fn concurrent_first_allocations_build_one_baseline() {
+    let fixture = Fixture::new();
+    let log = fixture.root.join("checkout-index.log");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "case \" $* \" in *' checkout-index '*) echo >> '{}' ;; esac\n",
+            log.display()
+        ),
+    );
+    let children: Vec<_> = (0..10)
+        .map(|index| {
+            fixture
+                .command()
+                .envs(env.iter().cloned())
+                .env_remove("SIMGIT_POPULATE")
+                .args(["--json", "add", &format!("agent/b{index}")])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let added: Vec<serde_json::Value> = children
+        .into_iter()
+        .map(|child| {
+            let output = child.wait_with_output().unwrap();
+            success(&output);
+            serde_json::from_slice(&output.stdout).unwrap()
+        })
+        .collect();
+    if added
+        .iter()
+        .all(|worktree| worktree["mode"] == "git-checkout")
+    {
+        eprintln!("skipped: no backend here uses a baseline");
+        return;
+    }
+    let builds = fs::read_to_string(&log).unwrap_or_default().lines().count();
+    assert_eq!(builds, 1, "baseline checkouts: {builds}");
+    for worktree in &added {
+        let path = worktree["path"].as_str().unwrap();
+        let status = git_stdout(Path::new(path), &["status", "--porcelain"]);
+        assert!(status.trim().is_empty(), "{path}: {status}");
+    }
+}
+
+/// `gc` reads each worktree's markers and lock from the registry it already
+/// listed: a `git` per worktree before it decides anything made a routine
+/// `gc` take seconds at a few hundred worktrees.
+#[test]
+fn gc_runs_no_git_per_worktree() {
+    let fixture = Fixture::new();
+    let log = fixture.root.join("gc-git.log");
+    let env = git_wrapper(&fixture, &format!("echo >> '{}'\n", log.display()));
+    let mut made = 0;
+    let mut gits_at = |count: usize| {
+        while made < count {
+            let name = format!("agent/g{made}");
+            // Half persistent, half ephemeral and recent, so every check runs.
+            let mut args = vec!["add", name.as_str()];
+            if made % 2 == 1 {
+                args.push("--ephemeral");
+            }
+            success(&fixture.run(&args));
+            made += 1;
+        }
+        let _ = fs::remove_file(&log);
+        let output = fixture
+            .command()
+            .envs(env.iter().cloned())
+            .args(["--json", "gc"])
+            .output()
+            .unwrap();
+        success(&output);
+        fs::read_to_string(&log).unwrap_or_default().lines().count()
+    };
+    let few = gits_at(4);
+    let many = gits_at(16);
+    assert_eq!(
+        few, many,
+        "gc ran {few} git calls at 4 worktrees, {many} at 16"
+    );
+}
+
+/// Reaping is linear: teardown rechecks one registration's HEAD instead of
+/// listing them all, and the reaped branches go in one `git branch -d`.
+#[test]
+fn gc_reaps_with_one_listing_and_one_branch_deletion() {
+    let fixture = Fixture::new();
+    for index in 0..6 {
+        success(&fixture.run(&["add", &format!("agent/r{index}"), "--ephemeral"]));
+    }
+    // One branch holds a commit nothing else has: the batch must keep it.
+    let listed: serde_json::Value =
+        serde_json::from_slice(&fixture.run(&["--json", "list"]).stdout).unwrap();
+    let unmerged = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|worktree| worktree["branch"] == "refs/heads/agent/r0")
+        .map(|worktree| std::path::PathBuf::from(worktree["worktree"].as_str().unwrap()))
+        .unwrap();
+    fs::write(unmerged.join("only-here"), "x\n").unwrap();
+    git(&unmerged, &["add", "only-here"]);
+    git(&unmerged, &["commit", "-qm", "only here"]);
+    // A tag of the same name makes Git shorten the branch to `heads/agent/r0`.
+    git(&fixture.repo, &["tag", "agent/r0"]);
+    let log = fixture.root.join("reap-git.log");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "case \" $* \" in *' worktree list '*) echo list >> '{0}' ;; *' branch -d '*|*' branch -D '*) echo branch >> '{0}' ;; esac\n",
+            log.display()
+        ),
+    );
+    let output = fixture
+        .command()
+        .envs(env.iter().cloned())
+        .args(["--json", "gc", "--older-than", "0s", "--delete-branches"])
+        .output()
+        .unwrap();
+    success(&output);
+    let gc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(gc["reaped"].as_array().unwrap().len(), 6, "{gc}");
+    assert_eq!(gc["deleted_branches"].as_array().unwrap().len(), 5, "{gc}");
+    assert_eq!(
+        gc["retained_branches"],
+        serde_json::json!(["agent/r0"]),
+        "{gc}"
+    );
+    assert!(
+        !git_stdout(&fixture.repo, &["branch", "--list", "agent/r0"])
+            .trim()
+            .is_empty()
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(calls.matches("list").count(), 1, "{calls}");
+    assert_eq!(calls.matches("branch").count(), 1, "{calls}");
+}
+
+/// `remove` finds its target and that target's entry in one listing of the
+/// registry: each listing reads every registration.
+#[test]
+fn remove_lists_the_registry_once() {
+    let fixture = Fixture::new();
+    for index in 0..3 {
+        success(&fixture.run(&["add", &format!("agent/m{index}")]));
+    }
+    let log = fixture.root.join("remove-git.log");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "case \" $* \" in *' worktree list '*) echo list >> '{}' ;; esac\n",
+            log.display()
+        ),
+    );
+    let output = fixture
+        .command()
+        .envs(env.iter().cloned())
+        .args(["remove", "agent/m1", "--delete-branch"])
+        .output()
+        .unwrap();
+    success(&output);
+    let lists = fs::read_to_string(&log).unwrap_or_default().lines().count();
+    assert_eq!(lists, 1, "remove listed the registry {lists} times");
+    assert!(git_stdout(&fixture.repo, &["branch", "--list", "agent/m1"])
+        .trim()
+        .is_empty());
+}
+
+/// An allocation drops its own lock by removing the file it wrote: `git
+/// worktree unlock` would read every registration to find it, under the
+/// registry lock, so each `add` waited on every other.
+#[test]
+fn add_releases_its_lock_without_git() {
+    let fixture = Fixture::new();
+    let log = fixture.root.join("unlock-git.log");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "case \" $* \" in *' worktree unlock '*) echo unlock >> '{}' ;; esac\n",
+            log.display()
+        ),
+    );
+    let output = fixture
+        .command()
+        .envs(env.iter().cloned())
+        .args(["add", "agent/u"])
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(fs::read_to_string(&log).unwrap_or_default(), "");
+    let listed: Vec<serde_json::Value> =
+        serde_json::from_slice(&fixture.run(&["--json", "list"]).stdout).unwrap();
+    let added = listed
+        .iter()
+        .find(|worktree| worktree["branch"] == "refs/heads/agent/u")
+        .unwrap();
+    assert!(added.get("locked").is_none(), "{added}");
+}
+
+/// Every command pays for its `git` calls, and `add` and `run` sit on an
+/// agent's hot path: the counts may fall but never quietly grow.
+#[test]
+fn add_and_run_keep_their_git_calls() {
+    let fixture = Fixture::new();
+    let log = fixture.root.join("calls-git.log");
+    let env = git_wrapper(&fixture, &format!("echo \"$*\" >> '{}'\n", log.display()));
+    let calls = |args: &[&str]| {
+        let _ = fs::remove_file(&log);
+        let output = fixture
+            .command()
+            .envs(env.iter().cloned())
+            .args(args)
+            .output()
+            .unwrap();
+        success(&output);
+        fs::read_to_string(&log).unwrap_or_default()
+    };
+    let add = calls(&["add", "agent/c"]);
+    let run = calls(&["run", "agent/c", "--", "true"]);
+    let count = |log: &str| log.lines().count();
+    assert!(
+        count(&add) <= ADD_GIT_CALLS,
+        "add made {} calls:\n{add}",
+        count(&add)
+    );
+    assert!(
+        count(&run) <= RUN_GIT_CALLS,
+        "run made {} calls:\n{run}",
+        count(&run)
+    );
+}
+
+/// The counts `add_and_run_keep_their_git_calls` holds them to, in checkout mode.
+const ADD_GIT_CALLS: usize = 11;
+const RUN_GIT_CALLS: usize = 4;
+
+/// A published baseline never changes, so `doctor` and `prune` read the size
+/// recorded when it was published instead of walking every file of every
+/// baseline on each call. One published before sizes were recorded is still
+/// walked.
+#[test]
+fn baseline_sizes_come_from_the_record() {
+    let fixture = Fixture::new();
+    let added = fixture
+        .command()
+        .env_remove("SIMGIT_POPULATE")
+        .args(["--json", "add", "agent/sized"])
+        .output()
+        .unwrap();
+    success(&added);
+    let baselines = fixture.repo.join(".git/simgit/baselines");
+    let Some(baseline) = fs::read_dir(&baselines)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .map(|entry| entry.unwrap().path())
+    else {
+        eprintln!("skipped: no backend here uses a baseline");
+        return;
+    };
+    let bytes = || {
+        let doctor: serde_json::Value =
+            serde_json::from_slice(&fixture.run(&["--json", "doctor"]).stdout).unwrap();
+        doctor["baseline_cache"]["retained_bytes"].as_u64().unwrap()
+    };
+    let recorded = bytes();
+    assert!(recorded > 0);
+    // Not something a baseline ever sees; here it shows nothing walks it.
+    fs::write(baseline.join("tree/added-later"), vec![b'x'; 1 << 20]).unwrap();
+    assert_eq!(bytes(), recorded, "doctor walked the baseline");
+    fs::remove_file(baseline.join("size")).unwrap();
+    assert!(
+        bytes() > recorded,
+        "a baseline without a record must be walked"
+    );
+}
+
+/// Whether a cached baseline's commit is still reachable is one `rev-list`
+/// over every ref and worktree HEAD, not one `merge-base` per detached
+/// worktree, and gives the same answer.
+#[test]
+fn prune_checks_baseline_reachability_in_one_call() {
+    let fixture = Fixture::new();
+    let cow = |args: &[&str]| {
+        let output = fixture
+            .command()
+            .env_remove("SIMGIT_POPULATE")
+            .args(args)
+            .output()
+            .unwrap();
+        success(&output);
+    };
+    // A commit only a deleted branch reached, with a baseline built for it.
+    git(&fixture.repo, &["switch", "-qc", "gone"]);
+    fs::write(fixture.repo.join("gone.txt"), "x\n").unwrap();
+    git(&fixture.repo, &["add", "gone.txt"]);
+    git(&fixture.repo, &["commit", "-qm", "gone"]);
+    let gone = git_stdout(&fixture.repo, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    git(&fixture.repo, &["switch", "-q", "-"]);
+    cow(&["add", "agent/tmp", "--base", &gone]);
+    if !fixture
+        .repo
+        .join(".git/simgit/baselines")
+        .join(&gone)
+        .is_dir()
+    {
+        eprintln!("skipped: no backend here uses a baseline");
+        return;
+    }
+    cow(&[
+        "remove",
+        "agent/tmp",
+        "--delete-branch",
+        "--delete-unmerged",
+    ]);
+    git(&fixture.repo, &["branch", "-qD", "gone"]);
+    for index in 0..4 {
+        cow(&[
+            "add",
+            "--detach",
+            "--path",
+            &fixture.root.join(format!("d{index}")).display().to_string(),
+        ]);
+    }
+    let log = fixture.root.join("reach-git.log");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "case \" $* \" in *' merge-base '*) echo merge-base >> '{}' ;; esac\n",
+            log.display()
+        ),
+    );
+    let output = fixture
+        .command()
+        .envs(env.iter().cloned())
+        .args(["--json", "prune"])
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(fs::read_to_string(&log).unwrap_or_default(), "");
+    assert!(!fixture
+        .repo
+        .join(".git/simgit/baselines")
+        .join(&gone)
+        .exists());
 }

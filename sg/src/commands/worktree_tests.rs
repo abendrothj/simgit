@@ -617,8 +617,23 @@ fn pruning_preserves_baselines_used_by_active_overlays() -> Result<()> {
     let repo = discover_repo(&fixture.repo)?;
     let commit = resolve_commit(&repo, "HEAD")?;
     let baseline = cow::ensure_baseline(&repo, &commit)?.tree;
+    // Other tests in this process fork children (`pre_exec`), and one forked
+    // while this test held the cache lock holds a copy of it until it execs.
+    // `prune --all` rightly refuses a busy cache instead of waiting, so wait
+    // out that moment here; no simgit process forks while it holds a lock.
+    let prune_all = |protected: &dyn Fn() -> HashSet<PathBuf>| {
+        for _ in 0..100 {
+            match prune_baseline_cache(&repo, true, protected) {
+                Err(error) if format!("{error:#}").contains("in use by an allocation") => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                outcome => return outcome,
+            }
+        }
+        prune_baseline_cache(&repo, true, protected)
+    };
     let protected = || HashSet::from([baseline.clone()]);
-    let protected_run = prune_baseline_cache(&repo, true, &protected)?;
+    let protected_run = prune_all(&protected)?;
     assert!(protected_run.removed.is_empty());
     assert_eq!(protected_run.retained.len(), 1);
     assert!(
@@ -626,7 +641,7 @@ fn pruning_preserves_baselines_used_by_active_overlays() -> Result<()> {
         "a retained baseline must report its disk cost"
     );
     assert!(baseline.is_dir());
-    let full_run = prune_baseline_cache(&repo, true, &HashSet::new)?;
+    let full_run = prune_all(&HashSet::new)?;
     assert_eq!(full_run.removed.len(), 1);
     assert_eq!(full_run.retained_bytes, 0);
     assert!(!baseline.exists());
