@@ -7,6 +7,9 @@
 # Environment:
 #   SIMGIT_VERSION      release to install, vX.Y.Z or X.Y.Z (default: latest)
 #   SIMGIT_INSTALL_DIR  install directory (default: ~/.local/bin)
+#   SIMGIT_REQUIRE_SIGNATURE  refuse to install without minisign to check
+#                       the release signature (default: check it when
+#                       minisign is installed, else the checksum only)
 #
 # No Rust toolchain and no jq required. Unsupported platforms are reported
 # instead of silently falling back.
@@ -14,6 +17,8 @@
 set -eu
 
 REPO="abendrothj/simgit"
+# The key every release's SHA256SUMS is signed with (sg/minisign.pub).
+PUBLIC_KEY='RWTT6Elk+LYVr8TQtSOys9pS3bchCSi2iMkZCe+CkHLywqsls/rQxiNB'
 VERSION="${SIMGIT_VERSION:-}"
 INSTALL_DIR="${SIMGIT_INSTALL_DIR:-$HOME/.local/bin}"
 
@@ -80,6 +85,10 @@ else
 	die "need curl or wget to download $url"
 fi
 
+if ! command -v minisign >/dev/null 2>&1 && [ -n "${SIMGIT_REQUIRE_SIGNATURE:-}" ]; then
+	die "SIMGIT_REQUIRE_SIGNATURE is set but minisign is not installed"
+fi
+
 tmp="$(mktemp -d)"
 stage_simgit=
 stage_sg=
@@ -94,6 +103,16 @@ trap 'exit 1' HUP INT TERM
 printf 'simgit: downloading %s\n' "$url"
 fetch "$sums_url" "$tmp/SHA256SUMS" ||
 	die "could not download checksum manifest: $sums_url"
+# With minisign installed, the checksums count only once the release key's
+# signature over them verifies.
+if command -v minisign >/dev/null 2>&1; then
+	fetch "$sums_url.minisig" "$tmp/SHA256SUMS.minisig" ||
+		die "could not download the checksum signature: $sums_url.minisig"
+	minisign -V -P "$PUBLIC_KEY" -m "$tmp/SHA256SUMS" >/dev/null 2>&1 ||
+		die "SHA256SUMS does not match the release signature; refusing to install"
+else
+	printf 'simgit: minisign not found; verified the checksum only\n'
+fi
 fetch "$url" "$tmp/$asset" || die "download failed: $url"
 
 expected=

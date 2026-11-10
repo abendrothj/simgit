@@ -83,6 +83,20 @@ impl Release {
         .expect("create local release fetcher");
         fs::set_permissions(&curl, fs::Permissions::from_mode(0o755))
             .expect("make fetcher executable");
+
+        // The signature's cryptography is tested in Rust; here `minisign`
+        // only records how it was asked and answers as the test says.
+        fs::write(fixture.release.join("SHA256SUMS.minisig"), "signature\n")
+            .expect("create signature fixture");
+        let minisign = fixture.bin.join("minisign");
+        fs::write(
+            &minisign,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$SIMGIT_TEST_RELEASE/../minisign.log\"\n\
+             exit \"${SIMGIT_TEST_MINISIGN_EXIT:-0}\"\n",
+        )
+        .expect("create minisign fixture");
+        fs::set_permissions(&minisign, fs::Permissions::from_mode(0o755))
+            .expect("make minisign executable");
         fixture
     }
 
@@ -142,6 +156,44 @@ impl Release {
     fn fetches(&self) -> String {
         fs::read_to_string(self.root.join("curl.log")).unwrap_or_default()
     }
+
+    /// A directory of the system tools `install.sh` needs, linked from
+    /// `PATH`, so a test can leave one out (curl, minisign) whatever the
+    /// machine has installed.
+    fn system_tools(&self) -> PathBuf {
+        let tools = self.root.join("tools");
+        fs::create_dir(&tools).unwrap();
+        let search = std::env::var_os("PATH").unwrap();
+        for tool in [
+            "uname",
+            "mktemp",
+            "rm",
+            "tar",
+            "gzip",
+            "cmp",
+            "cp",
+            "chmod",
+            "mv",
+            "mkdir",
+            "shasum",
+            "sha256sum",
+            "sh",
+        ] {
+            if let Some(found) = std::env::split_paths(&search)
+                .map(|directory| directory.join(tool))
+                .find(|path| path.is_file())
+            {
+                std::os::unix::fs::symlink(found, tools.join(tool)).unwrap();
+            }
+        }
+        tools
+    }
+
+    /// `PATH` with the fixture's `curl` but no `minisign` at all.
+    fn path_without_minisign(&self) -> String {
+        fs::remove_file(self.bin.join("minisign")).unwrap();
+        format!("{}:{}", self.bin.display(), self.system_tools().display())
+    }
 }
 
 #[test]
@@ -178,7 +230,7 @@ fn curl_downloads_only_over_https_with_tls_1_2() {
         String::from_utf8_lossy(&installed.stderr)
     );
     let fetches = release.fetches();
-    assert_eq!(fetches.lines().count(), 2, "fetches: {fetches}");
+    assert_eq!(fetches.lines().count(), 3, "fetches: {fetches}");
     for fetch in fetches.lines() {
         assert!(fetch.contains("--proto =https --tlsv1.2"), "fetch: {fetch}");
     }
@@ -322,31 +374,7 @@ fn an_archive_without_sg_is_refused() {
 #[test]
 fn wget_is_used_when_curl_is_missing() {
     let release = Release::new();
-    let tools = release.root.join("tools");
-    fs::create_dir(&tools).unwrap();
-    let search = std::env::var_os("PATH").unwrap();
-    for tool in [
-        "uname",
-        "mktemp",
-        "rm",
-        "tar",
-        "gzip",
-        "cmp",
-        "cp",
-        "chmod",
-        "mv",
-        "mkdir",
-        "shasum",
-        "sha256sum",
-        "sh",
-    ] {
-        if let Some(found) = std::env::split_paths(&search)
-            .map(|directory| directory.join(tool))
-            .find(|path| path.is_file())
-        {
-            std::os::unix::fs::symlink(found, tools.join(tool)).unwrap();
-        }
-    }
+    let tools = release.system_tools();
     assert!(!tools.join("curl").exists());
     fs::write(
         release.bin.join("wget"),
@@ -367,7 +395,7 @@ fn wget_is_used_when_curl_is_missing() {
         String::from_utf8_lossy(&installed.stderr)
     );
     let log = fs::read_to_string(release.root.join("wget.log")).unwrap();
-    assert_eq!(log.lines().count(), 2, "wget calls: {log}");
+    assert_eq!(log.lines().count(), 3, "wget calls: {log}");
     assert!(
         log.lines().all(|call| call.contains("https://github.com/")),
         "wget calls: {log}"
@@ -403,4 +431,97 @@ fn the_fuse_overlayfs_hint_appears_only_without_reflink() {
             "cow={cow}: {stdout}"
         );
     }
+}
+
+#[test]
+fn installer_key_matches_the_release_key() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let installer = fs::read_to_string(root.join("../install.sh")).unwrap();
+    let release_key = fs::read_to_string(root.join("minisign.pub")).unwrap();
+    let release_key = release_key.lines().nth(1).unwrap();
+    assert!(
+        installer.contains(&format!("PUBLIC_KEY='{release_key}'")),
+        "install.sh does not carry sg/minisign.pub's key"
+    );
+}
+
+#[test]
+fn installer_checks_the_signature_with_the_release_key() {
+    let release = Release::new();
+    let installed = release.install("v0.0.0");
+    assert!(
+        installed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let calls = fs::read_to_string(release.root.join("minisign.log")).unwrap_or_default();
+    let key =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("minisign.pub")).unwrap();
+    let key = key.lines().nth(1).unwrap().to_owned();
+    assert_eq!(calls.lines().count(), 1, "minisign calls: {calls}");
+    assert!(
+        calls.starts_with(&format!("-V -P {key} -m ")),
+        "minisign calls: {calls}"
+    );
+    assert!(
+        calls.trim_end().ends_with("/SHA256SUMS"),
+        "minisign calls: {calls}"
+    );
+}
+
+#[test]
+fn installer_rejects_a_bad_signature_when_minisign_is_present() {
+    let release = Release::new();
+    let installed = release.install_with("v0.0.0", &[("SIMGIT_TEST_MINISIGN_EXIT", "1")]);
+    assert!(!installed.status.success(), "a bad signature was installed");
+    assert!(
+        String::from_utf8_lossy(&installed.stderr).contains("signature"),
+        "stderr: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(!release.install.join("simgit").exists());
+    assert!(!release.install.join("sg").exists());
+}
+
+#[test]
+fn installer_requires_minisign_when_asked() {
+    let release = Release::new();
+    let path = release.path_without_minisign();
+    let installed = release.install_with(
+        "v0.0.0",
+        &[("PATH", &path), ("SIMGIT_REQUIRE_SIGNATURE", "1")],
+    );
+    assert!(
+        !installed.status.success(),
+        "installed without a signature check"
+    );
+    assert!(
+        String::from_utf8_lossy(&installed.stderr)
+            .contains("SIMGIT_REQUIRE_SIGNATURE is set but minisign is not installed"),
+        "stderr: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(!release.install.join("simgit").exists());
+}
+
+#[test]
+fn installer_says_when_it_checked_only_the_checksum() {
+    let release = Release::new();
+    let path = release.path_without_minisign();
+    let installed = release.install_with("v0.0.0", &[("PATH", &path)]);
+    assert!(
+        installed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&installed.stdout),
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    assert!(
+        said.contains("minisign not found; verified the checksum only"),
+        "output: {said}"
+    );
+    assert!(release.install.join("simgit").exists());
 }
