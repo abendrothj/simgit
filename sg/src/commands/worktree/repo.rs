@@ -398,9 +398,11 @@ pub(super) fn state_dir(common_git_dir: &Path) -> PathBuf {
 
 /// Run a Git command that reads every worktree registration without the
 /// registry lock, retrying when it died on one another allocation was half-way
-/// through writing. Used where holding the lock would stall every allocation
-/// (a network fetch, a large removal); a Git that skips half-written
-/// registrations would make it unnecessary.
+/// through writing: its `commondir` not yet written, or its HEAD still the
+/// placeholder of zeros `git worktree add` writes first. Used where holding
+/// the lock would stall every allocation (a network fetch, a large removal,
+/// a reachability check); a Git that skipped half-written registrations
+/// would make it unnecessary.
 pub(super) fn output_retrying_half_written_registration(command: &mut Command) -> Result<Output> {
     // Untranslated messages: the match below, and callers, read them.
     command.env("LC_ALL", "C");
@@ -409,8 +411,10 @@ pub(super) fn output_retrying_half_written_registration(command: &mut Command) -
         let output = command.output().context("run git")?;
         let complaint = String::from_utf8_lossy(&output.stderr);
         let raced = !output.status.success()
-            && complaint.contains("failed to read")
-            && complaint.contains("commondir");
+            && ((complaint.contains("failed to read") && complaint.contains("commondir"))
+                || complaint.lines().any(|line| {
+                    line.contains("bad object worktrees/") && line.trim_end().ends_with("/HEAD")
+                }));
         match backoff.next() {
             Some(millis) if raced => std::thread::sleep(Duration::from_millis(millis)),
             _ => return Ok(output),

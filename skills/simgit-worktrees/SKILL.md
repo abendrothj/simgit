@@ -20,7 +20,7 @@ case "$SIMGIT" in
   *) echo "simgit discovery did not return an executable path" >&2; exit 1 ;;
 esac
 [ -f "$SIMGIT" ] && [ -x "$SIMGIT" ] || exit 1
-"$SIMGIT" doctor --json     # require top-level "identity": "simgit" and "version" >= 0.4.0 — see "Preflight"
+"$SIMGIT" doctor --json     # require top-level "identity": "simgit" and "version" >= 0.5.0 — see "Preflight"
 
 # 2. Preflight, run again from the source repository — see "Preflight"
 "$SIMGIT" doctor --json     # require git_worktree_supported; read cow_supported, repository owner,
@@ -89,7 +89,7 @@ Stop on an identity mismatch, unsupported Git worktrees, or an ownership problem
 
 This skill describes simgit 0.5.0. Compare `doctor --json`'s `version` with it before relying on anything below:
 
-- Older than 0.4.0: `add --attach`, the per-branch allocation claim, and `prune`'s `cache_busy` field do not exist, and `prune` may delete a baseline an allocation is using. Tell the user, and either get approval to upgrade (see **Install safely**) or limit yourself to what the installed version documents in its `--help`; for an existing branch, `simgit run <branch> -- <command>` works on older versions.
+- Older than 0.5.0: `remove` and `gc` do not protect a detached worktree whose commits no ref reaches (there is no `unreached-commits`), so removing one can leave those commits dangling. Older than 0.4.0, `add --attach`, the per-branch allocation claim, and `prune`'s `cache_busy` field do not exist either, and `prune` may delete a baseline an allocation is using. Tell the user, and either get approval to upgrade (see **Install safely**) or limit yourself to what the installed version documents in its `--help`; for an existing branch, `simgit run <branch> -- <command>` works on older versions.
 - Newer than 0.5.0: this copy of the skill may be stale. Ask the user to refresh it (`npx skills update simgit-worktrees -g`, or a fresh copy for a manual install) before depending on behavior it does not describe.
 
 In Claude Code with the simgit plugin active, the harness allocates and removes worktrees through `simgit hook`, so the agent does not run simgit for its own infrastructure and works inside the directory it is given. In Codex the same plugin brings this skill, but its hooks never allocate: when the work needs isolation, the agent uses the fast path above itself, runs its commands with the returned `path` as the working directory, and cleans up with the `cleanup_token`.

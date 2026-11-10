@@ -10,6 +10,7 @@ use super::remove::{
 };
 use super::repo::{
     canonical_path, discover_repo, git_common_command, git_failure, git_output_common,
+    output_retrying_half_written_registration,
 };
 use super::{cow, emit, overlay, Caller, RepoContext};
 use anyhow::{bail, Context, Result};
@@ -279,8 +280,11 @@ fn commit_reachable(repo: &RepoContext, commit: &str) -> Result<bool> {
     }
     // `--all` counts every ref and every worktree's HEAD, so one call answers
     // what a `merge-base` per detached worktree used to: `commit` is reached
-    // exactly when nothing is left once those are subtracted.
-    let unreached = git_output_common(repo, ["rev-list", "-n1", commit, "--not", "--all"])?;
+    // exactly when nothing is left once those are subtracted. Reading every
+    // HEAD meets the ones concurrent allocations are writing, so it retries.
+    let mut command = git_common_command(repo);
+    command.args(["rev-list", "-n1", commit, "--not", "--all"]);
+    let unreached = output_retrying_half_written_registration(&mut command)?;
     if !unreached.status.success() {
         return Err(git_failure("git rev-list --not --all", &unreached));
     }
