@@ -1,5 +1,6 @@
 //! `simgit update` and the update notice.
 
+pub(crate) mod notice;
 pub(crate) mod release;
 
 use crate::commands::worktree::emit;

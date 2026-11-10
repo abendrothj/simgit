@@ -396,3 +396,125 @@ fn update_replaces_only_the_binaries_present() {
     let installed = fixture.installed.join("simgit");
     assert_eq!(fixture.version_of(&installed), format!("simgit {LATEST}"));
 }
+
+const LATEST_URL: &str = "https://github.com/abendrothj/simgit/releases/tag/v9.9.9";
+
+impl FakeRelease {
+    fn cache(&self) -> PathBuf {
+        self.root.join("cache/simgit/latest")
+    }
+
+    /// The installed simgit with `args` under a pseudo-terminal, as a person
+    /// runs it; stdout and stderr arrive together on stdout.
+    fn on_terminal(&self, args: &[&str], path: &str) -> Command {
+        let python = which("python3");
+        let mut command = self.command(&python);
+        command
+            .env("PATH", path)
+            .env_remove("CI")
+            .env_remove("SIMGIT_NO_UPDATE_CHECK")
+            .current_dir(&self.root)
+            .args([
+                "-c",
+                "import os, pty, sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))",
+            ])
+            .arg(self.installed.join("simgit"))
+            .args(args);
+        command
+    }
+
+    fn tools_path(&self) -> String {
+        format!("{}:/usr/bin:/bin", self.tools.display())
+    }
+}
+
+fn which(program: &str) -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join(program))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("{program} is not on PATH"))
+}
+
+#[test]
+fn notice_shows_a_newer_cached_release_on_a_terminal() {
+    let fixture = FakeRelease::new();
+    fs::create_dir_all(fixture.cache().parent().unwrap()).unwrap();
+    fs::write(fixture.cache(), LATEST_URL).unwrap();
+    let output = fixture
+        .on_terminal(&["doctor"], &fixture.tools_path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let shown = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        shown.contains(&format!(
+            "simgit {LATEST} is available (you have {}); update with: simgit update",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{shown}"
+    );
+}
+
+#[test]
+fn notice_never_reaches_json_or_piped_output() {
+    let fixture = FakeRelease::new();
+    fs::create_dir_all(fixture.cache().parent().unwrap()).unwrap();
+    fs::write(fixture.cache(), LATEST_URL).unwrap();
+    let on_terminal = fixture
+        .on_terminal(&["--json", "doctor"], &fixture.tools_path())
+        .output()
+        .unwrap();
+    assert!(on_terminal.status.success());
+    assert!(!String::from_utf8_lossy(&on_terminal.stdout).contains("is available"));
+    let piped = fixture
+        .command(&fixture.installed.join("simgit"))
+        .env_remove("CI")
+        .current_dir(&fixture.root)
+        .arg("doctor")
+        .output()
+        .unwrap();
+    assert!(piped.status.success());
+    assert!(
+        !stderr(&piped).contains("is available"),
+        "{}",
+        stderr(&piped)
+    );
+}
+
+#[test]
+fn stale_cache_is_refreshed_without_waiting() {
+    let fixture = FakeRelease::new();
+    let started = std::time::Instant::now();
+    // The check takes six seconds; the command must not wait for it.
+    let output = fixture
+        .on_terminal(&["doctor"], &fixture.tools_path())
+        .env("SIMGIT_TEST_CURL_DELAY", "6")
+        .output()
+        .unwrap();
+    let took = started.elapsed();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(took < std::time::Duration::from_secs(3), "waited {took:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while fs::read_to_string(fixture.cache()).unwrap_or_default() != LATEST_URL {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cache was never refreshed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn notice_is_silent_when_curl_is_missing() {
+    let fixture = FakeRelease::new();
+    let empty = fixture.root.join("no-tools");
+    fs::create_dir(&empty).unwrap();
+    let output = fixture
+        .on_terminal(&["doctor"], &empty.display().to_string())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let shown = String::from_utf8_lossy(&output.stdout);
+    assert!(!shown.contains("curl"), "{shown}");
+    assert!(!shown.contains("is available"), "{shown}");
+}
