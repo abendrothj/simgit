@@ -664,6 +664,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
+        crate::commands::worktree::tests::isolate_git_config();
         let status = Command::new("git")
             .current_dir(dir)
             .args(args)

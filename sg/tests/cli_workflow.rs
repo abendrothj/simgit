@@ -24,7 +24,7 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
     git(&repo, &["commit", "-q", "-m", "initial"]);
 
     let sg = env!("CARGO_BIN_EXE_sg");
-    let run = Command::new(sg)
+    let run = isolated(sg)
         .current_dir(&repo)
         .args(["run", "agent/test", "--ephemeral", "--path"])
         .arg(&worktree)
@@ -46,7 +46,7 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
         "agent output\n"
     );
 
-    let gc = Command::new(sg)
+    let gc = isolated(sg)
         .current_dir(&repo)
         .args([
             "gc",
@@ -63,7 +63,7 @@ fn run_creates_executes_and_gc_removes_the_agent_worktree_and_branch() {
         String::from_utf8_lossy(&gc.stderr)
     );
     assert!(!worktree.exists());
-    let branch = Command::new("git")
+    let branch = isolated("git")
         .current_dir(&repo)
         .args(["show-ref", "--verify", "--quiet", "refs/heads/agent/test"])
         .status()
@@ -85,7 +85,7 @@ fn failed_allocation_does_not_delete_a_competing_branch() {
     fs::write(fixture.repo.join("competitor.txt"), "unmerged work").unwrap();
     git(&fixture.repo, &["add", "."]);
     git(&fixture.repo, &["commit", "-qm", "competitor work"]);
-    let commit = Command::new("git")
+    let commit = isolated("git")
         .current_dir(&fixture.repo)
         .args(["rev-parse", "HEAD"])
         .output()
@@ -127,7 +127,7 @@ fn failed_allocation_does_not_delete_a_competing_branch() {
         .output()
         .unwrap();
     assert!(!output.status.success(), "competing branch must block add");
-    let surviving = Command::new("git")
+    let surviving = isolated("git")
         .current_dir(&fixture.repo)
         .args(["rev-parse", "--verify", "refs/heads/agent/race"])
         .output()
@@ -137,8 +137,20 @@ fn failed_allocation_does_not_delete_a_competing_branch() {
     assert!(!fixture.worktree.exists());
 }
 
+/// A command with the developer's Git configuration out of reach: a global
+/// `init.defaultBranch` or `commit.gpgsign` must not change what a test sees.
+fn isolated(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", std::env::temp_dir().join("simgit-test-no-home"))
+        .env_remove("XDG_CONFIG_HOME");
+    command
+}
+
 fn git(repo: &Path, args: &[&str]) {
-    let status = Command::new("git")
+    let status = isolated("git")
         .current_dir(repo)
         .args(args)
         .status()
@@ -172,9 +184,10 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sg"));
+        let mut command = isolated(env!("CARGO_BIN_EXE_sg"));
         command
             .current_dir(&self.repo)
+            .env("HOME", &self.root)
             .env("SIMGIT_POPULATE", "checkout")
             .env_remove("SIMGIT_WORKTREE_ROOT");
         command
@@ -277,7 +290,7 @@ fn add_attach_checks_out_an_existing_branch_and_refuses_a_taken_one() {
     git(&fixture.repo, &["commit", "-qm", "branch work"]);
     git(&fixture.repo, &["checkout", "-q", "--detach", "HEAD~1"]);
     let tip = || {
-        let output = Command::new("git")
+        let output = isolated("git")
             .current_dir(&fixture.repo)
             .args(["rev-parse", "--verify", "refs/heads/chat/test"])
             .output()
@@ -390,7 +403,7 @@ fn require_cow_rejects_forced_checkout_before_creating_branch() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts with --require-cow"));
     assert!(!fixture.worktree.exists());
-    let output = Command::new("git")
+    let output = isolated("git")
         .current_dir(&fixture.repo)
         .args(["show-ref", "--verify", "--quiet", "refs/heads/chat/test"])
         .output()
@@ -497,39 +510,88 @@ fn run_keeps_the_child_status_when_release_fails() {
     assert!(stderr.contains("simgit unlock"), "stderr: {stderr}");
 }
 
+/// A `run` whose command blocks until `release` exists. The release file is
+/// outside the worktree, so a test that deletes the worktree can still write
+/// it, and the script gives up after a minute on its own. Dropping it, as a
+/// panicking test does, releases and reaps the command.
+struct BlockedRun {
+    child: std::process::Child,
+    release: std::path::PathBuf,
+}
+
+impl BlockedRun {
+    fn start(fixture: &Fixture) -> Self {
+        let started = fixture.root.join("started");
+        let release = fixture.root.join("release");
+        let child = fixture
+            .command()
+            .args(["run", "chat/test", "--", "sh", "-c"])
+            .arg(
+                "touch \"$1\"; n=0; \
+                 while [ ! -f \"$2\" ] && [ \"$n\" -lt 1200 ]; do sleep 0.05; n=$((n+1)); done",
+            )
+            .arg("sh")
+            .arg(&started)
+            .arg(&release)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let run = Self { child, release };
+        wait_for(&started);
+        run
+    }
+
+    fn finish(&mut self) -> std::process::ExitStatus {
+        fs::write(&self.release, "").unwrap();
+        self.child.wait().unwrap()
+    }
+}
+
+impl Drop for BlockedRun {
+    fn drop(&mut self) {
+        // Give the command time to see the release file before the fixture
+        // deletes it; only then kill a launcher that is stuck.
+        let _ = fs::write(&self.release, "");
+        for _ in 0..100 {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[test]
 fn running_commands_are_protected_from_gc_and_remove() {
     let fixture = Fixture::new();
     fixture.create(&["--ephemeral"]);
-    let mut child = fixture
-        .command()
-        .args([
-            "run",
-            "chat/test",
-            "--",
-            "sh",
-            "-c",
-            "touch started; sleep 3",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !fixture.worktree.join("started").exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let started = fixture.worktree.join("started").exists();
+    let mut run = BlockedRun::start(&fixture);
+    fs::write(fixture.worktree.join("unsaved.txt"), "agent work").unwrap();
+
     let gc = fixture.run(&["gc", "--older-than", "0s", "--discard-dirty", "--json"]);
     let remove = fixture.run(&["remove", "chat/test", "--discard-dirty"]);
     let duplicate = fixture.run(&["run", "chat/test", "--", "true"]);
     let listed = fixture.listed();
-    let status = child.wait().unwrap();
-    assert!(started && status.success());
+    let survived = fixture.worktree.join("unsaved.txt").is_file();
+    let status = run.finish();
+
     success(&gc);
-    assert!(String::from_utf8_lossy(&gc.stdout).contains("locked"));
-    assert!(!remove.status.success() && !duplicate.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&gc.stdout).unwrap();
+    assert_eq!(report["reaped"], serde_json::json!([]));
+    assert_eq!(
+        report["skipped"],
+        serde_json::json!([{ "worktree": resolved(&fixture.worktree), "reason": "locked" }])
+    );
+    assert!(!remove.status.success(), "remove deleted a running command");
+    assert!(!duplicate.status.success(), "a second run shared the lock");
+    assert!(survived, "the running command's files did not survive");
     assert!(listed.get("locked").is_some());
+    assert!(status.success());
+
+    // Once the command is done, the same worktree is reaped.
     success(&fixture.run(&["gc", "--older-than", "0s", "--discard-dirty"]));
     assert!(!fixture.worktree.exists());
 }
@@ -746,7 +808,7 @@ fn cow_materialization_reproduces_the_checkout_git_would_make() {
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-qm", "initial"]);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_sg"))
+    let output = isolated(env!("CARGO_BIN_EXE_sg"))
         .current_dir(&repo)
         .env_remove("SIMGIT_POPULATE")
         .env_remove("SIMGIT_WORKTREE_ROOT")
@@ -772,7 +834,7 @@ fn cow_materialization_reproduces_the_checkout_git_would_make() {
     );
     assert_eq!(mode & 0o111, 0o111, "executable bit lost: {mode:o}");
 
-    let status = Command::new("git")
+    let status = isolated("git")
         .current_dir(&worktree)
         .args(["status", "--porcelain"])
         .output()
@@ -780,7 +842,7 @@ fn cow_materialization_reproduces_the_checkout_git_would_make() {
     assert_eq!(String::from_utf8(status.stdout).unwrap(), "");
 
     fs::write(worktree.join("nested/deep/data.txt"), "edited\n").unwrap();
-    let status = Command::new("git")
+    let status = isolated("git")
         .current_dir(&worktree)
         .args(["status", "--porcelain"])
         .output()
@@ -825,7 +887,7 @@ fn remove_refuses_delete_unmerged_without_delete_branch() {
         "error must name the missing flag: {stderr}"
     );
     assert!(fixture.worktree.is_dir(), "worktree was torn down anyway");
-    let branch = Command::new("git")
+    let branch = isolated("git")
         .current_dir(&fixture.repo)
         .args(["show-ref", "--verify", "--quiet", "refs/heads/chat/test"])
         .status()
@@ -842,7 +904,7 @@ fn remove_commit_refuses_the_main_checkout_before_committing() {
     fs::write(fixture.repo.join("README.md"), "edited\n").unwrap();
     fs::write(fixture.repo.join("scratch.txt"), "work in progress\n").unwrap();
     let head = |repo: &Path| {
-        let output = Command::new("git")
+        let output = isolated("git")
             .current_dir(repo)
             .args(["rev-parse", "HEAD"])
             .output()
@@ -850,7 +912,7 @@ fn remove_commit_refuses_the_main_checkout_before_committing() {
         String::from_utf8(output.stdout).unwrap()
     };
     let status = |repo: &Path| {
-        let output = Command::new("git")
+        let output = isolated("git")
             .current_dir(repo)
             .args(["status", "--porcelain"])
             .output()
@@ -1018,7 +1080,7 @@ fn sparse_worktrees_check_out_only_the_requested_directories() {
     // additionally covered wherever the filesystem provides it; the
     // fuse-overlayfs backend rejects --sparse by design and is skipped.
     let create = |mode: Option<&str>, branch: &str| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sg"));
+        let mut command = isolated(env!("CARGO_BIN_EXE_sg"));
         command
             .current_dir(&repo)
             .env_remove("SIMGIT_WORKTREE_ROOT");
@@ -1047,7 +1109,7 @@ fn sparse_worktrees_check_out_only_the_requested_directories() {
         "paths outside the cone must not be materialized"
     );
 
-    let listed = Command::new("git")
+    let listed = isolated("git")
         .current_dir(&worktree)
         .args(["ls-files", "-t"])
         .output()
@@ -1058,7 +1120,7 @@ fn sparse_worktrees_check_out_only_the_requested_directories() {
         "paths outside the cone must be marked skip-worktree: {listed}"
     );
 
-    let status = Command::new("git")
+    let status = isolated("git")
         .current_dir(&worktree)
         .args(["status", "--porcelain"])
         .output()
@@ -1066,7 +1128,7 @@ fn sparse_worktrees_check_out_only_the_requested_directories() {
     assert_eq!(String::from_utf8(status.stdout).unwrap(), "");
 
     fs::write(worktree.join("alpha/sub/f0.txt"), "edited\n").unwrap();
-    let status = Command::new("git")
+    let status = isolated("git")
         .current_dir(&worktree)
         .args(["status", "--porcelain"])
         .output()
@@ -1089,7 +1151,7 @@ fn sparse_worktrees_check_out_only_the_requested_directories() {
             "cone mode keeps root-level and ancestor files; they must be cloned"
         );
         assert!(!native_worktree.join("beta").exists());
-        let status = Command::new("git")
+        let status = isolated("git")
             .current_dir(&native_worktree)
             .args(["status", "--porcelain"])
             .output()
@@ -1102,7 +1164,7 @@ fn sparse_worktrees_check_out_only_the_requested_directories() {
         );
     }
 
-    let rejected = Command::new(env!("CARGO_BIN_EXE_sg"))
+    let rejected = isolated(env!("CARGO_BIN_EXE_sg"))
         .current_dir(&repo)
         .args(["add", "agent/escape", "--sparse", "../outside"])
         .output()
@@ -1147,7 +1209,7 @@ fn overlapping_sparse_cones_allocate_clean_worktrees() {
         success(&created);
         assert!(target.join("alpha/sub/result.txt").is_file());
         assert!(!target.join("beta").exists());
-        let status = Command::new("git")
+        let status = isolated("git")
             .current_dir(&target)
             .args(["status", "--porcelain"])
             .output()
@@ -1248,7 +1310,7 @@ fn backtrace_variables_never_add_stderr_lines_to_machine_errors() {
         (&fixture.repo, vec!["--json", "add", "--nonsense"], ""),
     ] {
         for bin in [env!("CARGO_BIN_EXE_sg"), env!("CARGO_BIN_EXE_simgit")] {
-            let mut child = Command::new(bin)
+            let mut child = isolated(bin)
                 .current_dir(dir)
                 .env("GIT_CEILING_DIRECTORIES", &fixture.root)
                 .env("CLAUDE_PROJECT_DIR", dir)
@@ -1546,7 +1608,7 @@ fn add_without_a_branch_generates_an_agent_branch_and_one_cleanup_token() {
         uuid.parse::<uuid::Uuid>().is_ok(),
         "branch suffix {uuid} is not a uuid"
     );
-    let reference = Command::new("git")
+    let reference = isolated("git")
         .current_dir(&fixture.repo)
         .args(["show-ref", "--verify", "--quiet"])
         .arg(format!("refs/heads/{branch}"))
@@ -1583,7 +1645,7 @@ fn add_detach_creates_no_ref_and_is_reaped_by_gc() {
         "original\n"
     );
     assert_eq!(rev_parse(&path, "HEAD"), first);
-    let attached = Command::new("git")
+    let attached = isolated("git")
         .current_dir(&path)
         .args(["symbolic-ref", "-q", "HEAD"])
         .output()
@@ -1604,7 +1666,7 @@ fn add_detach_creates_no_ref_and_is_reaped_by_gc() {
 #[test]
 fn canonical_binary_identifies_as_simgit_and_matches_the_alias() {
     let fixture = Fixture::new();
-    let version = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    let version = isolated(env!("CARGO_BIN_EXE_simgit"))
         .arg("--version")
         .output()
         .unwrap();
@@ -1617,7 +1679,7 @@ fn canonical_binary_identifies_as_simgit_and_matches_the_alias() {
     fixture.create(&[]);
     let alias = fixture.run(&["list", "--json"]);
     success(&alias);
-    let canonical = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    let canonical = isolated(env!("CARGO_BIN_EXE_simgit"))
         .current_dir(&fixture.repo)
         .env("SIMGIT_POPULATE", "checkout")
         .env_remove("SIMGIT_WORKTREE_ROOT")
@@ -1641,7 +1703,7 @@ fn doctor_outside_a_repository_reports_null_repository_fields() {
     fs::create_dir_all(&outside).unwrap();
 
     let doctor = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_sg"))
+        isolated(env!("CARGO_BIN_EXE_sg"))
             .current_dir(&outside)
             // Keep Git from discovering a repository above the temporary root.
             .env("GIT_CEILING_DIRECTORIES", &root)
@@ -2037,7 +2099,7 @@ fn concurrent_allocations_to_one_path_leave_one_removable_worktree() {
     }
 
     let created: serde_json::Value = serde_json::from_slice(&winners[0].stdout).unwrap();
-    let registrations = Command::new("git")
+    let registrations = isolated("git")
         .current_dir(&fixture.repo)
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -2050,7 +2112,7 @@ fn concurrent_allocations_to_one_path_leave_one_removable_worktree() {
         1,
         "one directory holds more than one registration"
     );
-    let checked_out = Command::new("git")
+    let checked_out = isolated("git")
         .current_dir(&resolved)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output()
@@ -2104,7 +2166,7 @@ fn concurrent_attaches_of_one_branch_leave_one_worktree_on_it() {
         .filter(|outcome| outcome.status.success())
         .count();
     assert_eq!(winners, 1, "{winners} allocations got one branch");
-    let registrations = Command::new("git")
+    let registrations = isolated("git")
         .current_dir(&fixture.repo)
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -2203,7 +2265,7 @@ fn concurrent_allocations_of_different_branches_all_succeed() {
         success(listing);
     }
 
-    let registrations = Command::new("git")
+    let registrations = isolated("git")
         .current_dir(&fixture.repo)
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -2361,7 +2423,7 @@ fn checkout_allocation_runs_a_config_defined_post_checkout_hook() {
         &fixture.repo,
         &["config", "hook.marker.event", "post-checkout"],
     );
-    let listed = Command::new("git")
+    let listed = isolated("git")
         .current_dir(&fixture.repo)
         .args(["hook", "list", "post-checkout"])
         .output()
@@ -2464,7 +2526,7 @@ fn add_accepts_an_empty_destination_but_refuses_a_populated_one() {
     let cloned = fixture.root.join("prepared clone");
     fs::create_dir_all(&cloned).unwrap();
     success(
-        &Command::new(env!("CARGO_BIN_EXE_sg"))
+        &isolated(env!("CARGO_BIN_EXE_sg"))
             .current_dir(&fixture.repo)
             .env_remove("SIMGIT_POPULATE")
             .env_remove("SIMGIT_WORKTREE_ROOT")
@@ -2699,7 +2761,7 @@ fn prune_reports_the_stale_registrations_it_cleared() {
 }
 
 fn rev_parse(dir: &Path, revision: &str) -> String {
-    let output = Command::new("git")
+    let output = isolated("git")
         .current_dir(dir)
         .args(["rev-parse", revision])
         .output()
@@ -2709,7 +2771,7 @@ fn rev_parse(dir: &Path, revision: &str) -> String {
 }
 
 fn local_refs(repo: &Path) -> String {
-    let output = Command::new("git")
+    let output = isolated("git")
         .current_dir(repo)
         .args(["for-each-ref", "--format=%(refname)", "refs/"])
         .output()
@@ -2737,7 +2799,7 @@ fn commit_in(worktree: &Path, name: &str) -> String {
 }
 
 fn object_count(repo: &Path) -> String {
-    let output = Command::new("git")
+    let output = isolated("git")
         .current_dir(repo)
         .args(["count-objects", "-v"])
         .output()
@@ -2859,7 +2921,7 @@ fn remove_keeps_uncommitted_files_and_unreached_commits_on_every_path() {
 /// Git older than 2.45, which has none. Under reftable every registration's
 /// `HEAD` file is a stub naming `refs/heads/.invalid`, detached or not.
 fn reftable_fixture() -> Option<Fixture> {
-    let version = Command::new("git").arg("version").output().unwrap();
+    let version = isolated("git").arg("version").output().unwrap();
     let version = String::from_utf8_lossy(&version.stdout).into_owned();
     let mut parts = version
         .trim()
@@ -2880,7 +2942,7 @@ fn reftable_fixture() -> Option<Fixture> {
 }
 
 fn commit_exists(repo: &Path, commit: &str) -> bool {
-    Command::new("git")
+    isolated("git")
         .current_dir(repo)
         .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
         .status()
@@ -3023,7 +3085,7 @@ fn gc_keeps_a_gitfile_less_worktree_inside_another_repository() {
 /// The HEAD Git's registry records for `worktree`, or `None` when it is not
 /// registered. Works after the directory is gone.
 fn registered_head(fixture: &Fixture, worktree: &Path) -> Option<String> {
-    let output = Command::new("git")
+    let output = isolated("git")
         .current_dir(&fixture.repo)
         .args(["worktree", "list", "--porcelain", "-z"])
         .output()
@@ -3345,7 +3407,7 @@ fn recovery_hints_quote_paths_with_spaces_and_quotes() {
         "{message}"
     );
     // The hint works as written.
-    let unlock = Command::new("sh")
+    let unlock = isolated("sh")
         .current_dir(&fixture.repo)
         .env("PATH", bin_dir_first())
         .arg("-c")
@@ -3398,7 +3460,7 @@ fn run_refuses_a_half_made_worktree_after_unlock() {
 
     // Committing it would record every tracked file as deleted.
     let tip = || {
-        let output = Command::new("git")
+        let output = isolated("git")
             .current_dir(&fixture.repo)
             .args(["rev-parse", "chat/half"])
             .output()
@@ -4051,7 +4113,7 @@ fn allocation_survives_a_concurrent_prune() {
          fi\n",
     );
     let fully_allocated = |path: &Path| {
-        let admin = Command::new("git")
+        let admin = isolated("git")
             .arg("-C")
             .arg(path)
             .args(["rev-parse", "--absolute-git-dir"])
@@ -4137,7 +4199,7 @@ fn allocation_survives_a_concurrent_prune() {
         "{} of 10 allocations failed: {failures:#?}",
         failures.len()
     );
-    let registrations = Command::new("git")
+    let registrations = isolated("git")
         .current_dir(&fixture.repo)
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -4147,7 +4209,7 @@ fn allocation_survives_a_concurrent_prune() {
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let path = Path::new(report["path"].as_str().unwrap());
         assert_eq!(fs::read_to_string(path.join("file-999")).unwrap(), "999\n");
-        let status = Command::new("git")
+        let status = isolated("git")
             .arg("-C")
             .arg(path)
             .args(["status", "--porcelain"])
@@ -4301,7 +4363,7 @@ fn a_failed_population_rolls_back_its_locked_registration() {
     assert!(!output.status.success(), "population did not fail");
     assert!(!stderr.contains("rollback"), "{stderr}");
     assert!(!fixture.worktree.exists());
-    let registrations = Command::new("git")
+    let registrations = isolated("git")
         .current_dir(&fixture.repo)
         .args(["worktree", "list", "--porcelain"])
         .output()
@@ -4312,7 +4374,7 @@ fn a_failed_population_rolls_back_its_locked_registration() {
             .count(),
         1
     );
-    let branch = Command::new("git")
+    let branch = isolated("git")
         .current_dir(&fixture.repo)
         .args(["show-ref", "--verify", "--quiet", "refs/heads/agent/failed"])
         .status()
@@ -4480,7 +4542,7 @@ fn a_failed_gitlink_restore_keeps_the_allocation_lock() {
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
-    Command::new("git")
+    isolated("git")
         .current_dir(repo)
         .args(["rev-parse", "--verify", "--quiet"])
         .arg(format!("refs/heads/{branch}"))
@@ -4701,7 +4763,7 @@ fn assert_module_root(fixture: &Fixture, parent: &Path, prefix: &str) {
 
 /// What `git status` reports in `checkout`, ignored files included.
 fn status_with_ignored(checkout: &Path) -> String {
-    let output = Command::new("git")
+    let output = isolated("git")
         .current_dir(checkout)
         .args(["status", "--porcelain", "--ignored"])
         .output()
@@ -5235,7 +5297,7 @@ fn a_deleted_worktree_registered_through_a_symlink_can_be_removed() {
 }
 
 fn git_stdout(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = isolated("git")
         .current_dir(dir)
         .args(args)
         .output()
@@ -5339,7 +5401,7 @@ fn add_in_a_repository_without_commits_says_so() {
     let root = std::env::temp_dir().join(format!("simgit-unborn-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     git(&root, &["init", "-q"]);
-    let output = Command::new(env!("CARGO_BIN_EXE_sg"))
+    let output = isolated(env!("CARGO_BIN_EXE_sg"))
         .current_dir(&root)
         .args(["add", "agent/x"])
         .output()
