@@ -1382,7 +1382,8 @@ fn add_into_an_empty_directory_under_an_unwritable_parent_checks_out() {
     fs::set_permissions(&jobs, fs::Permissions::from_mode(0o755)).unwrap();
     success(&output);
     let added: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(added["mode"], "git-checkout", "{added}");
+    // No CoW: a checkout, or overlay where fuse-overlayfs is installed.
+    assert_ne!(added["mode"], "cow-clone", "{added}");
 }
 
 /// A probe that could not be written measured nothing, so `cow_supported` is
@@ -5485,10 +5486,22 @@ fn run_reattach_refused_for_its_populate_mode_keeps_the_registration() {
     let fixture = Fixture::new();
     fixture.create(&["--ephemeral"]);
     fs::remove_dir_all(&fixture.worktree).unwrap();
-    // Whatever the host has, simgit must not find fuse-overlayfs.
+    // Whatever the host has, simgit must not find fuse-overlayfs. It often
+    // shares a directory with git, so keep git and the command reachable
+    // through links of their own.
+    let tools = fixture.root.join("tools-without-fuse");
+    fs::create_dir_all(&tools).unwrap();
     let host_path = std::env::var_os("PATH").unwrap();
-    let path =
-        std::env::split_paths(&host_path).filter(|dir| !dir.join("fuse-overlayfs").is_file());
+    for tool in ["git", "true"] {
+        let found = std::env::split_paths(&host_path)
+            .map(|dir| dir.join(tool))
+            .find(|candidate| candidate.is_file())
+            .unwrap();
+        std::os::unix::fs::symlink(found, tools.join(tool)).unwrap();
+    }
+    let path = std::iter::once(tools).chain(
+        std::env::split_paths(&host_path).filter(|dir| !dir.join("fuse-overlayfs").is_file()),
+    );
 
     let refused = fixture
         .command()
