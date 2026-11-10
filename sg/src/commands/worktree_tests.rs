@@ -108,31 +108,58 @@ fn gc_skips_dirty_worktrees_without_discard_dirty() -> Result<()> {
     let fixture = Fixture::new()?;
     let repo = discover_repo(&fixture.repo)?;
     let base = resolve_commit(&repo, "HEAD")?;
-    let dirty = fixture.root.join("dirty");
-    add_git_worktree(&repo, "dirty", &dirty, &base, WorktreeKind::NewBranch, &[])?;
-    fs::write(dirty.join("scratch.txt"), "uncommitted")?;
+    let mut dirty = Vec::new();
+    for name in ["untracked", "modified", "staged"] {
+        let path = fixture.root.join(name);
+        add_git_worktree(&repo, name, &path, &base, WorktreeKind::NewBranch, &[])?;
+        dirty.push(path);
+    }
+    let [untracked, modified, staged] = &dirty[..] else {
+        unreachable!()
+    };
+    fs::write(untracked.join("scratch.txt"), "uncommitted")?;
+    fs::write(modified.join("file.txt"), "edited\n")?;
+    fs::write(staged.join("staged.txt"), "staged\n")?;
+    git(staged, ["add", "staged.txt"])?;
 
-    let outcome = run_gc(
-        &repo,
-        &WorktreeGc {
-            older_than: "0s".to_owned(),
-            include_persistent: true,
-            ..Default::default()
-        },
-    )?;
+    let gc = |discard_dirty| {
+        run_gc(
+            &repo,
+            &WorktreeGc {
+                older_than: "0s".to_owned(),
+                include_persistent: true,
+                discard_dirty,
+                ..Default::default()
+            },
+        )
+    };
+    let outcome = gc(false)?;
     assert!(outcome.reaped.is_empty());
-    assert_eq!(outcome.skipped, vec![(dirty.clone(), "dirty")]);
+    let mut skipped = outcome.skipped;
+    skipped.sort();
+    let mut expected: Vec<_> = dirty.iter().cloned().map(|path| (path, "dirty")).collect();
+    expected.sort();
+    assert_eq!(skipped, expected);
+    // The skipped worktrees still hold every kind of uncommitted work.
+    assert_eq!(
+        fs::read_to_string(untracked.join("scratch.txt"))?,
+        "uncommitted"
+    );
+    assert_eq!(fs::read_to_string(modified.join("file.txt"))?, "edited\n");
+    assert_eq!(fs::read_to_string(staged.join("staged.txt"))?, "staged\n");
+    assert!(git_output_at(staged, ["diff", "--cached", "--name-only"])?
+        .stdout
+        .starts_with(b"staged.txt"));
 
-    let discarded = run_gc(
-        &repo,
-        &WorktreeGc {
-            older_than: "0s".to_owned(),
-            include_persistent: true,
-            discard_dirty: true,
-            ..Default::default()
-        },
-    )?;
-    assert_eq!(discarded.reaped, vec![dirty]);
+    let mut reaped = gc(true)?.reaped;
+    reaped.sort();
+    assert_eq!(
+        reaped,
+        expected
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>()
+    );
     Ok(())
 }
 
@@ -839,8 +866,24 @@ struct Fixture {
     repo: PathBuf,
 }
 
+/// Keep the developer's Git configuration out of every `git` these tests run,
+/// including the ones the code under test starts: a global `init.defaultBranch`
+/// or `commit.gpgsign` must not change a result. The variables are process
+/// wide because the code under test inherits its environment; each is set to
+/// the same value by every test, and std serializes `set_var` against spawns.
+pub(crate) fn isolate_git_config() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        std::env::set_var("HOME", std::env::temp_dir().join("simgit-test-no-home"));
+        std::env::remove_var("XDG_CONFIG_HOME");
+    });
+}
+
 impl Fixture {
     fn new() -> Result<Self> {
+        isolate_git_config();
         let root = std::env::temp_dir().join(format!("simgit-worktree-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
@@ -896,6 +939,7 @@ impl Drop for Fixture {
 }
 
 fn git<const N: usize>(path: &Path, args: [&str; N]) -> Result<()> {
+    isolate_git_config();
     let mut command = Command::new("git");
     command.arg("-C").arg(path).args(args);
     run_command(&mut command, "test git")

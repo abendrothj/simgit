@@ -4,17 +4,19 @@
 # the .git baseline cache both live on the reflink filesystem.
 set -euo pipefail
 
-mnt=/mnt/simgit-reflink
-image=/tmp/simgit-reflink.img
+# Unique per run, so a leftover mount or image from another run is never reused.
+mnt="$(mktemp -d /tmp/simgit-reflink-mnt.XXXXXX)"
+image="$(mktemp /tmp/simgit-reflink-img.XXXXXX)"
+# The image goes even when the unmount fails; a lazy unmount is the fallback.
 cleanup() {
-    sudo umount "$mnt" 2>/dev/null || true
+    sudo umount "$mnt" 2>/dev/null || sudo umount -l "$mnt" 2>/dev/null || true
     rm -f "$image"
+    rmdir "$mnt" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 sudo apt-get update -qq
 sudo apt-get install -y -qq btrfs-progs xfsprogs >/dev/null
-sudo mkdir -p "$mnt"
 truncate -s 2G "$image"
 
 if mkfs.btrfs -q "$image" 2>/dev/null && sudo mount -o loop "$image" "$mnt" 2>/dev/null; then

@@ -4,8 +4,20 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+/// A command with the developer's Git configuration out of reach: a global
+/// `init.defaultBranch` or `commit.gpgsign` must not change what a test sees.
+fn isolated(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", std::env::temp_dir().join("simgit-test-no-home"))
+        .env_remove("XDG_CONFIG_HOME");
+    command
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = isolated("git")
         .current_dir(dir)
         .args(args)
         .output()
@@ -58,8 +70,9 @@ impl HookFixture {
         stdin: &str,
         env: &[(&str, &std::ffi::OsStr)],
     ) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_simgit"))
+        let mut child = isolated(env!("CARGO_BIN_EXE_simgit"))
             .current_dir(&self.root)
+            .env("HOME", &self.root)
             .envs(env.iter().copied())
             .env("CLAUDE_PROJECT_DIR", project)
             .env("SIMGIT_POPULATE", "checkout")
@@ -130,7 +143,7 @@ fn unknown_event_and_session_start_are_no_ops() {
 #[test]
 fn requires_refuses_an_older_binary_with_exit_1() {
     let fixture = HookFixture::new();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    let mut child = isolated(env!("CARGO_BIN_EXE_simgit"))
         .current_dir(&fixture.root)
         .args(["hook", "claude-code", "--requires", "99.0.0"])
         .stdin(Stdio::null())
@@ -143,7 +156,7 @@ fn requires_refuses_an_older_binary_with_exit_1() {
         "{}",
         stderr(&child)
     );
-    child = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    child = isolated(env!("CARGO_BIN_EXE_simgit"))
         .current_dir(&fixture.root)
         .args(["hook", "claude-code", "--requires", "1.x"])
         .stdin(Stdio::null())
@@ -158,7 +171,7 @@ fn requires_refuses_an_older_binary_with_exit_1() {
 fn requires_is_checked_before_unknown_flags() {
     let fixture = HookFixture::new();
     let hook = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_simgit"))
+        isolated(env!("CARGO_BIN_EXE_simgit"))
             .current_dir(&fixture.root)
             .args(args)
             .stdin(Stdio::null())
@@ -293,7 +306,7 @@ fn a_failure_with_causes_prints_one_stderr_line() {
 fn unknown_provider_is_an_error() {
     let fixture = HookFixture::new();
     let before = fixture.snapshot();
-    let output = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    let output = isolated(env!("CARGO_BIN_EXE_simgit"))
         .current_dir(&fixture.root)
         .args(["hook", "codex", "--requires", "0.0.0"])
         .stdin(Stdio::null())
@@ -393,27 +406,100 @@ fn create_never_returns_the_main_checkout() {
     assert!(output.stdout.is_empty());
 }
 
+/// `simgit run <branch>` running a command that blocks until a release file
+/// appears, so the worktree stays run-locked exactly as long as the test
+/// needs. The marker files live outside the worktree: inside it they would be
+/// uncommitted changes, and the hook would refuse for that reason instead. The
+/// script gives up after a minute on its own, and dropping the value, as a
+/// panicking test does, releases and reaps the command.
+struct LockedRun {
+    runner: std::process::Child,
+    path: PathBuf,
+    release: PathBuf,
+}
+
+impl LockedRun {
+    /// Returns once the lock is observed and the command is running.
+    fn start(fixture: &HookFixture, branch: &str) -> Self {
+        let started = fixture
+            .root
+            .join(format!("{}.started", branch.replace('/', "-")));
+        let release = fixture
+            .root
+            .join(format!("{}.release", branch.replace('/', "-")));
+        let runner = isolated(env!("CARGO_BIN_EXE_simgit"))
+            .current_dir(&fixture.repo)
+            .env("SIMGIT_POPULATE", "checkout")
+            .args(["run", branch, "--", "sh", "-c"])
+            .arg(
+                "touch \"$1\"; n=0; \
+                 while [ ! -f \"$2\" ] && [ \"$n\" -lt 1200 ]; do sleep 0.05; n=$((n+1)); done",
+            )
+            .arg("sh")
+            .arg(&started)
+            .arg(&release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn simgit run");
+        let mut locked = None;
+        for _ in 0..400 {
+            let listing = git(&fixture.repo, &["worktree", "list", "--porcelain"]);
+            let wanted = format!("branch refs/heads/{branch}");
+            if listing.contains("locked") && listing.contains(&wanted) {
+                locked = listing
+                    .lines()
+                    .rev()
+                    .skip_while(|line| *line != wanted)
+                    .find_map(|line| line.strip_prefix("worktree ").map(PathBuf::from));
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let run = Self {
+            runner,
+            path: locked.expect("run created a locked worktree"),
+            release,
+        };
+        for _ in 0..400 {
+            if started.exists() {
+                return run;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the command never started in {}", run.path.display());
+    }
+
+    /// Let the command exit and wait for `simgit run` to release the lock.
+    fn finish(&mut self) {
+        fs::write(&self.release, "").expect("write release");
+        self.runner.wait().expect("wait for simgit run");
+    }
+}
+
+impl Drop for LockedRun {
+    fn drop(&mut self) {
+        // Give the command time to see the release file before the fixture
+        // deletes it; only then kill a launcher that is stuck.
+        let _ = fs::write(&self.release, "");
+        for _ in 0..100 {
+            if matches!(self.runner.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = self.runner.kill();
+        let _ = self.runner.wait();
+    }
+}
+
 #[test]
 fn create_refuses_a_run_locked_worktree() {
     let fixture = HookFixture::new();
-    let mut runner = Command::new(env!("CARGO_BIN_EXE_simgit"))
-        .current_dir(&fixture.repo)
-        .env("SIMGIT_POPULATE", "checkout")
-        .args(["run", "simgit/s4", "--", "sleep", "3"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn simgit run");
-    for _ in 0..100 {
-        let listing = git(&fixture.repo, &["worktree", "list", "--porcelain"]);
-        if listing.contains("simgit/s4") && listing.contains("locked") {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    let mut run = LockedRun::start(&fixture, "simgit/s4");
     let output = fixture.hook(&[], create_payload("s4", &fixture.repo));
-    runner.wait().expect("wait for simgit run");
+    run.finish();
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stdout.is_empty());
 }
@@ -453,7 +539,7 @@ fn run_hint(fixture: &HookFixture, hint: &str) -> Output {
         &std::env::var_os("PATH").expect("PATH"),
     )))
     .expect("join PATH");
-    Command::new("sh")
+    isolated("sh")
         .arg("-c")
         .arg(hint)
         .current_dir(&fixture.root)
@@ -670,7 +756,7 @@ fn create_and_remove_work_from_a_deleted_cwd() {
     let gone = fixture.root.join("gone");
     let run_from_gone = |payload: Value| {
         fs::create_dir(&gone).expect("create the doomed cwd");
-        let mut child = Command::new("sh")
+        let mut child = isolated("sh")
             .current_dir(&gone)
             .env("CLAUDE_PROJECT_DIR", &fixture.repo)
             .args([
@@ -710,7 +796,7 @@ fn created_worktree_is_persistent() {
     let output = fixture.hook(&[], create_payload("s6", &fixture.repo));
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let path = stdout_path(&output);
-    let listing = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    let listing = isolated(env!("CARGO_BIN_EXE_simgit"))
         .current_dir(&fixture.repo)
         .args(["--json", "list"])
         .output()
@@ -878,7 +964,7 @@ fn hook_on_a_terminal(
         assert!(!name.is_null(), "ptsname");
         (master, CStr::from_ptr(name).to_owned())
     };
-    let mut command = Command::new(env!("CARGO_BIN_EXE_simgit"));
+    let mut command = isolated(env!("CARGO_BIN_EXE_simgit"));
     command
         .current_dir(&fixture.root)
         .envs(env.iter().copied())
@@ -1075,7 +1161,7 @@ fn prune_deletes_the_fetch_refs_of_a_killed_create() {
     for name in malformed.iter().chain([&live, &unowned]) {
         git(&fixture.repo, &["update-ref", name, "HEAD"]);
     }
-    let pruned = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    let pruned = isolated(env!("CARGO_BIN_EXE_simgit"))
         .current_dir(&fixture.repo)
         .arg("prune")
         .output()
@@ -1219,7 +1305,7 @@ fn create_refuses_a_non_cone_sparse_worktree_deleted_by_hand_with_a_hook_recover
     assert!(registered(&fixture.repo, &path));
 
     // The named recovery works, and the name is then free to create again.
-    let removed = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    let removed = isolated(env!("CARGO_BIN_EXE_simgit"))
         .current_dir(&fixture.repo)
         .arg("remove")
         .arg(&path)
@@ -1242,7 +1328,7 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
 #[test]
 fn remove_refuses_a_worktree_not_on_a_simgit_branch() {
     let fixture = HookFixture::new();
-    let output = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    let output = isolated(env!("CARGO_BIN_EXE_simgit"))
         .current_dir(&fixture.repo)
         .env("SIMGIT_POPULATE", "checkout")
         .args(["--json", "add", "other/x"])
@@ -1267,7 +1353,7 @@ fn remove_refuses_a_worktree_not_on_a_simgit_branch() {
 #[test]
 fn remove_refuses_a_detached_worktree_not_at_a_hook_path() {
     let fixture = HookFixture::new();
-    let output = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    let output = isolated(env!("CARGO_BIN_EXE_simgit"))
         .current_dir(&fixture.repo)
         .env("SIMGIT_POPULATE", "checkout")
         .args(["--json", "add", "--detach"])
@@ -1516,7 +1602,7 @@ fn remove_finds_the_repo_from_worktree_path() {
     let fixture = HookFixture::new();
     let path = create_worktree(&fixture, "r6");
     let other = std::env::temp_dir();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_simgit"))
+    let mut child = isolated(env!("CARGO_BIN_EXE_simgit"))
         .current_dir(&other)
         .env_remove("CLAUDE_PROJECT_DIR")
         .args([
@@ -1548,31 +1634,10 @@ fn remove_finds_the_repo_from_worktree_path() {
 #[test]
 fn remove_refuses_a_run_locked_worktree() {
     let fixture = HookFixture::new();
-    let mut runner = Command::new(env!("CARGO_BIN_EXE_simgit"))
-        .current_dir(&fixture.repo)
-        .env("SIMGIT_POPULATE", "checkout")
-        .args(["run", "simgit/r7", "--", "sleep", "3"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn simgit run");
-    let mut path = None;
-    for _ in 0..100 {
-        let listing = git(&fixture.repo, &["worktree", "list", "--porcelain"]);
-        if listing.contains("simgit/r7") && listing.contains("locked") {
-            path = listing
-                .lines()
-                .rev()
-                .skip_while(|line| *line != "branch refs/heads/simgit/r7")
-                .find_map(|line| line.strip_prefix("worktree ").map(PathBuf::from));
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let path = path.expect("run created a locked worktree");
+    let mut run = LockedRun::start(&fixture, "simgit/r7");
+    let path = run.path.clone();
     let output = fixture.hook(&["--discard-dirty"], remove_payload(&path));
-    runner.wait().expect("wait for simgit run");
+    run.finish();
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(stderr(&output).contains("is locked"), "{}", stderr(&output));
     assert!(path.is_dir());
@@ -1860,7 +1925,7 @@ fn remove_never_drops_a_branch_whose_tip_moved_after_the_check() {
 fn create_and_remove_in_the_default_populate_mode() {
     let fixture = HookFixture::new();
     let hook = |extra: &[&str], payload: Value| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_simgit"))
+        let mut child = isolated(env!("CARGO_BIN_EXE_simgit"))
             .current_dir(&fixture.root)
             .env("CLAUDE_PROJECT_DIR", &fixture.repo)
             .env_remove("SIMGIT_POPULATE")
@@ -1962,33 +2027,17 @@ fn stop_keeps_a_worktree_with_an_unpushed_commit() {
 #[test]
 fn stop_keeps_a_run_locked_worktree() {
     let fixture = HookFixture::new();
-    let mut runner = Command::new(env!("CARGO_BIN_EXE_simgit"))
-        .current_dir(&fixture.repo)
-        .env("SIMGIT_POPULATE", "checkout")
-        .args(["run", "simgit/agent-a4", "--", "sleep", "3"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn simgit run");
-    let mut path = None;
-    for _ in 0..100 {
-        let listing = git(&fixture.repo, &["worktree", "list", "--porcelain"]);
-        if listing.contains("simgit/agent-a4") && listing.contains("locked") {
-            path = listing
-                .lines()
-                .rev()
-                .skip_while(|line| *line != "branch refs/heads/simgit/agent-a4")
-                .find_map(|line| line.strip_prefix("worktree ").map(PathBuf::from));
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let path = path.expect("run created a locked worktree");
+    let mut run = LockedRun::start(&fixture, "simgit/agent-a4");
+    let path = run.path.clone();
     let commits = all_commits(&fixture.repo);
     let output = fixture.hook(&[], stop_payload("a4", &fixture.repo));
-    runner.wait().expect("wait for simgit run");
+    run.finish();
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("is locked (a command may be running)"),
+        "{}",
+        stderr(&output)
+    );
     assert!(path.is_dir());
     assert!(branch_exists(&fixture.repo, "simgit/agent-a4"));
     assert_eq!(all_commits(&fixture.repo), commits);
@@ -2255,10 +2304,11 @@ fn marketplace_ref_names_a_release_no_newer_than_the_crate() {
     // Claude Code and Codex.
     let source = &market["plugins"][0]["source"];
     assert_eq!(source["source"], "url", "{source}");
-    assert_eq!(source["url"], "https://github.com/abendrothj/simgit.git");
-    let reference = market["plugins"][0]["source"]["ref"]
-        .as_str()
-        .expect("marketplace plugin ref");
+    assert_eq!(
+        source["url"], "https://github.com/abendrothj/simgit.git",
+        "{source}"
+    );
+    let reference = source["ref"].as_str().expect("marketplace plugin ref");
     let version = reference
         .strip_prefix('v')
         .unwrap_or_else(|| panic!("ref {reference} is not vX.Y.Z"));

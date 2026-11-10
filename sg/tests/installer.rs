@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct Release {
     root: PathBuf,
     release: PathBuf,
+    archive_dir: String,
+    asset: String,
     bin: PathBuf,
     install: PathBuf,
 }
@@ -34,15 +36,6 @@ impl Release {
                 .expect("clock")
                 .as_nanos()
         ));
-        let fixture = Release {
-            release: root.join("release"),
-            bin: root.join("bin"),
-            install: root.join("installed"),
-            root,
-        };
-        fs::create_dir_all(&fixture.release).expect("create release fixture");
-        fs::create_dir_all(&fixture.bin).expect("create tool fixture");
-
         let target = match (std::env::consts::OS, std::env::consts::ARCH) {
             ("macos", "aarch64") => "aarch64-apple-darwin",
             ("macos", "x86_64") => "x86_64-apple-darwin",
@@ -51,8 +44,18 @@ impl Release {
             other => panic!("unsupported installer test target: {other:?}"),
         };
         let archive_dir = format!("sg-{target}");
-        let asset = format!("{archive_dir}.tar.gz");
-        let payload = fixture.release.join(&archive_dir);
+        let fixture = Release {
+            release: root.join("release"),
+            asset: format!("{archive_dir}.tar.gz"),
+            archive_dir,
+            bin: root.join("bin"),
+            install: root.join("installed"),
+            root,
+        };
+        fs::create_dir_all(&fixture.release).expect("create release fixture");
+        fs::create_dir_all(&fixture.bin).expect("create tool fixture");
+
+        let payload = fixture.payload();
         fs::create_dir(&payload).expect("create archive directory");
         let binary = payload.join("simgit");
         // `doctor` answers the installer's copy-on-write probe from the test.
@@ -65,32 +68,7 @@ impl Release {
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
             .expect("make binary executable");
         fs::copy(&binary, payload.join("sg")).expect("create alias fixture");
-        let packed = Command::new("tar")
-            .current_dir(&fixture.release)
-            .args(["czf", &asset, &archive_dir])
-            .status()
-            .expect("package release fixture");
-        assert!(packed.success(), "could not package release fixture");
-
-        let checksum = if cfg!(target_os = "macos") {
-            Command::new("shasum")
-                .args(["-a", "256"])
-                .arg(fixture.release.join(&asset))
-                .output()
-        } else {
-            Command::new("sha256sum")
-                .arg(fixture.release.join(&asset))
-                .output()
-        }
-        .expect("hash release fixture");
-        assert!(checksum.status.success(), "could not hash release fixture");
-        let checksum = String::from_utf8(checksum.stdout).expect("checksum is UTF-8");
-        let digest = checksum.split_whitespace().next().expect("checksum digest");
-        fs::write(
-            fixture.release.join("SHA256SUMS"),
-            format!("{digest}  {asset}\n"),
-        )
-        .expect("create checksum manifest");
+        fixture.package();
 
         // The URL is the last argument and the destination follows `-o`,
         // wherever the options put them. Every call's arguments are logged.
@@ -106,6 +84,41 @@ impl Release {
         fs::set_permissions(&curl, fs::Permissions::from_mode(0o755))
             .expect("make fetcher executable");
         fixture
+    }
+
+    fn payload(&self) -> PathBuf {
+        self.release.join(&self.archive_dir)
+    }
+
+    /// Pack the payload directory into the release archive and record its
+    /// digest in `SHA256SUMS`, as a release would. Call it again after
+    /// changing the payload.
+    fn package(&self) {
+        let packed = Command::new("tar")
+            .current_dir(&self.release)
+            .args(["czf", &self.asset, &self.archive_dir])
+            .status()
+            .expect("package release fixture");
+        assert!(packed.success(), "could not package release fixture");
+
+        let archive = self.release.join(&self.asset);
+        let checksum = if cfg!(target_os = "macos") {
+            Command::new("shasum")
+                .args(["-a", "256"])
+                .arg(&archive)
+                .output()
+        } else {
+            Command::new("sha256sum").arg(&archive).output()
+        }
+        .expect("hash release fixture");
+        assert!(checksum.status.success(), "could not hash release fixture");
+        let checksum = String::from_utf8(checksum.stdout).expect("checksum is UTF-8");
+        let digest = checksum.split_whitespace().next().expect("checksum digest");
+        self.manifest(&format!("{digest}  {}\n", self.asset));
+    }
+
+    fn manifest(&self, contents: &str) {
+        fs::write(self.release.join("SHA256SUMS"), contents).expect("create checksum manifest");
     }
 
     fn install(&self, version: &str) -> Output {
@@ -210,6 +223,158 @@ fn a_malformed_version_is_refused_before_any_download() {
     }
     assert_eq!(release.fetches(), "", "a refused version was downloaded");
     assert!(!release.install.exists());
+}
+
+/// The installer must stop with `message` and leave nothing installed.
+fn assert_refused(release: &Release, message: &str) {
+    let refused = release.install("v0.0.0");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "installed despite: {message}");
+    assert!(
+        stderr.contains(message),
+        "wanted {message:?}, got: {stderr}"
+    );
+    assert!(!release.install.join("simgit").exists());
+    assert!(!release.install.join("sg").exists());
+}
+
+#[test]
+fn a_checksum_mismatch_is_refused() {
+    let release = Release::new();
+    release.manifest(&format!("{}  {}\n", "0".repeat(64), release.asset));
+    assert_refused(&release, "checksum mismatch");
+}
+
+#[test]
+fn a_manifest_without_the_archive_is_refused() {
+    let release = Release::new();
+    release.manifest(&format!("{}  sg-other.tar.gz\n", "0".repeat(64)));
+    assert_refused(&release, "has no record for");
+    release.manifest("");
+    assert_refused(&release, "has no record for");
+}
+
+#[test]
+fn a_duplicate_checksum_record_is_refused() {
+    let release = Release::new();
+    let manifest = fs::read_to_string(release.release.join("SHA256SUMS")).unwrap();
+    // Even two identical records: which one is trusted is not for us to guess.
+    release.manifest(&format!("{manifest}{manifest}"));
+    assert_refused(&release, "duplicate checksum records");
+}
+
+#[test]
+fn a_malformed_checksum_record_is_refused() {
+    let release = Release::new();
+    let digest = "a".repeat(64);
+    for (record, message) in [
+        (
+            format!("{}  {}", &digest[1..], release.asset),
+            "malformed checksum for",
+        ),
+        (
+            format!("{digest}0  {}", release.asset),
+            "malformed checksum for",
+        ),
+        (
+            format!("{}g  {}", &digest[1..], release.asset),
+            "malformed checksum for",
+        ),
+        (
+            format!("{digest} {}", release.asset),
+            "malformed checksum record",
+        ),
+        (
+            format!("{digest} extra  {}", release.asset),
+            "malformed checksum record",
+        ),
+        (
+            format!("{digest}  {} extra", release.asset),
+            "malformed checksum record",
+        ),
+    ] {
+        release.manifest(&format!("{record}\n"));
+        assert_refused(&release, message);
+    }
+}
+
+#[test]
+fn an_sg_that_differs_from_simgit_is_refused() {
+    let release = Release::new();
+    fs::write(release.payload().join("sg"), "#!/bin/sh\nexit 0\n").unwrap();
+    release.package();
+    assert_refused(&release, "non-equivalent simgit and sg binaries");
+}
+
+#[test]
+fn an_archive_without_sg_is_refused() {
+    let release = Release::new();
+    fs::remove_file(release.payload().join("sg")).unwrap();
+    release.package();
+    assert_refused(
+        &release,
+        &format!("did not contain {}/sg", release.archive_dir),
+    );
+}
+
+/// Without curl the installer falls back to wget. The PATH here holds only the
+/// tools the installer needs and a `wget` that records its arguments.
+#[test]
+fn wget_is_used_when_curl_is_missing() {
+    let release = Release::new();
+    let tools = release.root.join("tools");
+    fs::create_dir(&tools).unwrap();
+    let search = std::env::var_os("PATH").unwrap();
+    for tool in [
+        "uname",
+        "mktemp",
+        "rm",
+        "tar",
+        "gzip",
+        "cmp",
+        "cp",
+        "chmod",
+        "mv",
+        "mkdir",
+        "shasum",
+        "sha256sum",
+        "sh",
+    ] {
+        if let Some(found) = std::env::split_paths(&search)
+            .map(|directory| directory.join(tool))
+            .find(|path| path.is_file())
+        {
+            std::os::unix::fs::symlink(found, tools.join(tool)).unwrap();
+        }
+    }
+    assert!(!tools.join("curl").exists());
+    fs::write(
+        release.bin.join("wget"),
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >>\"$SIMGIT_TEST_RELEASE/../wget.log\"\n\
+         out=\nurl=\nwhile [ $# -gt 0 ]; do\n\
+         \tcase \"$1\" in\n\t-qO|-O) out=$2; shift 2 ;;\n\t-*) shift ;;\n\t*) url=$1; shift ;;\n\tesac\n\
+         done\ncp \"$SIMGIT_TEST_RELEASE/${url##*/}\" \"$out\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(release.bin.join("wget"), fs::Permissions::from_mode(0o755)).unwrap();
+    // The stub dir goes first, curl's directory is not on PATH at all.
+    fs::remove_file(release.bin.join("curl")).unwrap();
+    let path = format!("{}:{}", release.bin.display(), tools.display());
+    let installed = release.install_with("v0.0.0", &[("PATH", &path)]);
+    assert!(
+        installed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let log = fs::read_to_string(release.root.join("wget.log")).unwrap();
+    assert_eq!(log.lines().count(), 2, "wget calls: {log}");
+    assert!(
+        log.lines().all(|call| call.contains("https://github.com/")),
+        "wget calls: {log}"
+    );
+    assert_eq!(release.fetches(), "", "curl was used");
+    assert!(release.install.join("simgit").exists());
+    assert!(release.install.join("sg").exists());
 }
 
 /// The fuse-overlayfs hint is for filesystems without reflink; where simgit's

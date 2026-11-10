@@ -11,6 +11,11 @@ set -euo pipefail
 
 SG="${SG:-$(pwd)/target/release/sg}"
 if ! command -v fuse-overlayfs >/dev/null; then
+    # A CI job that installs fuse-overlayfs must not pass by skipping.
+    if [ "${CI:-}" = true ]; then
+        echo "FAIL: fuse-overlayfs not installed" >&2
+        exit 1
+    fi
     echo "SKIP: fuse-overlayfs not installed"
     exit 0
 fi
@@ -31,8 +36,23 @@ unmount_and_wait() {
 }
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-cd "$tmp"
+# Unmount every overlay under $tmp, deepest first, so removing it cannot reach
+# through a live mount into an upperdir or the baseline.
+cleanup() {
+    local mountpoint
+    awk -v root="$tmp/" 'index($5, root) == 1 { print $5 }' /proc/self/mountinfo | sort -r |
+        while read -r mountpoint; do
+            fusermount3 -uz "$mountpoint" 2>/dev/null ||
+                fusermount -uz "$mountpoint" 2>/dev/null ||
+                umount -l "$mountpoint" 2>/dev/null || true
+        done
+    rm -rf "$tmp"
+}
+trap cleanup EXIT
+# The default worktree root is `.simgit/repo` beside the repository, so every
+# worktree, and its mount, lands under $tmp where cleanup finds it.
+mkdir "$tmp/repo"
+cd "$tmp/repo"
 git init -q
 git config user.email t@t
 git config user.name t
