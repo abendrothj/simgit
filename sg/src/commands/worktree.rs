@@ -26,23 +26,21 @@ mod maintenance;
 mod overlay;
 
 pub use doctor::doctor;
-pub use hook::{hook, WorktreeHook};
+pub use hook::{check_requires_before_parsing, hook, hook_arguments, WorktreeHook};
 pub use launch::{run_in_worktree, WorktreeRun};
 pub use locks::{unlock, WorktreeUnlock};
 pub use maintenance::{gc, prune, repair, WorktreeGc, WorktreePrune};
 
 use locks::{
-    allocation_lock_reason, ensure_unlocked, lock_present, lock_state, BranchClaim, PathClaim,
-    RegistryLock, WorktreeLock,
+    allocation_lock_reason, ensure_unlocked, lock_present, lock_state, refuse_unfinished,
+    unfinished, unfinished_worktree, BranchClaim, PathClaim, RegistryLock, WorktreeLock,
 };
-use maintenance::{
-    delete_branch_unguarded, delete_local_branch, prune_git_worktrees, registered_worktree,
-};
+use maintenance::{delete_branch_unguarded, delete_local_branch, registered_worktree};
 
 #[cfg(test)]
 use locks::{lock_owner_of, lock_owner_pid, process_alive, worktree_lock_path};
 #[cfg(test)]
-use maintenance::{prune_baseline_cache, run_gc};
+use maintenance::{prune_baseline_cache, prune_git_worktrees, run_gc};
 
 #[derive(Args)]
 pub struct WorktreeAdd {
@@ -160,6 +158,7 @@ pub fn add(mut args: WorktreeAdd, json: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo = discover_repo(&cwd)?;
     let created = create_worktree(&repo, &cwd, &args, None)?;
+    release_allocation_lock(&repo, &created.target)?;
 
     if json {
         let path = created.target.display().to_string();
@@ -196,15 +195,17 @@ enum WorktreeKind {
 /// Create a worktree for `args`, resolving a relative `--path` against `cwd`.
 /// A `claim` the caller already holds on the branch is used as is; with
 /// `None`, one is acquired without waiting.
+///
+/// The worktree is returned still under its allocation lock. The caller
+/// releases it with `release_allocation_lock`, or `run` takes it over with
+/// `WorktreeLock::take_over_allocation`, so gc never sees it unlocked first.
 fn create_worktree(
     repo: &RepoContext,
     cwd: &Path,
     args: &WorktreeAdd,
     claim: Option<BranchClaim>,
 ) -> Result<CreatedWorktree> {
-    if args.attach && args.detach {
-        bail!("cannot attach an existing branch with --detach");
-    }
+    check_creation_args(args)?;
     let kind = if args.detach {
         WorktreeKind::Detached
     } else if args.attach {
@@ -228,13 +229,7 @@ fn create_worktree(
             branch.context("branch is required unless --detach is used")?,
         )?;
     } else if kind == WorktreeKind::ExistingBranch {
-        if args.base.is_some() {
-            bail!("--base cannot be used with an existing branch");
-        }
         validate_existing_branch(repo, branch.context("existing worktree requires a branch")?)?;
-    }
-    if kind == WorktreeKind::Detached && branch.is_some() {
-        bail!("a branch cannot be combined with --detach");
     }
     let reference = branch.map(|name| format!("refs/heads/{name}"));
     let base = resolve_commit(
@@ -262,11 +257,7 @@ fn create_worktree(
     // the one checked out there.
     let _claim = PathClaim::acquire(repo, &target)?;
 
-    // An empty directory holds nothing to lose, and harnesses routinely
-    // pre-create one per job; anything else is someone's data.
-    if target.exists() && !directory_is_empty(&target) {
-        bail!("worktree path already exists: {}", target.display());
-    }
+    refuse_occupied(&target)?;
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create worktree parent {}", parent.display()))?;
@@ -276,13 +267,7 @@ fn create_worktree(
     let mode = select_populate_mode(repo, target_parent, args.require_cow)?;
 
     let sparse = validate_sparse(&args.sparse)?;
-    if !sparse.is_empty() && mode == PopulateMode::Overlay {
-        bail!(
-            "--sparse is not supported by the fuse-overlayfs backend: the lower \
-             layer is the whole baseline, so nothing is saved by narrowing the \
-             view. Use SIMGIT_POPULATE=reflink or =checkout."
-        );
-    }
+    refuse_sparse_overlay(&sparse, mode)?;
 
     let branch_arg = branch.unwrap_or("");
     let populated = match mode {
@@ -308,7 +293,7 @@ fn create_worktree(
             let mut error = error.context("mark worktree ephemeral");
             // Teardown refuses a locked worktree.
             let teardown = release_allocation_lock(repo, &target)
-                .and_then(|()| teardown_worktree(repo, &target, true));
+                .and_then(|()| teardown_worktree(repo, &target, true, Caller::Cli));
             if let Err(teardown) = teardown {
                 return Err(error.context(format!(
                     "cleanup after ephemeral marker failure: {teardown:#}"
@@ -331,10 +316,6 @@ fn create_worktree(
             return Err(error);
         }
     }
-    // Only now is the worktree whole: until here gc must see it locked, and
-    // a failure here keeps the lock, as a failed population that cannot roll
-    // back does.
-    release_allocation_lock(repo, &target)?;
     warn_if_inside_repository(repo, &target);
 
     Ok(CreatedWorktree {
@@ -343,6 +324,42 @@ fn create_worktree(
         base,
         mode,
     })
+}
+
+/// The checks of `args` that need nothing but the arguments, so a caller can
+/// make them before it changes anything.
+fn check_creation_args(args: &WorktreeAdd) -> Result<()> {
+    if args.attach && args.detach {
+        bail!("cannot attach an existing branch with --detach");
+    }
+    if args.attach && args.base.is_some() {
+        bail!("--base cannot be used with an existing branch");
+    }
+    if args.detach && args.branch.is_some() {
+        bail!("a branch cannot be combined with --detach");
+    }
+    validate_sparse(&args.sparse).map(drop)
+}
+
+fn refuse_sparse_overlay(sparse: &[String], mode: PopulateMode) -> Result<()> {
+    if !sparse.is_empty() && mode == PopulateMode::Overlay {
+        bail!(
+            "--sparse is not supported by the fuse-overlayfs backend: the lower \
+             layer is the whole baseline, so nothing is saved by narrowing the \
+             view. Use SIMGIT_POPULATE=reflink or =checkout."
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a destination that holds something. An empty directory holds
+/// nothing to lose, and harnesses routinely pre-create one per job; anything
+/// else is someone's data.
+fn refuse_occupied(target: &Path) -> Result<()> {
+    if target.exists() && !directory_is_empty(target) {
+        bail!("worktree path already exists: {}", target.display());
+    }
+    Ok(())
 }
 
 /// Choose how to populate the worktree. Prefers per-file reflink, then
@@ -379,7 +396,9 @@ fn select_populate_mode(
         };
     }
 
-    if cow::clone_supported(&repo.common_git_dir, target_parent)? {
+    // A directory no probe can be written in has no CoW to offer; only
+    // `doctor` tells that apart from "unsupported".
+    if cow::clone_supported(&repo.common_git_dir, target_parent).unwrap_or(false) {
         Ok(PopulateMode::CowClone)
     } else if overlay::supported() {
         Ok(PopulateMode::Overlay)
@@ -490,7 +509,7 @@ fn release_allocation_lock(repo: &RepoContext, target: &Path) -> Result<()> {
 fn still_locked(target: &Path) -> String {
     format!(
         "the worktree is still locked; release it with: simgit unlock {}",
-        target.display()
+        shell_quote(target)
     )
 }
 
@@ -946,18 +965,96 @@ fn allocate_overlay_worktree(
     Ok(())
 }
 
+/// Who tears a worktree down, so that its refusals name a fix that caller's
+/// user can run: `remove` takes a flag, a hook's user a whole command.
+#[derive(Clone, Copy)]
+enum Caller {
+    Cli,
+    Hook,
+}
+
+impl Caller {
+    /// Adding `flag` to the removal of `target`, in this caller's terms.
+    fn flag(self, repo: &RepoContext, target: &Path, flag: &str) -> String {
+        match self {
+            Caller::Cli => flag.to_owned(),
+            Caller::Hook => format!(
+                "`{}`",
+                simgit_anywhere(repo, &format!("remove {} {flag}", shell_quote(target)))
+            ),
+        }
+    }
+
+    /// How to recreate a deleted worktree whose sparse checkout cannot be read
+    /// back: the CLI names the cone to pass, a hook's user drops the registration.
+    fn sparse_recovery(self, repo: &RepoContext, target: &Path) -> String {
+        match self {
+            Caller::Cli => "pass --sparse with the directories to check out".to_owned(),
+            Caller::Hook => format!(
+                "drop its registration with `{}`, then create the worktree again",
+                simgit_anywhere(repo, &format!("remove {}", shell_quote(target)))
+            ),
+        }
+    }
+
+    /// The step after keeping a detached worktree's commit.
+    fn then_remove(self, repo: &RepoContext, target: &Path) -> String {
+        match self {
+            Caller::Cli => "then remove it".to_owned(),
+            Caller::Hook => format!(
+                "then remove it with `{}`",
+                simgit_anywhere(repo, &format!("remove {}", shell_quote(target)))
+            ),
+        }
+    }
+}
+
+/// `simgit <arguments>` as a command that works from any directory: simgit
+/// finds its repository from the one it runs in, and the hook's worktrees lie
+/// outside it.
+fn simgit_anywhere(repo: &RepoContext, arguments: &str) -> String {
+    format!(
+        "cd {} && simgit {arguments}",
+        shell_quote(&repo.main_worktree)
+    )
+}
+
+/// `text` as one shell word, for a command a person pastes: bare when it has
+/// only characters no shell treats specially, else single-quoted.
+fn shell_quote(text: impl AsRef<std::ffi::OsStr>) -> String {
+    let text = text.as_ref().to_string_lossy();
+    let plain = |c: char| c.is_ascii_alphanumeric() || "/._-+=:,@%".contains(c);
+    if !text.is_empty() && text.chars().all(plain) {
+        text.into_owned()
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
+}
+
 /// Recheck dirty state at teardown so a command finishing during GC selection
 /// cannot turn a previously clean workspace into silently discarded work.
-fn teardown_worktree(repo: &RepoContext, target: &Path, discard_dirty: bool) -> Result<()> {
-    ensure_unlocked(repo, target)?;
+fn teardown_worktree(
+    repo: &RepoContext,
+    target: &Path,
+    discard_dirty: bool,
+    caller: Caller,
+) -> Result<()> {
+    let lock = ensure_unlocked(repo, target)?;
     // Every caller is covered, and a commit landing after the caller's own
     // check cannot turn a dirty worktree into a clean one that dangles it.
-    refuse_unreached_head(repo, target)?;
+    refuse_unreached_head(repo, target, caller)?;
+    let discard = caller.flag(repo, target, "--discard-dirty");
+    // An unpopulated worktree shows every file as deleted: never offer to
+    // commit that.
+    let dirty_refusal = || match unfinished(&lock) {
+        true => unfinished_worktree(target, &discard),
+        false => uncommitted_changes(repo, target, caller),
+    };
     if registration_gone(repo, target) {
         // Deleted by hand: only this registration is left to drop.
         {
             let _registry = RegistryLock::exclusive(repo)?;
-            drop_gone_registration(repo, target, discard_dirty)?;
+            drop_gone_registration(repo, target, discard_dirty, &discard)?;
         }
         prune_empty_worktree_dirs(repo, target);
         return Ok(());
@@ -965,19 +1062,19 @@ fn teardown_worktree(repo: &RepoContext, target: &Path, discard_dirty: bool) -> 
     // Report uncommitted work in simgit's own terms on every path: Git's
     // `worktree remove` only knows about --force, not about --commit.
     if !discard_dirty && worktree_dirty(target)? {
-        return Err(uncommitted_changes(repo, target));
+        return Err(dirty_refusal());
     }
     let result = if let Some(state) = overlay::state(repo, target) {
         let lock = WorktreeLock::acquire(repo, target)?;
         if !discard_dirty && worktree_dirty(target)? {
-            return Err(uncommitted_changes(repo, target));
+            return Err(dirty_refusal());
         }
         // Dropping the registration below would refuse this only after the
         // files are gone.
         if !discard_dirty && registration_holds_uncommitted(repo, target)? {
             bail!(
                 "the registration of {} holds submodule repositories or refs of its own; \
-                 keep them, or discard them with --discard-dirty",
+                 keep them, or discard them with {discard}",
                 target.display()
             );
         }
@@ -986,7 +1083,7 @@ fn teardown_worktree(repo: &RepoContext, target: &Path, discard_dirty: bool) -> 
         remove_dir_if_present(&state.overlay_dir)?;
         lock.release()?;
         let _registry = RegistryLock::exclusive(repo)?;
-        drop_gone_registration(repo, target, discard_dirty)
+        drop_gone_registration(repo, target, discard_dirty, &discard)
     } else if discard_dirty {
         remove_worktree_force(repo, target)
     } else {
@@ -1001,49 +1098,71 @@ fn teardown_worktree(repo: &RepoContext, target: &Path, discard_dirty: bool) -> 
 }
 
 /// The refusal of a worktree with uncommitted changes, naming what keeps them.
-fn uncommitted_changes(repo: &RepoContext, target: &Path) -> anyhow::Error {
+fn uncommitted_changes(repo: &RepoContext, target: &Path, caller: Caller) -> anyhow::Error {
     let branch = list_worktrees(repo)
         .ok()
         .and_then(|entries| entries.into_iter().find(|entry| entry.path == target))
         .and_then(|entry| entry.branch)
         .or_else(|| overlay::branch(repo, target));
     let keep = match branch {
-        Some(_) => "keep the work with --commit".to_owned(),
-        None => keep_detached_changes(target),
+        Some(_) => format!(
+            "keep the work with {}",
+            caller.flag(repo, target, "--commit")
+        ),
+        None => keep_detached_changes(repo, target, caller),
     };
     anyhow::anyhow!(
-        "worktree has uncommitted changes: {}\n{keep}, or discard it with --discard-dirty",
-        target.display()
+        "worktree has uncommitted changes: {}\n{keep}, or discard it with {}",
+        target.display(),
+        caller.flag(repo, target, "--discard-dirty")
     )
 }
 
 /// How to keep a detached worktree's changes: `--commit` alone would make a
 /// commit no ref reaches, which removal then refuses to drop.
-fn keep_detached_changes(target: &Path) -> String {
+fn keep_detached_changes(repo: &RepoContext, target: &Path, caller: Caller) -> String {
+    let commit = match caller {
+        Caller::Cli => "`--commit`".to_owned(),
+        Caller::Hook => caller.flag(repo, target, "--commit"),
+    };
     format!(
         "keep the work by creating a branch with `git -C {} switch -c <name>`, \
-         then removing the worktree with `--commit`",
-        target.display()
+         then removing the worktree with {commit}",
+        shell_quote(target)
     )
 }
 
 /// Drop the registration of a worktree whose directory is gone, and only that
 /// one; the caller holds the exclusive registry lock. The directory is checked
 /// again last, since Git would delete one that reappeared if it is clean. Git
-/// refuses a registration that was locked meanwhile.
-fn drop_gone_registration(repo: &RepoContext, target: &Path, discard_dirty: bool) -> Result<()> {
-    if !discard_dirty && registration_holds_uncommitted(repo, target)? {
+/// refuses a registration that was locked meanwhile. A refusal names `discard`
+/// as the way to discard what the registration holds.
+fn drop_gone_registration(
+    repo: &RepoContext,
+    target: &Path,
+    discard_dirty: bool,
+    discard: &str,
+) -> Result<()> {
+    let holds = !discard_dirty
+        && registration_holds_uncommitted(repo, target).with_context(|| {
+            format!(
+                "cannot tell whether the registration of {} holds work",
+                target.display()
+            )
+        })?;
+    if holds {
         let admin = overlay::admin_dir(repo, target).unwrap_or_default();
         bail!(
             "{} was deleted, but its registration {admin} still holds staged changes, a merge, \
              rebase, cherry-pick or revert in progress, submodule repositories (`modules/`) \
              or refs of its own (`refs/worktree`, `refs/bisect`, `refs/rewritten`)\n\
-             inspect what is staged with `git --git-dir={admin} diff --cached --stat`, \
-             its refs with `git --git-dir={admin} for-each-ref refs/worktree/ refs/bisect/ \
+             inspect what is staged with `git --git-dir={quoted} diff --cached --stat`, \
+             its refs with `git --git-dir={quoted} for-each-ref refs/worktree/ refs/bisect/ \
              refs/rewritten/`, and its submodule repositories under {admin}/modules; \
-             or discard all of it with --discard-dirty",
+             or discard all of it with {discard}",
             target.display(),
             admin = admin.display(),
+            quoted = shell_quote(&admin),
         );
     }
     if !matches!(target.try_exists(), Ok(false)) {
@@ -1055,6 +1174,94 @@ fn drop_gone_registration(repo: &RepoContext, target: &Path, discard_dirty: bool
     let mut command = git_common_command(repo);
     command.args(["worktree", "remove"]).arg(target);
     run_command(&mut command, "drop the registration of a deleted worktree")
+}
+
+/// Drop the registration of a worktree deleted by hand, so that it can be
+/// allocated again, with `remove`'s refusals of whatever that would lose: a
+/// lock, a detached HEAD no ref reaches, or work the registration holds. Each
+/// refusal names its recovery; `then` is the caller's step after keeping a
+/// detached commit.
+fn drop_deleted_registration(
+    repo: &RepoContext,
+    entry: &WorktreeEntry,
+    then: &str,
+    caller: Caller,
+) -> Result<()> {
+    ensure_unlocked(repo, &entry.path)?;
+    if entry.branch.is_none() {
+        refuse_unreached_entry(repo, entry, then)?;
+    }
+    let spec = match &entry.branch {
+        Some(reference) => short_branch(reference).to_owned(),
+        None => shell_quote(&entry.path),
+    };
+    let _registry = RegistryLock::exclusive(repo)?;
+    let discard = match caller {
+        Caller::Cli => format!("`simgit remove {spec} --discard-dirty`"),
+        Caller::Hook => caller.flag(repo, &entry.path, "--discard-dirty"),
+    };
+    drop_gone_registration(repo, &entry.path, false, &discard)
+}
+
+/// What a deleted worktree's registration records that reattaching keeps:
+/// whether it is ephemeral, and its cone-mode sparse directories (read only
+/// when `sparse` is true). An entry whose settings cannot be read is an error.
+fn deleted_worktree_settings(
+    repo: &RepoContext,
+    entry: &WorktreeEntry,
+    sparse: bool,
+    caller: Caller,
+) -> Result<(bool, Vec<String>)> {
+    let target = &entry.path;
+    let admin = overlay::admin_dir(repo, target)
+        .with_context(|| format!("cannot find the registration of {}", target.display()))?;
+    let marker = admin.join("simgit-ephemeral");
+    let ephemeral = marker
+        .try_exists()
+        .with_context(|| format!("check {}", marker.display()))?;
+    if !sparse {
+        return Ok((ephemeral, Vec::new()));
+    }
+    let unreadable = || format!("cannot read the sparse checkout of {}", target.display());
+    let config = git_at_admin(
+        repo,
+        &admin,
+        &["config", "--get-regexp", "^core\\.sparsecheckout"],
+    )?;
+    let settings = match config.status.code() {
+        Some(0) => String::from_utf8(config.stdout).with_context(unreadable)?,
+        Some(1) => String::new(),
+        _ => return Err(git_failure("git config", &config)).with_context(unreadable),
+    };
+    let set = |key: &str| settings.lines().any(|line| line == format!("{key} true"));
+    if !set("core.sparsecheckout") {
+        return Ok((ephemeral, Vec::new()));
+    }
+    if !set("core.sparsecheckoutcone") {
+        bail!(
+            "{}: its sparse checkout is not in cone mode, so --sparse cannot recreate it; {}",
+            unreadable(),
+            caller.sparse_recovery(repo, target)
+        );
+    }
+    let list = git_at_admin(repo, &admin, &["sparse-checkout", "list"])?;
+    if !list.status.success() {
+        return Err(git_failure("git sparse-checkout list", &list)).with_context(unreadable);
+    }
+    let directories: Vec<String> = String::from_utf8(list.stdout)
+        .with_context(unreadable)?
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    // Git quotes a name it cannot print plainly; never guess at its unquoting.
+    if directories.iter().any(|dir| dir.starts_with('"')) {
+        bail!(
+            "{}: a directory name is quoted; {}",
+            unreadable(),
+            caller.sparse_recovery(repo, target)
+        );
+    }
+    Ok((ephemeral, directories))
 }
 
 /// Whether a worktree's registration holds uncommitted work of its own: an
@@ -1274,7 +1481,11 @@ pub fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     if entry.as_ref().is_some_and(|entry| entry.is_main) {
         bail!("{} is the main checkout, not a worktree", target.display());
     }
-    ensure_unlocked(&repo, &target)?;
+    let lock = ensure_unlocked(&repo, &target)?;
+    // Committing an unpopulated worktree would record every file as deleted.
+    if args.commit && !gone && unfinished(&lock) {
+        return Err(unfinished_worktree(&target, "--discard-dirty"));
+    }
     let branch = entry
         .and_then(|entry| entry.branch)
         .or_else(|| overlay::branch(&repo, &target));
@@ -1288,14 +1499,14 @@ pub fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
     }
     // Before --commit makes a commit; teardown rechecks in case a commit lands
     // between here and there.
-    refuse_unreached_head(&repo, &target)?;
+    refuse_unreached_head(&repo, &target, Caller::Cli)?;
     // A detached worktree's commit would be reached by no ref, so teardown
     // would refuse it, after the commit, on every retry.
     if args.commit && !gone && branch.is_none() && worktree_dirty(&target)? {
         bail!(
             "{} is detached, so --commit would make a commit no branch reaches\n{}",
             target.display(),
-            keep_detached_changes(&target)
+            keep_detached_changes(&repo, &target, Caller::Cli)
         );
     }
     // A commit that succeeded is never rolled back when a later step fails: it
@@ -1322,7 +1533,7 @@ pub fn remove(args: WorktreeRemove, json: bool) -> Result<()> {
         }
     }
 
-    teardown_worktree(&repo, &target, args.discard_dirty)
+    teardown_worktree(&repo, &target, args.discard_dirty, Caller::Cli)
         .map_err(|error| annotate_commit_kept(error, commit.as_deref(), branch.as_deref()))?;
 
     let mut branch_deleted = false;
@@ -2012,7 +2223,7 @@ fn worktree_dirty(worktree: &Path) -> Result<bool> {
 /// Refuse to tear down a detached worktree whose HEAD commit no ref reaches.
 /// The HEAD comes from the registry, never from the worktree's own gitfile: a
 /// missing gitfile makes git walk up and measure the main checkout instead.
-fn refuse_unreached_head(repo: &RepoContext, target: &Path) -> Result<()> {
+fn refuse_unreached_head(repo: &RepoContext, target: &Path, caller: Caller) -> Result<()> {
     let entry = list_worktrees(repo)?
         .into_iter()
         .find(|entry| entry.path == target)
@@ -2020,6 +2231,13 @@ fn refuse_unreached_head(repo: &RepoContext, target: &Path) -> Result<()> {
     if entry.branch.is_some() || overlay::branch(repo, target).is_some() {
         return Ok(());
     }
+    refuse_unreached_entry(repo, &entry, &caller.then_remove(repo, target))
+}
+
+/// `refuse_unreached_head` for a detached `entry` already read from the
+/// registry; `then` is the step that follows keeping the commit.
+fn refuse_unreached_entry(repo: &RepoContext, entry: &WorktreeEntry, then: &str) -> Result<()> {
+    let target = &entry.path;
     let head = entry.head.as_deref();
     let unreached = head_unreached(repo, head).with_context(|| {
         format!(
@@ -2031,17 +2249,17 @@ fn refuse_unreached_head(repo: &RepoContext, target: &Path) -> Result<()> {
         // Without its gitfile, git run there walks up to another repository,
         // so name the commit from the main checkout instead.
         let keep = if matches!(target.join(".git").try_exists(), Ok(true)) {
-            format!("git -C {} branch <name>", target.display())
+            format!("git -C {} branch <name>", shell_quote(target))
         } else {
             format!(
                 "git -C {} branch <name> {}",
-                repo.main_worktree.display(),
+                shell_quote(&repo.main_worktree),
                 head.unwrap_or_default()
             )
         };
         bail!(
             "{} is detached at a commit no branch or tag reaches; removing it would \
-             lose that work. Keep it with `{keep}`, then remove it",
+             lose that work. Keep it with `{keep}`, {then}",
             target.display()
         );
     }

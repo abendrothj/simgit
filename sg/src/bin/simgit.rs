@@ -1,5 +1,5 @@
 //! The canonical `simgit` executable.
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
     simgit_cli::run_cli()
 }

@@ -152,6 +152,92 @@ fn requires_refuses_an_older_binary_with_exit_1() {
     assert_eq!(child.status.code(), Some(1));
 }
 
+/// A newer plugin may pass flags this simgit does not know. The version
+/// check comes first, so the person is told to upgrade, not shown a usage error.
+#[test]
+fn requires_is_checked_before_unknown_flags() {
+    let fixture = HookFixture::new();
+    let hook = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_simgit"))
+            .current_dir(&fixture.root)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run simgit")
+    };
+    for args in [
+        vec![
+            "hook",
+            "claude-code",
+            "--requires",
+            "99.0.0",
+            "--from-the-future",
+        ],
+        vec![
+            "hook",
+            "claude-code",
+            "--from-the-future",
+            "--requires=99.0.0",
+        ],
+        vec![
+            "--json",
+            "hook",
+            "claude-code",
+            "--requires",
+            "99.0.0",
+            "--x",
+            "y",
+        ],
+    ] {
+        let output = hook(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let text = stderr(&output);
+        assert_eq!(text.lines().count(), 1, "{args:?}: {text}");
+        assert!(
+            text.contains("requires simgit >= 99.0.0")
+                && text.contains(&format!("found {}", env!("CARGO_PKG_VERSION"))),
+            "{args:?}: {text}"
+        );
+    }
+    // Once the version is satisfied an unknown flag is still a usage error.
+    let output = hook(&[
+        "hook",
+        "claude-code",
+        "--requires",
+        "0.0.0",
+        "--from-the-future",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(stderr(&output).lines().count(), 1, "{}", stderr(&output));
+
+    // So is a missing --requires, with or without a global flag first.
+    for args in [
+        &["hook", "claude-code"][..],
+        &["--json", "hook", "claude-code"],
+    ] {
+        let output = hook(args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            stderr(&output).lines().count(),
+            1,
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
 #[test]
 fn json_flag_is_rejected() {
     let fixture = HookFixture::new();
@@ -330,6 +416,156 @@ fn create_refuses_a_run_locked_worktree() {
     runner.wait().expect("wait for simgit run");
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(output.stdout.is_empty());
+}
+
+/// A pid that named a process which has exited.
+fn dead_pid() -> u32 {
+    let mut child = Command::new("true").spawn().expect("spawn true");
+    let pid = child.id();
+    child.wait().expect("wait for true");
+    pid
+}
+
+/// The main checkout as simgit names it, symlinks resolved.
+fn main_checkout(fixture: &HookFixture) -> PathBuf {
+    fixture
+        .repo
+        .canonicalize()
+        .expect("resolve the main checkout")
+}
+
+/// `simgit <arguments>` as a recovery hint spells it, to be run from anywhere.
+fn hint(fixture: &HookFixture, arguments: &str) -> String {
+    format!(
+        "cd {} && simgit {arguments}",
+        main_checkout(fixture).display()
+    )
+}
+
+/// Run a recovery hint the way a person pastes it into a shell: from a
+/// directory in no repository, with this build's simgit first on `PATH`.
+fn run_hint(fixture: &HookFixture, hint: &str) -> Output {
+    let bin = Path::new(env!("CARGO_BIN_EXE_simgit"))
+        .parent()
+        .expect("bin dir")
+        .to_path_buf();
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH"),
+    )))
+    .expect("join PATH");
+    Command::new("sh")
+        .arg("-c")
+        .arg(hint)
+        .current_dir(&fixture.root)
+        .env("PATH", path)
+        .env("SIMGIT_POPULATE", "checkout")
+        .output()
+        .expect("run the hint")
+}
+
+/// Leave `simgit/<name>` registered at its hook path as an allocation killed
+/// right after `git worktree add` leaves it: locked by a dead pid, with no
+/// index and no files. Returns the path and the pid.
+fn kill_an_allocation(fixture: &HookFixture, name: &str) -> (PathBuf, u32) {
+    let path = create_worktree(fixture, name);
+    let removed = fixture.hook(&[], remove_payload(&path));
+    assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
+    let dead = dead_pid();
+    let reason = format!("simgit: allocating (pid {dead})");
+    let branch = format!("simgit/{name}");
+    let path_arg = path.to_str().expect("utf-8 path");
+    git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--no-checkout",
+            "--lock",
+            "--reason",
+            &reason,
+            "-b",
+            &branch,
+            path_arg,
+        ],
+    );
+    (path, dead)
+}
+
+/// An allocation killed after `git worktree add` leaves its registration at
+/// the name's path, locked with the dead allocator's pid, with or without its
+/// directory. The create names that, and the command that releases it.
+#[test]
+fn create_names_the_unlock_for_a_killed_allocation() {
+    let fixture = HookFixture::new();
+    for (name, delete) in [("k1", false), ("k2", true)] {
+        let (path, dead) = kill_an_allocation(&fixture, name);
+        if delete {
+            fs::remove_dir_all(&path).expect("delete");
+        }
+
+        let output = fixture.hook(&[], create_payload(name, &fixture.repo));
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(output.stdout.is_empty());
+        let complaint = stderr(&output);
+        assert_eq!(complaint.lines().count(), 1, "{complaint}");
+        let unlock = hint(&fixture, &format!("unlock {}", path.display()));
+        assert!(
+            complaint.contains(&format!("no longer running (pid {dead})"))
+                && complaint.contains(&unlock),
+            "{complaint}"
+        );
+        assert!(registered(&fixture.repo, &path));
+    }
+}
+
+/// Once its lock is cleared, a killed allocation's worktree is still half
+/// made: no index, every tracked file showing as deleted. The create refuses
+/// to hand it out, removal never offers to commit that, and the named
+/// recovery, run from outside the repository, lets the next create succeed.
+#[test]
+fn create_refuses_a_half_made_worktree_until_it_is_removed() {
+    let fixture = HookFixture::new();
+    let (path, _) = kill_an_allocation(&fixture, "h1");
+    let unlock = hint(&fixture, &format!("unlock {}", path.display()));
+    let discard = hint(
+        &fixture,
+        &format!("remove {} --discard-dirty", path.display()),
+    );
+    let locked = fixture.hook(&[], create_payload("h1", &fixture.repo));
+    assert_eq!(locked.status.code(), Some(1), "{}", stderr(&locked));
+    for step in [&unlock, &discard] {
+        assert!(
+            stderr(&locked).contains(step.as_str()),
+            "{}",
+            stderr(&locked)
+        );
+    }
+    let unlocked = run_hint(&fixture, &unlock);
+    assert!(unlocked.status.success(), "{}", stderr(&unlocked));
+
+    let refused = fixture.hook(&[], create_payload("h1", &fixture.repo));
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(refused.stdout.is_empty());
+    let complaint = stderr(&refused);
+    assert_eq!(complaint.lines().count(), 1, "{complaint}");
+    assert!(complaint.contains(&discard), "{complaint}");
+
+    let kept = fixture.hook(&[], remove_payload(&path));
+    assert_eq!(kept.status.code(), Some(1), "{}", stderr(&kept));
+    assert!(stderr(&kept).contains(&discard), "{}", stderr(&kept));
+    assert!(!stderr(&kept).contains("--commit"), "{}", stderr(&kept));
+
+    let removed = run_hint(&fixture, &discard);
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    let again = fixture.hook(&[], create_payload("h1", &fixture.repo));
+    assert_eq!(again.status.code(), Some(0), "{}", stderr(&again));
+    assert_eq!(stdout_path(&again), path);
+    assert_eq!(
+        fs::read_to_string(path.join("README.md")).expect("populated"),
+        "base\n"
+    );
+    assert_eq!(git(&path, &["status", "--porcelain"]), "");
 }
 
 #[test]
@@ -601,6 +837,146 @@ fn pr_fetch_failure_is_reported_as_itself() {
     );
 }
 
+/// Run the hook on `payload` with a new pseudo-terminal as its controlling
+/// terminal, as when Claude Code runs in one. A run still going after a
+/// minute is killed and fails the test.
+fn hook_on_a_terminal(
+    fixture: &HookFixture,
+    payload: &Value,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> Output {
+    use std::ffi::{c_char, c_int, c_ulong, CStr};
+    use std::os::unix::process::CommandExt;
+    extern "C" {
+        fn posix_openpt(flags: c_int) -> c_int;
+        fn grantpt(fd: c_int) -> c_int;
+        fn unlockpt(fd: c_int) -> c_int;
+        fn ptsname(fd: c_int) -> *mut c_char;
+        fn setsid() -> c_int;
+        fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+        fn close(fd: c_int) -> c_int;
+    }
+    const O_RDWR: c_int = 2;
+    #[cfg(target_os = "macos")]
+    const O_NOCTTY: c_int = 0x20000;
+    #[cfg(target_os = "linux")]
+    const O_NOCTTY: c_int = 0o400;
+    #[cfg(target_os = "macos")]
+    const TIOCSCTTY: c_ulong = 0x2000_7461;
+    #[cfg(target_os = "linux")]
+    const TIOCSCTTY: c_ulong = 0x540E;
+
+    // SAFETY: plain calls on a descriptor this function owns; `ptsname`'s
+    // string is copied before anything else can reuse its buffer.
+    let (master, terminal) = unsafe {
+        let master = posix_openpt(O_RDWR | O_NOCTTY);
+        assert!(master >= 0, "posix_openpt");
+        assert_eq!(grantpt(master), 0, "grantpt");
+        assert_eq!(unlockpt(master), 0, "unlockpt");
+        let name = ptsname(master);
+        assert!(!name.is_null(), "ptsname");
+        (master, CStr::from_ptr(name).to_owned())
+    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_simgit"));
+    command
+        .current_dir(&fixture.root)
+        .envs(env.iter().copied())
+        .env("CLAUDE_PROJECT_DIR", &fixture.repo)
+        .env("SIMGIT_POPULATE", "checkout")
+        .args(["hook", "claude-code", "--requires", "0.0.0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: between fork and exec the closure only makes async-signal-safe
+    // calls on the name copied above, and allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let fd = open(terminal.as_ptr(), O_RDWR | O_NOCTTY);
+            // Left open: on macOS the terminal's last close ends its role as
+            // the controlling terminal.
+            if fd == -1 || ioctl(fd, TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().expect("spawn simgit");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(payload.to_string().as_bytes())
+        .expect("write stdin");
+    let started = std::time::Instant::now();
+    while child.try_wait().expect("poll simgit").is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the hook was still running after a minute");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().expect("wait for simgit");
+    // SAFETY: `master` is this function's descriptor, closed once.
+    unsafe { close(master) };
+    output
+}
+
+/// An ssh that can reach a terminal prompts there and waits for an answer
+/// nobody gives, since nobody reads the hook's terminal. The fetch runs with
+/// no controlling terminal, so such a prompt fails at once.
+#[test]
+fn pr_fetch_has_no_terminal_for_ssh_to_prompt_on() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = HookFixture::new();
+    git(
+        &fixture.repo,
+        &["remote", "add", "origin", "ssh://simgit.invalid/origin.git"],
+    );
+    // Stands in for ssh asking for a passphrase: it records whether it could
+    // open the terminal to ask on, then fails as an unanswered prompt would.
+    let opened = fixture.root.join("opened-the-terminal");
+    let ssh = fixture.root.join("ssh");
+    fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\n\
+             if (: </dev/tty) 2>/dev/null; then : > '{}'; fi\n\
+             exit 255\n",
+            opened.display()
+        ),
+    )
+    .expect("write ssh");
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).expect("chmod");
+    let before = fixture.snapshot();
+
+    let output = hook_on_a_terminal(
+        &fixture,
+        &create_payload("pr-7", &fixture.repo),
+        &[
+            ("GIT_SSH_COMMAND", ssh.as_os_str()),
+            ("GIT_SSH_VARIANT", "simple".as_ref()),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(output.stdout.is_empty());
+    assert!(
+        stderr(&output).contains("pull request 7"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !opened.exists(),
+        "the fetch's ssh could open the terminal to prompt on"
+    );
+    assert_eq!(fixture.snapshot(), before);
+}
+
 /// `git fetch`'s connectivity check reads every worktree's HEAD, so it dies
 /// on a registration another allocation is half-way through writing. The
 /// wrapper fails the first fetch that way; the create must still succeed.
@@ -652,6 +1028,65 @@ fn pr_fetch_is_retried_after_a_half_written_registration() {
         git(&stdout_path(&output), &["rev-parse", "HEAD"]).trim(),
         origin_ref(&origin, "refs/pull/7/head")
     );
+}
+
+/// A create killed between its fetch and the ref's deletion strands a
+/// temporary ref that names its process. `prune` deletes it once that process
+/// is gone, and keeps a running process's and one that names none.
+#[test]
+fn prune_deletes_the_fetch_refs_of_a_killed_create() {
+    let fixture = HookFixture::new();
+    add_origin_with_changes(&fixture);
+    let env = git_wrapper(
+        &fixture,
+        "case \"$2 $4\" in \"rev-parse refs/simgit/fetch/\"*) kill -9 \"$PPID\"; exit 1;; esac\n",
+    );
+    let output = hook_with_env(&fixture, &[], &create_payload("pr-7", &fixture.repo), &env);
+    assert_eq!(output.status.code(), None, "{}", stderr(&output));
+    let refs = || {
+        git(
+            &fixture.repo,
+            &["for-each-ref", "--format=%(refname)", "refs/simgit/fetch/"],
+        )
+    };
+    let stranded = refs();
+    let (pid, uuid) = stranded
+        .trim()
+        .strip_prefix("refs/simgit/fetch/")
+        .and_then(|name| name.split_once('-'))
+        .unwrap_or_else(|| panic!("not one <pid>-<uuid> ref: {stranded:?}"));
+    assert!(pid.parse::<u32>().is_ok(), "{stranded}");
+    assert!(uuid::Uuid::parse_str(uuid).is_ok(), "{stranded}");
+
+    let live = format!(
+        "refs/simgit/fetch/{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    let unowned = format!("refs/simgit/fetch/{}", uuid::Uuid::new_v4());
+    // Names simgit never writes, each naming the dead pid: never taken as its.
+    let id = uuid::Uuid::new_v4();
+    let malformed = [
+        format!("refs/simgit/fetch/+{pid}-{id}"),
+        format!("refs/simgit/fetch/0{pid}-{id}"),
+        format!("refs/simgit/fetch/{pid}.{id}"),
+        format!("refs/simgit/fetch/{pid}-{}", id.simple()),
+    ];
+    for name in malformed.iter().chain([&live, &unowned]) {
+        git(&fixture.repo, &["update-ref", name, "HEAD"]);
+    }
+    let pruned = Command::new(env!("CARGO_BIN_EXE_simgit"))
+        .current_dir(&fixture.repo)
+        .arg("prune")
+        .output()
+        .expect("run simgit prune");
+    assert!(pruned.status.success(), "{}", stderr(&pruned));
+    let mut kept: Vec<String> = refs().lines().map(str::to_owned).collect();
+    kept.sort();
+    let mut expected = vec![live, unowned];
+    expected.extend(malformed);
+    expected.sort();
+    assert_eq!(kept, expected);
 }
 
 #[test]
@@ -762,6 +1197,38 @@ fn create_worktree(fixture: &HookFixture, name: &str) -> PathBuf {
     stdout_path(&output)
 }
 
+/// A deleted worktree whose sparse checkout is not in cone mode cannot be
+/// recreated, and a hook has no `--sparse` to pass: the refusal names a command
+/// that works from a shell, on one line.
+#[test]
+fn create_refuses_a_non_cone_sparse_worktree_deleted_by_hand_with_a_hook_recovery() {
+    let fixture = HookFixture::new();
+    let path = create_worktree(&fixture, "sparse");
+    git(&path, &["sparse-checkout", "set", "--no-cone", "README.md"]);
+    fs::remove_dir_all(&path).expect("delete by hand");
+
+    let output = fixture.hook(&[], create_payload("sparse", &fixture.repo));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let note = stderr(&output);
+    assert_eq!(note.lines().count(), 1, "{note}");
+    assert!(!note.contains("pass --sparse"), "{note}");
+    assert!(
+        note.contains(&format!("&& simgit remove {}", path.display())),
+        "{note}"
+    );
+    assert!(registered(&fixture.repo, &path));
+
+    // The named recovery works, and the name is then free to create again.
+    let removed = Command::new(env!("CARGO_BIN_EXE_simgit"))
+        .current_dir(&fixture.repo)
+        .arg("remove")
+        .arg(&path)
+        .output()
+        .expect("run simgit remove");
+    assert!(removed.status.success(), "{}", stderr(&removed));
+    create_worktree(&fixture, "sparse");
+}
+
 fn commit_in(worktree: &Path, file: &str) {
     fs::write(worktree.join(file), "work\n").expect("write");
     git(worktree, &["add", "."]);
@@ -795,6 +1262,31 @@ fn remove_refuses_a_worktree_not_on_a_simgit_branch() {
     assert!(branch_exists(&fixture.repo, "other/x"));
 }
 
+/// A detached worktree is the hook's only at a `simgit/<name>` allocation
+/// path; one anywhere else is left alone, its HEAD reached or not.
+#[test]
+fn remove_refuses_a_detached_worktree_not_at_a_hook_path() {
+    let fixture = HookFixture::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_simgit"))
+        .current_dir(&fixture.repo)
+        .env("SIMGIT_POPULATE", "checkout")
+        .args(["--json", "add", "--detach"])
+        .output()
+        .expect("simgit add");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let added: Value = serde_json::from_slice(&output.stdout).expect("json");
+    let path = PathBuf::from(added["path"].as_str().expect("path"));
+    let output = fixture.hook(&["--discard-dirty"], remove_payload(&path));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not on a simgit/ branch"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(path.join("README.md").is_file());
+    assert!(registered(&fixture.repo, &path));
+}
+
 #[test]
 fn remove_refuses_the_main_checkout() {
     let fixture = HookFixture::new();
@@ -809,19 +1301,110 @@ fn remove_refuses_the_main_checkout() {
     assert!(fixture.repo.join("README.md").is_file());
 }
 
+/// The hook's worktree is the one at its allocation path, detached or not; a
+/// detached HEAD a ref reaches loses nothing when it goes.
 #[test]
-fn remove_refuses_a_detached_worktree() {
+fn remove_removes_a_detached_worktree_whose_commit_is_reached() {
     let fixture = HookFixture::new();
     let path = create_worktree(&fixture, "d1");
     git(&path, &["checkout", "-q", "--detach"]);
     let output = fixture.hook(&["--discard-dirty"], remove_payload(&path));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!path.exists());
+    assert!(!registered(&fixture.repo, &path));
+    assert!(!branch_exists(&fixture.repo, "simgit/d1"));
+}
+
+/// A1/A2: commits on a detached HEAD that no ref reaches exist only in the
+/// worktree, so removal keeps it, with or without its directory and even with
+/// `--discard-dirty`, and names the branch command that keeps the work.
+#[test]
+fn detached_hook_worktree_with_unreached_commits_is_kept() {
+    let fixture = HookFixture::new();
+    let path = create_worktree(&fixture, "d2");
+    git(&path, &["switch", "-q", "--detach"]);
+    commit_in(&path, "work.txt");
+    let output = fixture.hook(&["--discard-dirty"], remove_payload(&path));
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let keep = format!("git -C {} branch <name>", path.display());
+    let then = format!(
+        "then remove it with `{}`",
+        hint(&fixture, &format!("remove {}", path.display()))
+    );
+    assert!(stderr(&output).contains(&keep), "{}", stderr(&output));
+    assert!(stderr(&output).contains(&then), "{}", stderr(&output));
+    assert!(path.join("work.txt").is_file());
+
+    fs::remove_dir_all(&path).expect("delete by hand");
+    let output = fixture.hook(&["--discard-dirty"], remove_payload(&path));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    // The gitfile is gone, so the commit is named from the main checkout, and
+    // the step after it is one that works outside Claude Code.
+    let then = format!(
+        "then remove it with `{}`",
+        hint(&fixture, &format!("remove {}", path.display()))
+    );
     assert!(
-        stderr(&output).contains("not on a simgit/ branch"),
+        stderr(&output).contains("branch <name>"),
         "{}",
         stderr(&output)
     );
-    assert!(path.is_dir());
+    assert!(stderr(&output).contains(&then), "{}", stderr(&output));
+    assert!(registered(&fixture.repo, &path));
+}
+
+/// The hook's worktree is the one at its allocation path: a branch switched
+/// inside it must not make the next create allocate a second worktree.
+#[test]
+fn create_reuses_a_worktree_whose_branch_was_switched() {
+    let fixture = HookFixture::new();
+    let path = create_worktree(&fixture, "sw1");
+    for (switch, branch) in [
+        (&["switch", "-q", "-c", "other"][..], "other"),
+        (&["switch", "-q", "--detach"][..], "HEAD"),
+    ] {
+        git(&path, switch);
+        let output = fixture.hook(&[], create_payload("sw1", &fixture.repo));
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert_eq!(stdout_path(&output), path);
+        assert_eq!(branch_of(&path), branch);
+    }
+    let listing = git(&fixture.repo, &["worktree", "list", "--porcelain"]);
+    let worktrees = listing
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count();
+    assert_eq!(worktrees, 2, "{listing}");
+}
+
+/// Removal takes a worktree whose branch was switched or renamed, and leaves
+/// the branch it is on now, which is not simgit's, with the commit only it
+/// reaches. A `/` in the name is not spelled out by the directory name.
+#[test]
+fn remove_removes_a_switched_worktree_and_keeps_its_branch() {
+    let fixture = HookFixture::new();
+    for (name, switch, branch) in [
+        ("sw2", &["switch", "-q", "-c", "other"][..], "other"),
+        (
+            "nested/sw3",
+            &["switch", "-q", "-c", "nested"][..],
+            "nested",
+        ),
+        ("sw4", &["branch", "-m", "renamed"][..], "renamed"),
+    ] {
+        let path = create_worktree(&fixture, name);
+        git(&path, switch);
+        commit_in(&path, "work.txt");
+        let tip = git(&path, &["rev-parse", "HEAD"]);
+        let output = fixture.hook(&["--discard-dirty"], remove_payload(&path));
+        assert_eq!(output.status.code(), Some(0), "{name}: {}", stderr(&output));
+        assert!(!path.exists(), "{name}");
+        assert!(!registered(&fixture.repo, &path), "{name}");
+        assert_eq!(git(&fixture.repo, &["rev-parse", branch]), tip, "{name}");
+        // Left at the base, which the main checkout reaches.
+        let simgit = format!("simgit/{name}");
+        assert!(!branch_exists(&fixture.repo, &simgit), "{name}");
+    }
 }
 
 #[test]
@@ -850,8 +1433,43 @@ fn remove_without_discard_dirty_refuses_a_dirty_worktree() {
         "{}",
         stderr(&output)
     );
+    // The hook takes no --commit: the fix is a command a person can run,
+    // from wherever they are.
+    let fix = |flag: &str| hint(&fixture, &format!("remove {} {flag}", path.display()));
+    for flag in ["--commit", "--discard-dirty"] {
+        let command = format!("`{}`", fix(flag));
+        assert!(stderr(&output).contains(&command), "{}", stderr(&output));
+    }
     assert!(path.join("scratch.txt").is_file());
     assert!(branch_exists(&fixture.repo, "simgit/r2"));
+
+    let kept = run_hint(&fixture, &fix("--commit"));
+    assert!(kept.status.success(), "{}", stderr(&kept));
+    assert!(!path.exists());
+    assert_eq!(
+        git(&fixture.repo, &["show", "simgit/r2:scratch.txt"]),
+        "x\n"
+    );
+}
+
+/// A detached worktree's changes need a branch before a commit can keep them;
+/// the refusal says so, then names the removal that works from a shell.
+#[test]
+fn remove_refuses_a_dirty_detached_worktree_naming_a_branch_first() {
+    let fixture = HookFixture::new();
+    let path = create_worktree(&fixture, "r2d");
+    git(&path, &["switch", "-q", "--detach"]);
+    fs::write(path.join("scratch.txt"), "x\n").expect("write");
+    let output = fixture.hook(&[], remove_payload(&path));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let switch = format!("git -C {} switch -c <name>", path.display());
+    let commit = format!(
+        "`{}`",
+        hint(&fixture, &format!("remove {} --commit", path.display()))
+    );
+    assert!(stderr(&output).contains(&switch), "{}", stderr(&output));
+    assert!(stderr(&output).contains(&commit), "{}", stderr(&output));
+    assert!(path.join("scratch.txt").is_file());
 }
 
 #[test]
@@ -1070,6 +1688,49 @@ fn remove_of_a_worktree_deleted_by_hand_prunes_it_and_drops_its_branch() {
     assert!(!branch_exists(&fixture.repo, "simgit/r10"));
 }
 
+/// Removing a hook worktree deleted by hand drops that one registration, not
+/// every stale one in the repository: another worktree deleted by hand is not
+/// the hook's to clean up.
+#[test]
+fn remove_of_a_deleted_worktree_drops_only_its_own_registration() {
+    let fixture = HookFixture::new();
+    let path = create_worktree(&fixture, "r13");
+    let other = fixture.root.join("other");
+    let other_arg = other.to_str().expect("utf-8 path");
+    git(
+        &fixture.repo,
+        &["worktree", "add", "-q", "-b", "other", other_arg],
+    );
+    // Resolved while it exists, as Git registered it.
+    let other = other.canonicalize().expect("resolve");
+    fs::remove_dir_all(&path).expect("delete by hand");
+    fs::remove_dir_all(&other).expect("delete by hand");
+    let output = fixture.hook(&["--discard-dirty"], remove_payload(&path));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!registered(&fixture.repo, &path));
+    assert!(!branch_exists(&fixture.repo, "simgit/r13"));
+    assert!(registered(&fixture.repo, &other));
+}
+
+/// A lock is someone's claim on the registration, deleted directory or not:
+/// removal keeps the registration and the branch, even with `--discard-dirty`.
+#[test]
+fn remove_of_a_locked_worktree_deleted_by_hand_keeps_it() {
+    let fixture = HookFixture::new();
+    let path = create_worktree(&fixture, "r14");
+    let path_arg = path.to_str().expect("utf-8 path");
+    git(
+        &fixture.repo,
+        &["worktree", "lock", "--reason", "on a USB disk", path_arg],
+    );
+    fs::remove_dir_all(&path).expect("delete by hand");
+    let output = fixture.hook(&["--discard-dirty"], remove_payload(&path));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("is locked"), "{}", stderr(&output));
+    assert!(registered(&fixture.repo, &path));
+    assert!(branch_exists(&fixture.repo, "simgit/r14"));
+}
+
 /// A deleted worktree's submodule repositories live in its registration, and
 /// a commit in one may exist nowhere else: the hook keeps both.
 #[test]
@@ -1102,7 +1763,8 @@ fn remove_of_a_deleted_worktree_keeps_its_submodule_commits() {
 
     for extra in [&[][..], &["--discard-dirty"][..]] {
         let output = fixture.hook(extra, remove_payload(&path));
-        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert!(stderr(&output).contains("modules/"), "{}", stderr(&output));
         assert!(registered(&fixture.repo, &path), "{extra:?}");
         assert!(branch_exists(&fixture.repo, "simgit/subs"), "{extra:?}");
     }
@@ -1391,6 +2053,38 @@ fn stop_prunes_a_worktree_deleted_by_hand_and_keeps_unpushed_work() {
     assert!(branch_exists(&fixture.repo, "simgit/agent-a9"));
 }
 
+/// A stop drops only its own subagent's deleted registration: another
+/// worktree deleted by hand keeps its reattach metadata. One that holds staged
+/// work is kept too, with the refusal on one stderr line and exit 0.
+#[test]
+fn stop_drops_only_its_own_deleted_registration_and_keeps_staged_work() {
+    let fixture = HookFixture::new();
+    let own = create_subagent_worktree(&fixture, "b1");
+    let other = create_subagent_worktree(&fixture, "b2");
+    let staged = create_subagent_worktree(&fixture, "b3");
+    fs::write(staged.join("staged.txt"), "work\n").unwrap();
+    git(&staged, &["add", "staged.txt"]);
+    for path in [&own, &other, &staged] {
+        fs::remove_dir_all(path).expect("delete by hand");
+    }
+
+    let output = fixture.hook(&[], stop_payload("b1", &fixture.repo));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(!registered(&fixture.repo, &own));
+    assert!(
+        registered(&fixture.repo, &other),
+        "another registration was pruned"
+    );
+
+    let output = fixture.hook(&[], stop_payload("b3", &fixture.repo));
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let note = stderr(&output);
+    assert_eq!(note.lines().count(), 1, "{note}");
+    assert!(note.contains("still holds staged changes"), "{note}");
+    assert!(registered(&fixture.repo, &staged));
+    assert!(branch_exists(&fixture.repo, "simgit/agent-b3"));
+}
+
 #[test]
 fn parallel_stops_are_safe() {
     let fixture = HookFixture::new();
@@ -1429,12 +2123,43 @@ fn stop_exits_zero_outside_a_repository() {
         &stop_payload("a7", &outside).to_string(),
     );
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    assert_eq!(
-        stderr(&output).trim_end().lines().count(),
-        1,
-        "{}",
-        stderr(&output)
+    // Every subagent stop runs the hook, so a project that is no repository
+    // would otherwise get a line for each.
+    assert_eq!(stderr(&output), "");
+    assert_eq!(fixture.snapshot(), before);
+}
+
+/// A project Git refuses to open is still a repository: the stop says why it
+/// did nothing, on one line, and still exits 0.
+#[test]
+fn stop_reports_a_repository_git_refuses() {
+    let fixture = HookFixture::new();
+    let broken = fixture.root.join("broken");
+    fs::create_dir(&broken).expect("mkdir");
+    fs::write(broken.join(".git"), "gitdir: /nonexistent/simgit\n").expect("write");
+    let output = fixture.run_in(&broken, &[], &[], &stop_payload("a10", &broken).to_string());
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let complaint = stderr(&output);
+    assert_eq!(complaint.lines().count(), 1, "{complaint}");
+    assert!(
+        complaint.starts_with("simgit: SubagentStop: "),
+        "{complaint}"
     );
+}
+
+/// A payload without an `agent_id` names no subagent worktree: nothing to do,
+/// and nothing to say.
+#[test]
+fn stop_without_an_agent_id_is_silent() {
+    let fixture = HookFixture::new();
+    let before = fixture.snapshot();
+    let output = fixture.hook(
+        &[],
+        json!({ "hook_event_name": "SubagentStop", "cwd": fixture.repo }),
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(output.stdout.is_empty());
+    assert_eq!(stderr(&output), "");
     assert_eq!(fixture.snapshot(), before);
 }
 
@@ -1502,6 +2227,20 @@ fn hooks_require_no_newer_than_the_cargo_version() {
             "--requires {v} is newer than the crate"
         );
     }
+}
+
+/// Claude Code kills a hook after 600 s by default, and a first baseline in a
+/// large repository can take longer: a create killed then strands its lock.
+#[test]
+fn worktree_create_hook_allows_half_an_hour() {
+    let hooks = read_json(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../integrations/claude-code/hooks.json"
+    ));
+    assert_eq!(
+        hooks["hooks"]["WorktreeCreate"][0]["hooks"][0]["timeout"],
+        1800
+    );
 }
 
 /// The ref moves to a new tag only after Homebrew serves that release, so

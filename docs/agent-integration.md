@@ -174,8 +174,12 @@ on stderr. A provider branches on the exit status, parses stdout only on
 success, and reports the stderr line verbatim rather than trying to parse it;
 empty stdout on a nonzero exit is the documented shape, not a malformed
 response. `run` is the exception to the whole contract: it streams the child's
-output, rejects `--json`, and exits with the child's own status (`128 + signal`
-when a signal killed the child, `127` when the command cannot be found).
+output, rejects `--json`, and exits with the child's own status, or one of
+the codes in [its exit table](reference.md#run-locks-and-recovery).
+Like `system(3)`, `simgit run` ignores SIGINT and SIGQUIT sent to its pid
+alone, so stop it with SIGTERM or SIGHUP, which it forwards to the child, or
+signal its process group; see
+[Run locks and recovery](reference.md#run-locks-and-recovery).
 
 A tool that classifies simgit invocations before they run — an approval gate or
 checkpointer, rather than an allocator — depends on a narrower promise: which
@@ -245,7 +249,8 @@ fields are the contract the provider validates:
 | `cow_supported` | boolean or null | Whether copy-on-write works in the current directory. `null` means simgit could not write a probe there, so the question is unanswered; it describes the directory, not the filesystem. Human output prints that case as `CoW: unknown (cannot write a probe here)`. |
 | `repository` | string or null | Absolute path of the Git working tree containing the current directory; `null` outside one. |
 | `repository_details` | object or null | `common_git_dir` (string), `common_git_owner` (string), `top_level` (string), `is_main_worktree` (boolean); `null` outside a repository. |
-| `populate_mode` | string or null | The mode simgit would select here: `cow-clone`, `overlay`, or `git-checkout`. |
+| `populate_mode` | string or null | The mode simgit would select here: `cow-clone`, `overlay`, or `git-checkout`. `null` outside a repository, and when no mode can be selected (see `populate_error`). |
+| `populate_error` | string or null | Why no mode can be selected, such as a `SIMGIT_POPULATE` naming a backend this machine lacks. `null` when `populate_mode` is a string and outside a repository. `doctor` still exits 0. |
 | `default_worktree_root` | string or null | Absolute root used by an allocation that passes no `--path`. |
 | `default_worktree_root_inside_repository` | boolean or null | Whether that root is inside the source repository. `true` must block allocation against the default root. |
 | `git_worktree_supported` | boolean or null | Whether the installed Git supports linked worktrees. |
@@ -338,8 +343,11 @@ that relaunches stable-named jobs must choose one of four procedures:
   provider owns.
 - Reuse instead of reallocating: `simgit run <branch> -- <command>` attaches to
   the branch's registered worktree, or creates one at the branch's current
-  commit when only the branch survives. This keeps the job's history, but `run`
-  emits no JSON record.
+  commit when only the branch survives. A registered worktree deleted by hand
+  is created again at its old path, still ephemeral or sparse if it was, unless
+  its registration holds work `remove` would keep (see
+  [Reuse](reference.md#reuse-persistence-and-populate-backends)).
+  This keeps the job's history, but `run` emits no JSON record.
 - Delete the branch as part of cleanup, once its work is integrated, with
   `remove --delete-branch` (step 5). Safe deletion refuses an unmerged branch,
   so this never silently discards work.
@@ -550,11 +558,11 @@ registration stays locked with the reason `simgit: allocating (pid N)`, which
 keeps `prune` and `gc` off it, so safe removal first refuses it as locked.
 Clear the lock with `simgit unlock` as in step 2; it refuses while that PID is
 alive. After that, the worktree shows every tracked file as deleted, so safe
-removal refuses it as dirty. The branch claim, the path claim and the
-baseline-cache lock it held are operating-system file locks released with the
-process. Since
-`add` never returned, no agent ever ran there and the provider holds no
-allocation record for it; report the path to the operator, whose explicit
+removal refuses it as dirty, and `run` and the Claude Code hook refuse to reuse
+it ([details](reference.md#run-locks-and-recovery)). The branch claim, the
+path claim and the baseline-cache lock it held are operating-system file locks
+released with the process. Since `add` never returned, no agent ever ran there
+and the provider holds no allocation record for it; report the path to the operator, whose explicit
 authority `remove --discard-dirty` still requires even though it loses nothing
 here.
 
@@ -571,10 +579,13 @@ claude plugin install simgit --marketplace abendrothj/simgit
 
 The plugin registers `simgit hook claude-code` for `WorktreeCreate`,
 `WorktreeRemove`, `SubagentStop` and `SessionStart` (see
-[the `hook` reference](reference.md#hook)). `SessionStart` shows one message
-naming the install or upgrade command when simgit is missing or too old. The
-`SubagentStop` hook runs in shell form with `|| exit 0` because exit 2 there
-stops the subagent from finishing, and an older simgit without `hook` exits 2.
+[the `hook` reference](reference.md#hook)). `WorktreeCreate` has a 30-minute
+timeout in place of Claude Code's 600-second default, so building the first
+baseline of a large repository is not killed mid-allocation. `SessionStart`
+shows one message naming the install or upgrade command when simgit is missing
+or too old. The `SubagentStop` hook runs in shell form with `|| exit 0`
+because exit 2 there stops the subagent from finishing, and an older simgit
+without `hook` exits 2.
 Remove any hand-written worktree hook when you install the plugin. Claude Code
 caches plugins by version, so the plugin's version is simgit's. Worktrees
 Claude Code created before the plugin (branches `worktree-<name>`) are refused
@@ -607,6 +618,12 @@ from native is that no commit is deleted that no other ref reaches.
 - Claude Code names subagent worktrees `agent-<agent_id>` (observed, not
   documented). If that changes, subagent cleanup finds nothing and does
   nothing.
+- The adapter knows a name's worktree by its path, the default path of
+  `simgit/<name>`, so `git switch`, `git branch -m` or a detach inside it does
+  not lose it: the next create of that name returns it, and removal removes
+  it but never drops the branch it is on now, which is not simgit's. Subagent
+  cleanup still goes by the `simgit/agent-<agent_id>` branch, so a subagent
+  worktree switched away is left for removal or a person.
 - Claude Code's periodic sweep skips hook-created worktrees. A subagent
   worktree kept dirty that later becomes clean stays until that subagent stops
   again or a person removes it, as listed by `simgit list`.
@@ -616,7 +633,8 @@ from native is that no commit is deleted that no other ref reaches.
   that same worktree. A hand-written hook that names branches differently
   cannot be deduplicated.
 - `claude --worktree "#<n>"` sends only `pr-<n>` and fetches nothing, so the
-  adapter fetches the pull request head itself.
+  adapter fetches the pull request head itself. Its `simgit/pr-<n>` branch is
+  kept after removal, because no other local ref reaches that head.
 - `worktree.baseRef: "head"` and the 24-hour fetch of `"fresh"` are not
   reproduced; new worktrees start at `origin/HEAD` or `HEAD` without a fetch.
 - The payload's `cwd` follows the agent's `cd`, so it can name a subdirectory,

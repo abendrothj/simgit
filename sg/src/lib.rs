@@ -100,6 +100,15 @@ enum Commands {
     Repair,
 }
 
+// The libc signal and session calls used across the crate, declared once. A
+// handler is passed as its address, so `SIG_DFL` and `SIG_IGN` fit the same
+// parameter.
+extern "C" {
+    pub(crate) fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
+    pub(crate) fn kill(pid: i32, signal: std::ffi::c_int) -> std::ffi::c_int;
+    pub(crate) fn setsid() -> i32;
+}
+
 /// Restore the default disposition for `SIGPIPE`.
 ///
 /// Rust's runtime sets `SIGPIPE` to `SIG_IGN` before `main`, so writing to a
@@ -112,9 +121,6 @@ fn restore_default_sigpipe() {
     // handler type.
     const SIGPIPE: std::ffi::c_int = 13;
     const SIG_DFL: usize = 0;
-    extern "C" {
-        fn signal(signum: std::ffi::c_int, handler: usize) -> usize;
-    }
     // SAFETY: `SIG_DFL` is the reserved default-disposition value, not a
     // handler this process owns, so the call dereferences nothing. Resetting a
     // signal to its default is the documented way to undo the runtime's
@@ -137,19 +143,56 @@ fn one_line(diagnostic: &str) -> String {
         .join(" ")
 }
 
-/// Parse this process's arguments and execute the requested command. Both the
-/// canonical `simgit` binary and its `sg` alias are one-line wrappers around
-/// this, so the CLI is compiled and tested once.
-pub fn run_cli() -> Result<()> {
+/// Parse this process's arguments, execute the requested command and return the
+/// process exit code. Both the canonical `simgit` binary and its `sg` alias are
+/// one-line wrappers around this, so the CLI is compiled and tested once.
+///
+/// Errors are printed here, in the format `main` returning `Err` would use,
+/// because that path appends a backtrace whenever `RUST_BACKTRACE` or
+/// `RUST_LIB_BACKTRACE` is set, which breaks the one-line machine contract.
+pub fn run_cli() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{}", format_error(&error));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `Error: <message>`, then the causes under `Caused by:`, as anyhow's debug
+/// output lays them out, without the backtrace it would add.
+fn format_error(error: &anyhow::Error) -> String {
+    let mut text = format!("Error: {error}");
+    let mut causes = error.chain().skip(1).enumerate().peekable();
+    if causes.peek().is_some() {
+        text.push_str("\n\nCaused by:");
+        let numbered = error.chain().count() > 2;
+        for (index, cause) in causes {
+            if numbered {
+                text.push_str(&format!("\n{index:>5}: {cause}"));
+            } else {
+                text.push_str(&format!("\n    {cause}"));
+            }
+        }
+    }
+    text
+}
+
+fn run() -> Result<()> {
     restore_default_sigpipe();
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    commands::worktree::check_requires_before_parsing(&arguments)?;
     let cli = Cli::try_parse().unwrap_or_else(|error| {
-        // Clap prints usage and hints on several lines. In JSON mode a failed
-        // invocation has no stdout and exactly one stderr diagnostic instead.
-        let json = std::env::args_os()
-            .skip(1)
-            .take_while(|argument| argument != "--")
+        // Clap prints usage and hints on several lines. In JSON mode, and for
+        // a hook, which the harness shows the person, a failed invocation has
+        // no stdout and exactly one stderr diagnostic instead.
+        let json = arguments
+            .iter()
+            .take_while(|argument| *argument != "--")
             .any(|argument| argument == "--json");
-        if json && error.use_stderr() {
+        let one_line_usage = json || commands::worktree::hook_arguments(&arguments).is_some();
+        if one_line_usage && error.use_stderr() {
             let diagnostic = error.to_string();
             let primary = diagnostic.split("\n\n").next().unwrap_or(&diagnostic);
             eprintln!("{}", one_line(primary));

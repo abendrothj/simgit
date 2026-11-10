@@ -35,7 +35,12 @@ fn doctor_in_repository(repo: &RepoContext, json: bool) -> Result<()> {
     let probe = nearest_existing_directory(&root)?;
     let filesystem = filesystem_name(&probe);
     let cow_supported = cow::clone_supported(&repo.common_git_dir, &probe).ok();
-    let populate_mode = select_populate_mode(repo, &probe, false)?.label();
+    // A forced `SIMGIT_POPULATE` this machine cannot honour is a finding to
+    // report, not a reason for `doctor` to fail.
+    let (populate_mode, populate_error) = match select_populate_mode(repo, &probe, false) {
+        Ok(mode) => (Some(mode.label()), None),
+        Err(error) => (None, Some(format!("{error:#}"))),
+    };
     let git_worktree = git_worktree_list(repo)?;
     let git_worktree_supported = git_worktree.status.success();
     let stale = if git_worktree_supported {
@@ -66,6 +71,7 @@ fn doctor_in_repository(repo: &RepoContext, json: bool) -> Result<()> {
             "filesystem": filesystem,
             "cow_supported": cow_supported,
             "populate_mode": populate_mode,
+            "populate_error": populate_error,
             "default_worktree_root": root.display().to_string(),
             "default_worktree_root_inside_repository": root_inside_repository,
             "git_worktree_supported": git_worktree_supported,
@@ -83,7 +89,13 @@ fn doctor_in_repository(repo: &RepoContext, json: bool) -> Result<()> {
         println!("common git dir: {}", repo.common_git_dir.display());
         println!("filesystem: {filesystem}");
         println!("CoW: {}", cow_status(cow_supported));
-        println!("populate mode: {populate_mode}");
+        match (populate_mode, &populate_error) {
+            (Some(mode), _) => println!("populate mode: {mode}"),
+            (None, reason) => println!(
+                "populate mode: unavailable ({})",
+                reason.as_deref().unwrap_or("unknown")
+            ),
+        }
         println!(
             "worktree root: {} ({})",
             root.display(),
@@ -130,6 +142,7 @@ fn doctor_without_repository(cwd: &Path, json: bool) -> Result<()> {
             "filesystem": filesystem,
             "cow_supported": cow_supported,
             "populate_mode": null,
+            "populate_error": null,
             "default_worktree_root": null,
             "default_worktree_root_inside_repository": null,
             "git_worktree_supported": null,

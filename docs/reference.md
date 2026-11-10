@@ -99,7 +99,9 @@ and [Codex](agent-integration.md#codex) for install, behaviour and limits. Do
 not run it by hand.
 
 - `--requires <version>` exits 1 with one stderr line when the running simgit
-  is older than the `X.Y.Z` given. A newer one is accepted.
+  is older than the `X.Y.Z` given. A newer one is accepted. The check runs
+  before the other arguments are parsed, so a newer plugin's flag this simgit
+  does not know still gets the "requires simgit >= X" line, not a usage error.
 - `--discard-dirty` lets `WorktreeRemove` discard uncommitted work, as Claude
   Code's own `git worktree remove --force` does. Without it `hook` never
   discards. Untracked and uncommitted files are discarded; gitignored files go
@@ -116,15 +118,27 @@ matching `pr-<digits>` instead fetches `pull/<n>/head`, or
 `merge-requests/<n>/head` when origin has no such pull ref, from origin (git
 2.29 or newer, for `--no-write-fetch-head`) and starts there. If origin has
 neither ref, creation fails; any other fetch failure fails it with Git's error.
-`GIT_TERMINAL_PROMPT=0` stops HTTPS credential prompts, but an ssh key that
-needs a passphrase and has no agent can still prompt. A reused `pr-<n>`
-worktree is not refetched. Allocations are persistent.
+`GIT_TERMINAL_PROMPT=0` stops HTTPS credential prompts, and the fetch runs
+with no controlling terminal, so an ssh passphrase or host-key prompt fails at
+once instead of waiting (an ssh agent still works; whether `SSH_ASKPASS` does without a controlling
+terminal has not been tested). A reused `pr-<n>`
+worktree is not refetched. Removing a `pr-<n>` worktree keeps its
+`simgit/pr-<n>` branch: the fetched head is reached from no other local ref,
+so the rule below keeps it until a fetched merge reaches it. Delete it with
+`git branch -D simgit/pr-<n>` once the change no longer needs it. Allocations
+are persistent.
+
+A name's worktree is the one registered at `simgit/<name>`'s default path (see
+[Where worktrees live](#where-worktrees-live)), whatever branch it is on now:
+switching, renaming or detaching its branch inside it changes nothing for
+`WorktreeCreate` and `WorktreeRemove`. When no worktree is registered there,
+`WorktreeCreate` reuses one on `simgit/<name>` at another path.
 
 | Event | Action | stdout | Exit |
 |---|---|---|---|
-| `WorktreeCreate` | Under the branch claim: reuse the `simgit/<name>` worktree, else attach the branch if it exists, else create it from the base. Never returns the main checkout, and refuses a worktree locked by `run`. A worktree deleted by hand is pruned first, so its branch is attached again at its old tip; one whose registration holds uncommitted work (staged changes, an operation in progress, submodule repositories or refs of its own) is kept, and the create fails. | the path only | 1 with one stderr line on failure |
-| `WorktreeRemove` | Only a worktree on a `simgit/*` branch; others are refused. Removes it (refusing a dirty one without `--discard-dirty`), then drops the branch if no commit on it is unreached by another ref. A path that no longer exists succeeds; if Git still registers it, the registration is pruned and the branch dropped by the same rule, unless it holds uncommitted work as for `remove`, which keeps both. | nothing | 1 when refused or failed |
-| `SubagentStop` | Removes the `simgit/agent-<agent_id>` worktree and branch when it is clean, unlocked and holds no unreached commit. Otherwise keeps it. A worktree deleted by hand has its registration pruned and its branch dropped by the same rule, unless it holds uncommitted work as for `remove`. It does nothing when the branch is not checked out in a worktree. | nothing | always 0 |
+| `WorktreeCreate` | Under the branch claim: reuse the name's worktree, else the worktree on `simgit/<name>` wherever it is, else attach the branch if it exists, else create it from the base. Never returns the main checkout, and refuses a locked worktree; when the simgit process that locked it, a `run` or an allocation, is gone, the error names `simgit unlock <path>`. A worktree an allocation never finished populating is refused, naming `simgit remove <path> --discard-dirty`. A worktree deleted by hand is created again at its path, on the branch or detached HEAD it had, as `run` does; one whose registration is locked, holds uncommitted work (staged changes, an operation in progress, submodule repositories or refs of its own), or is detached at a commit no ref reaches is kept, and the create fails. | the path only | 1 with one stderr line on failure |
+| `WorktreeRemove` | Only a name's worktree or a worktree on a `simgit/*` branch; others are refused. Removes it (refusing a dirty one without `--discard-dirty`, and a detached one at a commit no ref reaches even with it), then drops its `simgit/*` branch, the one it is on or else the one it was allocated for, if no commit on it is unreached by another ref. No other branch is ever dropped. A path that no longer exists succeeds; if Git still registers it, that one registration is dropped and the branch by the same rule, unless the registration is locked, holds uncommitted work as for `remove`, or is detached at a commit no ref reaches: then both are kept and the hook exits 1, even with `--discard-dirty`. The hook takes no `--commit`, so a refusal names the command that works from a shell: `simgit remove <path> --commit` or `simgit remove <path> --discard-dirty` for uncommitted work, after `git -C <path> switch -c <name>` on a detached worktree, `simgit remove <path>` after keeping a detached commit, and only `--discard-dirty` for a worktree never populated. Each is spelled `cd <main checkout> && simgit ...`, so it works from any directory: simgit finds the repository from the one it runs in, and the hook's worktrees lie outside it. | nothing | 1 when refused or failed |
+| `SubagentStop` | Removes the `simgit/agent-<agent_id>` worktree and branch when it is clean, unlocked and holds no unreached commit. Otherwise keeps it. A worktree deleted by hand has its own registration dropped, and no other, and its branch dropped by the same rule; a registration that is locked or holds uncommitted work as for `remove` is kept, and the stop reports why on one line. It does nothing when the branch is not checked out in a worktree, and does nothing silently when the payload has no `agent_id` or no directory at or above the project has a `.git`. A `.git` that Git refuses is reported on one line. | nothing | always 0 |
 | `SessionStart` | Nothing; the plugin uses it to check the version. | nothing | 0 |
 | any other | Nothing. | nothing | 0 |
 
@@ -240,9 +254,40 @@ GC selects only ephemeral worktrees by default, even with `--discard-dirty`; use
 the earlier defaults: automation that relied on `run` creating disposable
 workspaces should now pass `--ephemeral`.
 
+`--ephemeral` and `--persistent` apply only to linked worktrees. The main
+checkout has no registration of its own to mark, so `run` on it with either
+flag is refused before anything is marked or launched.
+
 On reuse, `--path` must identify the existing workspace. `--base`,
 `--require-cow` and `--sparse` are creation-only options and are rejected on
 reuse; `--base` is also rejected when attaching an existing branch.
+
+A worktree deleted by hand leaves its registration, which keeps its branch
+checked out at a path that is gone. `run <branch>` on it drops that one
+registration and creates the worktree again: on the branch at its current
+commit, at the old path unless `--path` names another. It keeps the worktree's
+ephemeral marker and cone-mode sparse directories unless `--ephemeral`,
+`--persistent` or `--sparse` says otherwise; a sparse checkout that is not in
+cone mode is refused, and then `--sparse` names the directories instead.
+`--require-cow` applies as for a new worktree. Arguments a new worktree would
+reject, and a populate mode this machine cannot honour, are refused before
+anything is dropped. A failure after the drop (a full disk, a failing hook) says
+the registration was dropped and which of `--ephemeral` and `--sparse` to pass
+again, since the marker and cone went with it. The registration is dropped only
+when `remove` would drop it. Otherwise it is kept and the refusal names the
+recovery: a lock is released as its message says, work the registration holds
+(staged changes, an operation in progress, submodule repositories or refs of
+its own) is inspected with the commands named and discarded with
+`simgit remove <branch> --discard-dirty`, and a registration whose state cannot
+be read is named as such.
+
+The picker (`run` without a branch) marks such a workspace `[missing]`, except
+while a live simgit process holds its lock, as an allocation does while it
+populates the directory, and choosing it does the same; a detached one is created again detached at its old
+`HEAD`, and refused when no ref reaches that commit, naming
+`git -C <main checkout> branch <name> <commit>` to keep it first. A choice the picker cannot
+launch into (a locked workspace, a refused reattach, or the main checkout with
+`--ephemeral` or `--persistent`) is explained, and the prompt asks again.
 
 `--base` is any revision `git rev-parse` accepts, and defaults to `HEAD`. It is
 resolved in the working tree you run simgit from, so from a linked worktree the
@@ -271,9 +316,38 @@ rather than silently ignored.
 While a command launched by `run` is active, its linked worktree is locked
 against removal and GC, including `--discard-dirty`. A second `run` in the same
 workspace is refused until the first exits. The lock file records the launcher's
-PID. If the launcher is killed the lock is deliberately retained; recover it
-with `simgit unlock [TARGET]`, where TARGET is a workspace path or branch that
-defaults to the workspace containing the current directory.
+PID. If the launcher is killed outright (SIGKILL, a crash, or a signal before
+the command has started) the lock is deliberately retained; recover it with
+`simgit unlock [TARGET]`, where TARGET is a workspace path or branch that
+defaults to the workspace containing the current directory. `run`, `remove`
+and `hook` refuse such a lock, and the allocation lock a killed allocation
+leaves (below), saying that its process is no longer running and naming that
+command.
+
+Once the command has started, `run` handles signals the way a shell handles a
+foreground job, and always waits for the command, releases the lock, and exits
+with the command's status (`128 + signal` when a signal killed it). Ctrl-C and
+Ctrl-\ reach the command directly through the terminal's process group, so
+`run` ignores SIGINT and SIGQUIT and leaves the outcome to the command: one that
+traps Ctrl-C and finishes its work decides the exit status. SIGTERM and SIGHUP
+sent to `run` are forwarded to the command, so stopping `run` stops what it
+launched instead of orphaning it. A signal sent to the whole process group also
+reaches the command directly, so it can see that SIGTERM or SIGHUP twice.
+
+The command starts in the workspace with `PWD` set to its path, not the
+caller's. `run` exits as follows:
+
+| Exit | Meaning |
+| --- | --- |
+| the command's code | The command ran and exited. |
+| `128 + N` | Signal `N` killed the command. |
+| `126` | The command was found but cannot be executed. |
+| `127` | The command was not found. |
+| `1` | `run` itself failed before or around the command. |
+| `2` | `run` rejected its own arguments (a usage error) and started nothing. A command that exits 2 itself is told apart only by the absence of a `mode:` or `worktree:` line on stderr. |
+
+If the lock cannot be removed afterwards, `run` says so on stderr, names
+`simgit unlock`, and still exits with the command's status.
 
 It clears the lock wherever it lives: a linked worktree's lock is Git's own
 `.git/worktrees/<slug>/locked`, while `.git/simgit-run.lock` is used only when
@@ -305,10 +379,18 @@ An allocation also locks its own registration through Git, with the reason
 populated and its mode and `--ephemeral` markers are written. CoW population
 moves the worktree's `.git` aside while it clones, and the lock keeps Git's
 `worktree prune`, `simgit prune` and `gc` from dropping the registration, or
-reaping the worktree, before it is whole. An allocation killed after registering,
+reaping the worktree, before it is whole. A `run` that creates its workspace
+does not release this lock: it renames its own `run` lock over it, so the
+workspace is never unlocked before the command starts, and `gc` cannot reap a
+fresh `--ephemeral` one in between. An allocation killed after registering,
 or one whose failure leaves the workspace retained for recovery, keeps this
 lock, and `unlock` clears it like a `run` lock: once the recorded PID is gone,
-never while it runs.
+never while it runs. One killed before it was populated leaves a registration
+with no `index`, whose worktree shows every tracked file as deleted. `run` and
+`hook` refuse to reuse it, and `remove --commit` refuses to commit it; each
+names `simgit remove <path> --discard-dirty`, and the refusal of its lock names
+that step after the unlock. One stat of the `index` tells; a sparse allocation
+writes its index first, so one killed later is not caught.
 
 Allocating takes four more locks, and none of them needs `unlock`. An `add`,
 or a `run` that creates its workspace, claims the destination path and, when
@@ -359,6 +441,14 @@ whitespace, so a path it names appears verbatim unless the path itself
 contains a line break. `--help` and `--version` remain successful
 human-readable requests, not JSON results.
 
+A failure in any mode exits 1 (a usage error exits 2) and an error never
+prints a backtrace, whatever `RUST_BACKTRACE` or `RUST_LIB_BACKTRACE` say. A
+panic is a bug, not an error: it prints Rust's panic message, and a backtrace
+when those variables ask for one. Without `--json`, and for `hook`, stderr is
+`Error: <message>`; without `--json` it may add a `Caused by:` list and the
+message's own further lines. A `hook` usage error is one line too, as with
+`--json`.
+
 Every worktree path simgit prints or returns is symlink-resolved and lexically
 normalized, so one worktree always has exactly one string form and orchestrators
 can compare those strings directly. That resolution applies whenever a target
@@ -371,7 +461,7 @@ form would imply one exists.
 
 | Command | Fields |
 |---|---|
-| `doctor` | `identity`, `product`, `version`, `filesystem`, `cow_supported`, `populate_mode`, `repository`, `repository_details`, `git_worktree_supported`, `default_worktree_root`, `default_worktree_root_inside_repository`, `baseline_cache`, `stale_worktree_registrations` |
+| `doctor` | `identity`, `product`, `version`, `filesystem`, `cow_supported`, `populate_mode`, `populate_error`, `repository`, `repository_details`, `git_worktree_supported`, `default_worktree_root`, `default_worktree_root_inside_repository`, `baseline_cache`, `stale_worktree_registrations` |
 | `add` | `worktree`, `path`, `cleanup_token`, `branch`, `base`, `mode`, `ephemeral` |
 | `list` | array of `worktree`, `branch`, `HEAD`, `ephemeral`, `mode`, and `locked` while a command runs |
 | `remove` | `removed`, `already_absent`, `branch_deleted`, `committed`, `commit` |
@@ -384,6 +474,12 @@ always reported, and every repository-dependent field is `null` rather than an
 error. `cow_supported` is `true`/`false` when a probe could be written in the
 current directory and `null` when one could not, so an unprobed directory is
 never reported as unsupported.
+
+A `SIMGIT_POPULATE` this machine cannot honour (a missing `fuse-overlayfs`,
+reflink cloning unsupported, an unknown value) does not fail `doctor`:
+`populate_mode` is `null` and `populate_error` holds the reason, which the
+human report prints as `populate mode: unavailable (<reason>)`. Otherwise
+`populate_error` is `null`.
 
 `list` reports each worktree's `ephemeral` flag, its `locked` state while a
 command runs, and the `mode` it was populated with (`cow-clone`, `overlay`,
@@ -454,10 +550,13 @@ files a killed simgit leaves, once the process they name is gone: a lock's
 `<lock>.<pid>.<uuid>.pending` copy beside Git's `locked` or
 `.git/simgit-run.lock`, and a copy-on-write probe, recorded in
 `.git/simgit/clone-probes/<pid>.<uuid>.source` with the
-`.simgit-clone-probe-<pid>.<uuid>` file it names. A running process's are
-kept. A probe an older simgit left names no process
-(`clone-probes/<uuid>.source` and `.simgit-clone-probe-<uuid>`), so `prune`
-keeps it; delete both by hand while no simgit is running. And it reclaims the baseline cache, reporting what that cache still costs in both
+`.simgit-clone-probe-<pid>.<uuid>` file it names, and the temporary ref
+`refs/simgit/fetch/<pid>-<uuid>` a `hook` create killed during a `pr-<n>`
+fetch leaves. A running process's are kept. A probe an older simgit left names
+no process (`clone-probes/<uuid>.source` and `.simgit-clone-probe-<uuid>`), so
+`prune` keeps it; delete both by hand while no simgit is running. The same
+holds for an older fetch ref, `refs/simgit/fetch/<uuid>`: delete it with
+`git update-ref -d`. And it reclaims the baseline cache, reporting what that cache still costs in both
 formats (`retained_bytes` in JSON).
 
 One baseline is materialized per distinct base commit, so branching from several
