@@ -42,6 +42,7 @@
 //!   allocation is using
 //!
 //! `--json` is a global flag: it is accepted before or after the command name.
+//! `run` and `hook` reject it. `docs/reference.md` has the full semantics.
 //!
 //! ## Example
 //!

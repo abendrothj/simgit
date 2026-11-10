@@ -20,13 +20,17 @@ You'll need:
 
 ```
 simgit/
-├── sg/               the CLI — `simgit doctor|add|list|remove|run|unlock|gc|prune|repair`
+├── sg/               the CLI — `simgit doctor|add|list|remove|run|unlock|gc|prune|repair|hook`
 │   ├── src/lib.rs                 CLI surface (`run_cli`), parser and dispatch
 │   ├── src/bin/simgit.rs          canonical binary — one-line wrapper
 │   ├── src/bin/sg.rs              `sg` alias — same code, one-line wrapper
 │   ├── src/commands/worktree.rs   command and lifecycle orchestration
-│   └── src/commands/worktree/     launch/picker, CoW baseline, overlay, index backends
+│   ├── src/commands/worktree/     launch/picker, CoW baseline, overlay, index backends,
+│   │                              locks, gc/prune maintenance, `hook.rs` (Claude Code adapter)
+│   └── tests/                     CLI workflow, installer, and `claude_code_hook.rs` tests
 ├── skills/           `simgit-worktrees` agent skill
+├── .claude-plugin/   Claude Code and Codex plugin manifest and marketplace entry
+├── integrations/     `claude-code/hooks.json`, the hooks the plugin registers
 ├── tests/            CoW scaling benchmarks + reflink/overlay integration (Linux)
 ├── packaging/        Homebrew formula
 └── docs/             agent integration guide, scaling benchmark methodology
@@ -53,11 +57,10 @@ New workspaces are persistent; disposable runs opt in with `--ephemeral`. `gc`
 requires `--include-persistent` to select persistent workspaces.
 
 `run` holds a lock on its workspace for the child's lifetime, recording the
-launcher's PID in the lock file. `simgit unlock [TARGET]` is the recovery verb
-for a lock stranded by a killed launcher: it clears Git's worktree lock and the
-main checkout's `.git/simgit-run.lock`, succeeds on an unlocked target, and
-refuses while the recorded owner PID is still alive. It has no override flag by
-design — the correct answer to a live owner is to stop that process.
+launcher's PID. `simgit unlock` is the recovery verb for a lock a killed
+launcher stranded. It has no override flag by design: the correct answer to a
+live owner is to stop that process. Which locks it clears and which it refuses
+are in [the reference](docs/reference.md#run-locks-and-recovery).
 
 Allocation is guarded by locks that need no recovery verb. `PathClaim` and
 `BranchClaim` in `sg/src/commands/worktree/locks.rs` let one allocation at a
@@ -73,18 +76,16 @@ are always reported, and the repository-dependent diagnostics are `null`
 outside a Git worktree. Inside a repository it reports the repository context
 and the populate mode the machine actually supports, so a caller can branch on
 capability instead of guessing.
-The global `--json` flag makes every command emit machine-readable output,
-except `run`, which rejects it because it streams the child's output verbatim.
+The global `--json` flag makes every other command emit machine-readable
+output; `run` and `hook` reject it, because `run` streams the child's output
+and the harness fixes `hook`'s. See
+[the reference](docs/reference.md#machine-readable-output).
 
 Destructive behavior is always opt-in through an explicit flag rather than a
-blanket force switch: `--discard-dirty` permits removing a worktree with
-uncommitted changes, and `--delete-unmerged` (alongside `--delete-branch`)
-permits deleting a branch that is not merged.
-
-Cleanup is idempotent where that costs nothing: `remove` on a target that no
-longer resolves to a worktree exits successfully with `already_absent: true`,
-so at-least-once harness cleanup does not have to special-case a workspace it
-already removed.
+blanket force switch. The two flags and the rules that keep them stable are in
+[AGENTS.md](AGENTS.md#what-approval-gates-depend-on). Cleanup is idempotent
+where that costs nothing, so at-least-once harness cleanup needs no special
+case; see [removal and unlock](docs/reference.md#removal-and-unlock-semantics).
 
 The overlay path only activates on Linux with `fuse-overlayfs`; it can't run on
 macOS, so it's covered by `tests/overlay_integration.sh` in the `overlay-linux`
@@ -147,7 +148,11 @@ Published as `simgit-cli` on crates.io. The crate ships two binaries: `simgit`
    `abendrothj/homebrew-tap` repo's `Formula/simgit.rb`.
 5. Move the `ref` in `.claude-plugin/marketplace.json` to the new tag, only after
    the Homebrew formula serves that release, so the plugin never gets ahead of
-   brew.
+   brew. For 0.5.0 the `ref` was set to `v0.5.0` ahead of the tag.
+6. For 0.5.0 only: once `v0.5.0` is tagged and Homebrew serves it, delete the
+   `PRE-RELEASE` note in `integrations/claude-code/README.md` and the one in
+   `docs/agent-integration.md` (under Claude Code), and the sentence pointing
+   to it in that file's Codex section.
 
 ## Communication
 

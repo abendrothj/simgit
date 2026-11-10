@@ -44,6 +44,10 @@ committed nothing. Repeating the same command is safe either way — `--commit`
 stages and commits only what the worktree still holds, so a retry after a
 successful commit commits nothing a second time.
 
+A failure after the worktree is gone but before `--delete-branch` finished
+names the branch instead, because the path can no longer identify it; retry
+with `remove <branch> --delete-branch`.
+
 Removing a target that no longer has a worktree succeeds and reports
 `already_absent: true`, so a retried or at-least-once cleanup is safe. That
 includes the residue of an interrupted teardown: Git can delete a worktree's
@@ -463,11 +467,12 @@ form would imply one exists.
 |---|---|
 | `doctor` | `identity`, `product`, `version`, `filesystem`, `cow_supported`, `populate_mode`, `populate_error`, `repository`, `repository_details`, `git_worktree_supported`, `default_worktree_root`, `default_worktree_root_inside_repository`, `baseline_cache`, `stale_worktree_registrations` |
 | `add` | `worktree`, `path`, `cleanup_token`, `branch`, `base`, `mode`, `ephemeral` |
-| `list` | array of `worktree`, `branch`, `HEAD`, `ephemeral`, `mode`, and `locked` while a command runs |
+| `list` | array of `worktree`, `branch` (the full ref, `refs/heads/…`; absent on a detached worktree, which has `detached: true`), `HEAD`, `ephemeral`, `mode`, and `locked` (a reason string, or `true`; absent when unlocked) |
 | `remove` | `removed`, `already_absent`, `branch_deleted`, `committed`, `commit` |
 | `unlock` | `unlocked`, `was_locked`, `owner_pid` |
-| `gc` | `reaped`, `skipped`, `deleted_branches`, `retained_branches`, `dry_run` |
+| `gc` | `reaped` (paths), `skipped` (array of `{worktree, reason}`, reasons under [GC](#gc)), `deleted_branches`, `retained_branches`, `dry_run` |
 | `prune` | `pruned`, `pruned_registrations`, `kept_registrations`, `retained`, `retained_bytes`, `cache_busy` |
+| `repair` | `repaired` and `healthy` (paths of overlay worktrees), `failed` (array of `{worktree, error}`; any entry makes the command exit 1) |
 
 `doctor` exits 0 outside a Git worktree: identity, version and filesystem are
 always reported, and every repository-dependent field is `null` rather than an
@@ -481,11 +486,15 @@ reflink cloning unsupported, an unknown value) does not fail `doctor`:
 human report prints as `populate mode: unavailable (<reason>)`. Otherwise
 `populate_error` is `null`.
 
-`list` reports each worktree's `ephemeral` flag, its `locked` state while a
-command runs, and the `mode` it was populated with (`cow-clone`, `overlay`,
-`git-checkout`, or `null` for the main worktree) — so you can confirm a workspace
-really is CoW-backed rather than a silent full-copy fallback. The human `list`
-appends the same mode as a fourth tab-separated field.
+`list` reports each worktree's `ephemeral` flag, its `locked` state, and the
+`mode` it was populated with (`cow-clone`, `overlay`, `git-checkout`, or `null`
+for the main worktree), so you can confirm a workspace really is CoW-backed
+rather than a silent full-copy fallback. The human `list` prints `locked` as a
+word and appends the mode as a fourth tab-separated field.
+
+In `--json`, `locked` is Git's lock reason, such as `simgit: workspace in use (pid 123)` for
+a `run`, or the boolean `true` when a lock set with `git worktree lock` has no
+reason.
 
 ## GC
 
