@@ -476,6 +476,35 @@ impl BranchClaim {
     }
 }
 
+/// An exclusive claim on building one commit's baseline.
+///
+/// Allocations that find no baseline used to each check out the whole tree
+/// and keep only the first to publish: ten agents on a new commit did the
+/// work ten times, and on one disk the copies slowed each other down. The
+/// claim makes later allocators wait for the first build and reuse it. It is
+/// taken before the cache lock and never while holding it, and `prune` never
+/// takes it, so a slow build still does not hold `prune` up.
+pub(super) struct BaselineBuildClaim {
+    _file: fs::File,
+}
+
+impl BaselineBuildClaim {
+    pub(super) fn acquire(repo: &RepoContext, commit: &str) -> Result<Self> {
+        let file = open_claim_file(repo, "baselines", commit.as_bytes())?;
+        let context = || format!("claim building the baseline for {commit}");
+        match file.try_lock() {
+            Ok(()) => {}
+            // The wait has no bound: it lasts as long as the other build.
+            Err(fs::TryLockError::WouldBlock) => {
+                eprintln!("waiting for another simgit to build the baseline for {commit}");
+                file.lock().with_context(context)?;
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error).with_context(context),
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 /// A repository-wide lock on Git's worktree registry, `.git/worktrees/`.
 ///
 /// While `git worktree add` registers a worktree its admin directory is
@@ -541,7 +570,7 @@ impl RegistryLock {
 /// A lock file as `unlock` judged it: its text and which file held it.
 #[derive(PartialEq)]
 pub(super) struct ReadLock {
-    contents: String,
+    pub(super) contents: String,
     identity: (u64, u64),
 }
 

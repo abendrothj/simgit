@@ -308,6 +308,13 @@ that `list` and `add --json` report in `mode`: `reflink` yields `cow-clone`,
 requires `fuse-overlayfs`, so it is Linux-only and fails outright on macOS
 rather than falling back.
 
+On APFS, cloning a directory stalls every `rename(2)` on the volume until the
+clone finishes, about 0.36 s for 50,000 files, and Git commits refs and
+indexes by renaming. Parallel allocations of a large tree on one APFS volume
+therefore take about as long as running them one after another, and Git
+elsewhere on that volume, your own checkout included, pauses during each
+clone. Small trees clone too quickly to notice.
+
 `--sparse` is rejected with the overlay backend, where the lower layer is the
 whole baseline and narrowing the view saves nothing. Repeated directories and
 overlapping cones are accepted: an ancestor subsumes its descendants before
@@ -396,21 +403,27 @@ names `simgit remove <path> --discard-dirty`, and the refusal of its lock names
 that step after the unlock. One stat of the `index` tells; a sparse allocation
 writes its index first, so one killed later is not caught.
 
-Allocating takes four more locks, and none of them needs `unlock`. An `add`,
+Allocating takes five more locks, and none of them needs `unlock`. An `add`,
 or a `run` that creates its workspace, claims the destination path and, when
 it names a branch, the branch, so two allocations for one path or one branch
 never both proceed. For `add` and `run` the second fails at once; `hook`
 waits for the first to finish and then reuses its worktree. While it
 uses a baseline it also holds the baseline cache lock shared, which keeps
 `prune` from removing that baseline (see [Baselines and `prune`](#baselines-and-prune)).
+An allocation that finds no baseline for its commit claims building it, so
+allocations of one new commit build it once: the others wait for that build
+and reuse it, and each says `waiting for another simgit to build the baseline
+for <commit>` on stderr first. The wait has no time limit. It takes the build claim before the cache lock, never while
+holding it, and `prune` never takes it.
 The branch claims (`.git/simgit/claims/branches/`), the path claims
-(`.git/simgit/claims/paths/`) and the cache lock
+(`.git/simgit/claims/paths/`), the build claims
+(`.git/simgit/claims/baselines/`) and the cache lock
 (`.git/simgit/baselines.lock`) are operating-system file locks on files that
 are never deleted, so the kernel releases them when the process exits, however
 it exits, and a killed allocator leaves no claim to take over. Nothing deletes
-those files, `prune` included, so one empty claim file stays for every branch
-and every path ever claimed. Deleting one would break the exclusion it
-provides: a process that had opened it but not yet locked it would lock the
+those files, `prune` included, so one empty claim file stays for every branch,
+every path and every baseline commit ever claimed. Deleting one would break
+the exclusion it provides: a process that had opened it but not yet locked it would lock the
 deleted file while the next allocator created and locked a new one, and both
 would proceed. Allocations for
 different branches and paths run concurrently, waiting for one another only

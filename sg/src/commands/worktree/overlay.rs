@@ -1,6 +1,4 @@
-use super::{
-    admin_head, canonical_path, git_command_at, run_command, state_dir, AdminHead, RepoContext,
-};
+use super::{admin_head, canonical_path, run_command, state_dir, AdminHead, RepoContext};
 use anyhow::{bail, Context, Result};
 use serde_json::json;
 use std::fs;
@@ -154,18 +152,7 @@ pub(super) fn branch(repo: &RepoContext, worktree: &Path) -> Option<String> {
 pub(super) fn admin_dir(repo: &RepoContext, worktree: &Path) -> Option<PathBuf> {
     // Without its `.git`, git walks up from `worktree` and answers for whatever
     // repository encloses it; only the registry knows this worktree then.
-    let live = Some(worktree)
-        .filter(|worktree| worktree.join(".git").exists())
-        .and_then(|worktree| {
-            git_command_at(worktree)
-                .ok()?
-                .args(["rev-parse", "--absolute-git-dir"])
-                .output()
-                .ok()
-        })
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|path| PathBuf::from(path.trim()));
+    let live = live_git_dir(worktree);
     // When `worktree` is an empty, unmounted mountpoint nested inside the
     // common git dir (e.g. `.git/simgit/worktrees/<name>`), git's directory
     // discovery walks past it and finds the outer repository instead. Reject
@@ -188,6 +175,23 @@ pub(super) fn admin_dir(repo: &RepoContext, worktree: &Path) -> Option<PathBuf> 
         }
     }
     None
+}
+
+/// The git dir a worktree's own `.git` names, as Git reads it: a directory
+/// is the git dir itself, and a file says `gitdir: <path>`, relative to the
+/// worktree when Git wrote it so. `None` when there is none to find, or it
+/// names nothing. Reading it costs no `git`, which every command used to
+/// spawn several times to learn this.
+pub(super) fn live_git_dir(worktree: &Path) -> Option<PathBuf> {
+    let dot_git = worktree.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let recorded = fs::read_to_string(&dot_git).ok()?;
+        let named = recorded.lines().next()?.strip_prefix("gitdir: ")?.trim();
+        worktree.join(named)
+    };
+    git_dir.is_dir().then(|| canonical_path(&git_dir))
 }
 
 /// The `.git` path an admin dir's `gitdir` file records, in canonical form,

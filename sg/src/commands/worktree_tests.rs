@@ -411,6 +411,35 @@ fn worktree_paths_with_spaces_are_supported() -> Result<()> {
     Ok(())
 }
 
+/// gc and prune judge an unlocked worktree by its markers, so they must all be
+/// written while the allocation lock holds: `create_worktree` returns with
+/// both in place, and its callers release the lock only afterwards.
+#[test]
+fn create_worktree_writes_its_markers_before_releasing_the_lock() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let repo = discover_repo(&fixture.repo)?;
+    let args = WorktreeAdd {
+        branch: Some("agent/marked".to_owned()),
+        detach: false,
+        attach: false,
+        path: Some(fixture.root.join("marked")),
+        sparse: Vec::new(),
+        base: None,
+        require_cow: false,
+        ephemeral: true,
+    };
+    let created = create_worktree(&repo, &fixture.root, &args, None)?;
+    let admin = overlay::admin_dir(&repo, &created.target).context("admin dir")?;
+    assert!(admin.join("simgit-ephemeral").is_file());
+    assert!(admin.join("simgit-mode").is_file());
+    assert_eq!(
+        fs::read_to_string(admin.join("locked"))?.trim_end(),
+        allocation_lock_reason()
+    );
+    release_allocation_lock(&repo, &created.target)?;
+    Ok(())
+}
+
 #[test]
 fn overlay_marker_round_trips_through_common_admin_dir() -> Result<()> {
     let fixture = Fixture::new()?;
@@ -617,8 +646,23 @@ fn pruning_preserves_baselines_used_by_active_overlays() -> Result<()> {
     let repo = discover_repo(&fixture.repo)?;
     let commit = resolve_commit(&repo, "HEAD")?;
     let baseline = cow::ensure_baseline(&repo, &commit)?.tree;
+    // Other tests in this process fork children (`pre_exec`), and one forked
+    // while this test held the cache lock holds a copy of it until it execs.
+    // `prune --all` rightly refuses a busy cache instead of waiting, so wait
+    // out that moment here; no simgit process forks while it holds a lock.
+    let prune_all = |protected: &dyn Fn() -> HashSet<PathBuf>| {
+        for _ in 0..100 {
+            match prune_baseline_cache(&repo, true, protected) {
+                Err(error) if format!("{error:#}").contains("in use by an allocation") => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                outcome => return outcome,
+            }
+        }
+        prune_baseline_cache(&repo, true, protected)
+    };
     let protected = || HashSet::from([baseline.clone()]);
-    let protected_run = prune_baseline_cache(&repo, true, &protected)?;
+    let protected_run = prune_all(&protected)?;
     assert!(protected_run.removed.is_empty());
     assert_eq!(protected_run.retained.len(), 1);
     assert!(
@@ -626,7 +670,7 @@ fn pruning_preserves_baselines_used_by_active_overlays() -> Result<()> {
         "a retained baseline must report its disk cost"
     );
     assert!(baseline.is_dir());
-    let full_run = prune_baseline_cache(&repo, true, &HashSet::new)?;
+    let full_run = prune_all(&HashSet::new)?;
     assert_eq!(full_run.removed.len(), 1);
     assert_eq!(full_run.retained_bytes, 0);
     assert!(!baseline.exists());

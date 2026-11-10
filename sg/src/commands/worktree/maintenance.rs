@@ -1,10 +1,11 @@
 use super::hook::remove_dead_fetch_refs;
 use super::locks::remove_dead_pending;
 use super::{
-    admin_head, admin_holds_uncommitted, cow, discover_repo, emit, git_common_command, git_failure,
-    git_output_common, head_unreached, is_ephemeral, list_worktrees, lock_present, lock_state,
-    overlay, parse_duration, registration_gone, registration_holds_uncommitted, teardown_worktree,
-    worktree_dirty, worktree_idle, AdminHead, Caller, RegistryLock, RepoContext,
+    admin_dirs, admin_head, admin_holds_uncommitted, admin_is_ephemeral, canonical_path, cow,
+    discover_repo, emit, git_common_command, git_failure, git_output_common, head_unreached,
+    list_worktrees, lock_present, lock_state, overlay, parse_duration, registration_gone,
+    registration_holds_uncommitted, teardown_worktree, worktree_dirty, worktree_idle, AdminHead,
+    Caller, RegistryLock, RepoContext,
 };
 use anyhow::{bail, Context, Result};
 use clap::Args;
@@ -255,21 +256,14 @@ pub(super) fn prune_baseline_cache(
     all: bool,
     protected: &dyn Fn() -> HashSet<PathBuf>,
 ) -> Result<cow::PruneOutcome> {
-    // Branch worktrees are reached through their branch ref; only detached
-    // HEADs need checking on their own.
-    let detached_heads: Vec<String> = list_worktrees(repo)?
-        .into_iter()
-        .filter(|entry| entry.branch.is_none())
-        .filter_map(|entry| entry.head)
-        .collect();
-    let reachable = |commit: &str| commit_reachable(repo, commit, &detached_heads);
+    let reachable = |commit: &str| commit_reachable(repo, commit);
     cow::prune_baselines(&repo.common_git_dir, all, protected, &reachable)
 }
 
 /// Whether a ref or a detached worktree HEAD still reaches `commit`. One that
 /// nothing reaches, or that Git has already collected, can only be reused by
 /// naming its object id.
-fn commit_reachable(repo: &RepoContext, commit: &str, detached_heads: &[String]) -> Result<bool> {
+fn commit_reachable(repo: &RepoContext, commit: &str) -> Result<bool> {
     let spec = format!("{commit}^{{commit}}");
     let exists = git_output_common(repo, ["rev-parse", "--verify", "--quiet", &spec])?;
     match exists.status.code() {
@@ -277,31 +271,14 @@ fn commit_reachable(repo: &RepoContext, commit: &str, detached_heads: &[String])
         Some(1) => return Ok(false),
         _ => return Err(git_failure("git rev-parse --verify", &exists)),
     }
-    let refs = git_output_common(
-        repo,
-        [
-            "for-each-ref",
-            "--count=1",
-            "--format=%(refname)",
-            "--contains",
-            commit,
-        ],
-    )?;
-    if !refs.status.success() {
-        return Err(git_failure("git for-each-ref --contains", &refs));
+    // `--all` counts every ref and every worktree's HEAD, so one call answers
+    // what a `merge-base` per detached worktree used to: `commit` is reached
+    // exactly when nothing is left once those are subtracted.
+    let unreached = git_output_common(repo, ["rev-list", "-n1", commit, "--not", "--all"])?;
+    if !unreached.status.success() {
+        return Err(git_failure("git rev-list --not --all", &unreached));
     }
-    if !refs.stdout.is_empty() {
-        return Ok(true);
-    }
-    for head in detached_heads {
-        let ancestor = git_output_common(repo, ["merge-base", "--is-ancestor", commit, head])?;
-        match ancestor.status.code() {
-            Some(0) => return Ok(true),
-            Some(1) => {}
-            _ => return Err(git_failure("git merge-base --is-ancestor", &ancestor)),
-        }
-    }
-    Ok(false)
+    Ok(unreached.stdout.is_empty())
 }
 
 pub fn gc(args: WorktreeGc, json: bool) -> Result<()> {
@@ -400,11 +377,19 @@ pub(super) fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome>
     let mut skipped: Vec<(PathBuf, &'static str)> = Vec::new();
     let mut retained_branches = Vec::new();
     let mut deleted_branches = Vec::new();
+    let mut reaped_branches = Vec::new();
 
+    // Each check below reads a file in the worktree's admin dir; find them all
+    // in one pass rather than asking git once per worktree per check.
+    let admins = admin_dirs(repo);
     for entry in list_worktrees(repo)? {
         if entry.is_main {
             continue;
         }
+        let admin = admins
+            .get(&canonical_path(&entry.path))
+            .cloned()
+            .or_else(|| overlay::admin_dir(repo, &entry.path));
         let branch = entry.branch.as_deref().unwrap_or("");
         let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
         if let Some(prefix) = &args.prefix {
@@ -412,11 +397,15 @@ pub(super) fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome>
                 continue;
             }
         }
-        if !args.include_persistent && !is_ephemeral(repo, &entry.path) {
+        if !args.include_persistent && !admin_is_ephemeral(admin.as_deref()) {
             skipped.push((entry.path.clone(), "persistent"));
             continue;
         }
-        match lock_state(repo, &entry.path) {
+        let locked = match &admin {
+            Some(admin) => Some(lock_present(&admin.join("locked"))),
+            None => lock_state(repo, &entry.path),
+        };
+        match locked {
             Some(false) => {}
             Some(true) => {
                 skipped.push((entry.path.clone(), "locked"));
@@ -428,7 +417,7 @@ pub(super) fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome>
                 continue;
             }
         }
-        if worktree_idle(repo, &entry.path) < older_than {
+        if worktree_idle(admin.as_deref(), &entry.path) < older_than {
             // Say so: a user who just created and merged a workspace and then
             // followed the documented `gc --older-than 1h` otherwise sees no
             // mention of it at all.
@@ -475,19 +464,17 @@ pub(super) fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome>
         }
         match teardown_worktree(repo, &entry.path, args.discard_dirty, Caller::Cli) {
             Ok(()) => {
-                if args.delete_branches {
-                    if let Some(branch) = &entry.branch {
-                        if delete_local_branch(repo, branch, args.delete_unmerged).is_err() {
-                            retained_branches.push(short.to_owned());
-                        } else {
-                            deleted_branches.push(short.to_owned());
-                        }
-                    }
+                if args.delete_branches && entry.branch.is_some() {
+                    reaped_branches.push(short.to_owned());
                 }
                 reaped.push(entry.path)
             }
             Err(_) => skipped.push((entry.path, "remove-failed")),
         }
+    }
+    if !reaped_branches.is_empty() {
+        (deleted_branches, retained_branches) =
+            delete_branches_together(repo, reaped_branches, args.delete_unmerged);
     }
 
     // No closing prune: gc drops only what it reaps, and everything it skipped
@@ -498,6 +485,67 @@ pub(super) fn run_gc(repo: &RepoContext, args: &WorktreeGc) -> Result<GcOutcome>
         retained_branches,
         deleted_branches,
     })
+}
+
+/// Delete `branches` with as few `git branch` calls as possible, each of
+/// which reads every registration, and sort them into deleted and kept,
+/// never by parsing Git's messages. `main` and `master` are always kept;
+/// without `force`, so is any branch Git refuses as not fully merged.
+///
+/// It never fails: gc calls it after the worktrees are gone, and its report is
+/// the only record of them. A branch it cannot confirm deleted counts as kept.
+fn delete_branches_together(
+    repo: &RepoContext,
+    branches: Vec<String>,
+    force: bool,
+) -> (Vec<String>, Vec<String>) {
+    let (mut retained, deletable): (Vec<String>, Vec<String>) = branches
+        .into_iter()
+        .partition(|branch| branch == "main" || branch == "master");
+    let mut deleted = Vec::new();
+    // Branches of a `git branch` call that refused some: only the refs left
+    // afterwards say which.
+    let mut unsure = Vec::new();
+    // Chunks keep each argument list well under ARG_MAX.
+    for chunk in deletable.chunks(500) {
+        let mut command = git_common_command(repo);
+        command
+            .args(["branch", if force { "-D" } else { "-d" }])
+            .args(chunk);
+        let output = RegistryLock::shared(repo)
+            .and_then(|_registry| command.output().context("delete worktree branches"));
+        match output {
+            // Git exits 0 only when it deleted every branch it was given.
+            Ok(output) if output.status.success() => deleted.extend_from_slice(chunk),
+            Ok(_) => unsure.extend_from_slice(chunk),
+            // Git never ran, so every branch is still there.
+            Err(_) => retained.extend_from_slice(chunk),
+        }
+    }
+    if unsure.is_empty() {
+        return (deleted, retained);
+    }
+    let left = git_output_common(repo, ["for-each-ref", "--format=%(refname)", "refs/heads/"])
+        .ok()
+        .filter(|output| output.status.success());
+    let Some(left) = left else {
+        retained.extend(unsure);
+        return (deleted, retained);
+    };
+    let left: HashSet<String> = String::from_utf8_lossy(&left.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    // Full names: a tag or remote of the same name makes `refname:short`
+    // write a branch as `heads/<name>`.
+    for branch in unsure {
+        if left.contains(&format!("refs/heads/{branch}")) {
+            retained.push(branch);
+        } else {
+            deleted.push(branch);
+        }
+    }
+    (deleted, retained)
 }
 
 pub(super) fn delete_local_branch(repo: &RepoContext, branch_ref: &str, force: bool) -> Result<()> {
