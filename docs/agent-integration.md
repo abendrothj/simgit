@@ -538,10 +538,6 @@ brew install abendrothj/tap/simgit
 claude plugin install simgit --marketplace abendrothj/simgit
 ```
 
-> PRE-RELEASE: the plugin installs only once `v0.5.0` is tagged, and works only
-> once Homebrew serves simgit 0.5.0. Remove this note at release (CONTRIBUTING,
-> "Releasing").
-
 The plugin registers `simgit hook claude-code` for `WorktreeCreate`,
 `WorktreeRemove`, `SubagentStop` and `SessionStart` (see
 [the `hook` reference](reference.md#hook)). `WorktreeCreate` has a 30-minute
@@ -621,8 +617,6 @@ brew install abendrothj/tap/simgit
 codex plugin marketplace add abendrothj/simgit
 codex plugin add simgit@simgit
 ```
-
-The pre-release note under [Claude Code](#claude-code) applies here too.
 
 The plugin brings the `simgit-worktrees` skill and the `SessionStart` and
 `SubagentStop` hooks; Codex ignores the Claude Code-only `WorktreeCreate` and

@@ -161,11 +161,7 @@ which is how `simgit update` tells a release binary from a source build.
    `abendrothj/homebrew-tap` repo's `Formula/simgit.rb`.
 5. Move the `ref` in `.claude-plugin/marketplace.json` to the new tag, only after
    the Homebrew formula serves that release, so the plugin never gets ahead of
-   brew. For 0.5.0 the `ref` was set to `v0.5.0` ahead of the tag.
-6. For 0.5.0 only: once `v0.5.0` is tagged and Homebrew serves it, delete the
-   `PRE-RELEASE` note in `integrations/claude-code/README.md` and the one in
-   `docs/agent-integration.md` (under Claude Code), and the sentence pointing
-   to it in that file's Codex section.
+   brew.
 
 ## Communication
 
