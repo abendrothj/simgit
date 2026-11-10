@@ -1068,6 +1068,20 @@ fn pr_fetch_has_no_terminal_for_ssh_to_prompt_on() {
 /// wrapper fails the first fetch that way; the create must still succeed.
 #[test]
 fn pr_fetch_is_retried_after_a_half_written_registration() {
+    assert_pr_fetch_is_retried(
+        "fatal: failed to read ${1#--git-dir=}/worktrees/other/commondir: Undefined error: 0",
+    );
+}
+
+/// `git worktree add` writes a placeholder HEAD of zeros before the real one,
+/// and a fetch that reads it then dies on a "bad object".
+#[test]
+fn pr_fetch_is_retried_after_a_placeholder_head() {
+    assert_pr_fetch_is_retried("fatal: bad object worktrees/other/HEAD");
+}
+
+/// Fail the first `git fetch` with `complaint`; the create must still succeed.
+fn assert_pr_fetch_is_retried(complaint: &str) {
     use std::os::unix::fs::PermissionsExt;
 
     let fixture = HookFixture::new();
@@ -1086,7 +1100,7 @@ fn pr_fetch_is_retried_after_a_half_written_registration() {
             "#!/bin/sh\n\
              if [ \"$2\" = fetch ] && [ ! -e '{failed}' ]; then\n\
                : > '{failed}'\n\
-               echo \"fatal: failed to read ${{1#--git-dir=}}/worktrees/other/commondir: Undefined error: 0\" >&2\n\
+               echo \"{complaint}\" >&2\n\
                exit 128\n\
              fi\n\
              exec '{real}' \"$@\"\n",

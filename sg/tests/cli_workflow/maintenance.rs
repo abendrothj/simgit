@@ -323,3 +323,62 @@ fn prune_keeps_a_baseline_only_a_detached_worktree_reaches() {
         "prune dropped a baseline a worktree's HEAD reaches"
     );
 }
+
+/// `prune` asks whether anything reaches a baseline's commit with `--all`,
+/// which reads every worktree's HEAD. `git worktree add` writes a placeholder
+/// HEAD of zeros first, and a check that reads it dies on a "bad object"; the
+/// wrapper fails the first check that way, and `prune` must still finish.
+#[test]
+fn prune_retries_a_reachability_check_that_met_a_placeholder_head() {
+    let fixture = Fixture::new();
+    // A commit only a deleted branch reached, with a baseline built for it.
+    git(&fixture.repo, &["switch", "-qc", "gone"]);
+    fs::write(fixture.repo.join("gone.txt"), "x\n").unwrap();
+    git(&fixture.repo, &["add", "gone.txt"]);
+    git(&fixture.repo, &["commit", "-qm", "gone"]);
+    let gone = git_stdout(&fixture.repo, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    git(&fixture.repo, &["switch", "-q", "-"]);
+    let added = fixture
+        .command()
+        .env_remove("SIMGIT_POPULATE")
+        .args(["add", "agent/tmp", "--base", &gone])
+        .output()
+        .unwrap();
+    success(&added);
+    let baseline = fixture.repo.join(".git/simgit/baselines").join(&gone);
+    if !baseline.is_dir() {
+        eprintln!("skipped: no backend here uses a baseline");
+        return;
+    }
+    success(&fixture.run(&[
+        "remove",
+        "agent/tmp",
+        "--delete-branch",
+        "--delete-unmerged",
+    ]));
+    git(&fixture.repo, &["branch", "-qD", "gone"]);
+
+    let failed = fixture.root.join("reach-failed");
+    let env = git_wrapper(
+        &fixture,
+        &format!(
+            "case \" $* \" in *' rev-list '*' --all '*) if [ ! -e '{failed}' ]; then\n\
+               : > '{failed}'\n\
+               echo 'fatal: bad object worktrees/other/HEAD' >&2\n\
+               exit 128\n\
+             fi ;; esac\n",
+            failed = failed.display(),
+        ),
+    );
+    let output = fixture
+        .command()
+        .envs(env.iter().cloned())
+        .args(["--json", "prune"])
+        .output()
+        .unwrap();
+    success(&output);
+    assert!(failed.exists(), "the wrapper never failed a check");
+    assert!(!baseline.exists(), "prune kept a baseline nothing reaches");
+}
