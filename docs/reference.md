@@ -629,12 +629,14 @@ A newer release is trusted only once every check passes:
 3. The archive's `simgit` and `sg` are identical, and report
    `simgit <latest>` when run with `--version`.
 
-Then each of `sg` and `simgit` present in the binary's directory, and the
-running binary itself, is replaced by an atomic rename; running processes
-keep the old binary. Any failure replaces nothing. `update` never moves to an
-older release, nor to a pre-release. It needs `curl` and `tar`, and refuses
-with a message naming whichever is missing. Downloads use HTTPS with TLS 1.2
-or later only.
+Then the running binary, and an `sg` or `simgit` beside it that is the same
+binary, are replaced by an atomic rename; an `sg` from another program is
+left alone, and running processes keep the old binary. Any failed check
+replaces nothing. `update` never moves to an older release, nor to a
+pre-release. It needs `curl` and `tar`, and refuses with a message naming
+whichever is missing. Downloads use HTTPS with TLS 1.2 or later only, ignore
+your `.curlrc`, and give up on a server that does not answer within 10
+seconds or a download that stalls.
 
 ### Update notice
 

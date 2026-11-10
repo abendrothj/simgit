@@ -134,10 +134,21 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// `curl` restricted to HTTPS with TLS 1.2 or later, failing on HTTP errors.
+/// `curl` restricted to HTTPS with TLS 1.2 or later, failing on HTTP errors,
+/// and giving up on a server it cannot reach. `-q`, which curl honours only
+/// as the first argument, keeps a user's `.curlrc` out: `location` there would
+/// follow the `releases/latest` redirect and lose its answer.
 pub(crate) fn curl() -> Command {
     let mut command = Command::new("curl");
-    command.args(["--proto", "=https", "--tlsv1.2", "-fsS"]);
+    command.args([
+        "-q",
+        "--proto",
+        "=https",
+        "--tlsv1.2",
+        "--connect-timeout",
+        "10",
+        "-fsS",
+    ]);
     command
 }
 
@@ -145,7 +156,14 @@ pub(crate) fn curl() -> Command {
 /// `releases/latest`.
 pub(crate) fn latest_release() -> Result<Version> {
     let output = curl()
-        .args(["-o", "/dev/null", "-w", "%{redirect_url}"])
+        .args([
+            "--max-time",
+            "30",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{redirect_url}",
+        ])
         .arg(format!("{RELEASES_URL}/latest"))
         .stdin(Stdio::null())
         .output();

@@ -53,7 +53,7 @@ impl FakeRelease {
             "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" >>\"$SIMGIT_TEST_ROOT/curl.log\"\n\
              out=\nformat=\nurl=\nwhile [ $# -gt 0 ]; do\n\
              \tcase \"$1\" in\n\t-o) out=$2; shift 2 ;;\n\t-w) format=$2; shift 2 ;;\n\
-             \t--proto|--max-time) shift 2 ;;\n\t-*) shift ;;\n\t*) url=$1; shift ;;\n\tesac\n\
+             \t--proto|--max-time|--connect-timeout|--speed-limit|--speed-time) shift 2 ;;\n\t-*) shift ;;\n\t*) url=$1; shift ;;\n\tesac\n\
              done\n\
              sleep \"${SIMGIT_TEST_CURL_DELAY:-0}\"\n\
              case \"$url\" in\n\
@@ -517,4 +517,77 @@ fn notice_is_silent_when_curl_is_missing() {
     let shown = String::from_utf8_lossy(&output.stdout);
     assert!(!shown.contains("curl"), "{shown}");
     assert!(!shown.contains("is available"), "{shown}");
+}
+
+/// A user's `~/.curlrc` must not change what simgit asks curl: `location`
+/// there would follow the `releases/latest` redirect and lose its answer.
+#[test]
+fn update_ignores_the_users_curlrc() {
+    let fixture = FakeRelease::new();
+    fixture.publish(LATEST, &fixture.keys);
+    let output = fixture.run(&["update"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let log = fixture.curl_log();
+    assert!(log.lines().count() >= 4, "{log}");
+    for call in log.lines() {
+        assert!(call.starts_with("-q "), "-q must come first: {call}");
+    }
+}
+
+/// A stalled connection must not hang `update`, which agents run unattended.
+#[test]
+fn update_gives_up_on_a_stalled_connection() {
+    let fixture = FakeRelease::new();
+    fixture.publish(LATEST, &fixture.keys);
+    let output = fixture.run(&["update"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let log = fixture.curl_log();
+    for call in log.lines() {
+        assert!(call.contains("--connect-timeout 10"), "{call}");
+    }
+    let lookup = log
+        .lines()
+        .find(|call| call.ends_with("/releases/latest"))
+        .unwrap();
+    assert!(lookup.contains("--max-time 30"), "{lookup}");
+    for download in log
+        .lines()
+        .filter(|call| call.contains("/releases/download/"))
+    {
+        assert!(
+            download.contains("--speed-limit 1024 --speed-time 30"),
+            "{download}"
+        );
+    }
+}
+
+/// Another program's `sg` (ast-grep, shadow-utils) beside a hand-installed
+/// simgit is not simgit's to replace.
+#[test]
+fn update_leaves_another_programs_sg_alone() {
+    let fixture = FakeRelease::new();
+    fixture.publish(LATEST, &fixture.keys);
+    let foreign = "#!/bin/sh\necho ast-grep\n";
+    fs::write(fixture.installed.join("sg"), foreign).unwrap();
+    let output = fixture.run(&["update"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(fixture.installed.join("sg")).unwrap(),
+        foreign
+    );
+    let installed = fixture.installed.join("simgit");
+    assert_eq!(fixture.version_of(&installed), format!("simgit {LATEST}"));
+}
+
+/// Run as `sg` with no `simgit` beside it, `update` replaces `sg` alone.
+#[test]
+fn update_run_as_sg_replaces_only_sg() {
+    let fixture = FakeRelease::new();
+    fixture.publish(LATEST, &fixture.keys);
+    fs::remove_file(fixture.installed.join("simgit")).unwrap();
+    let sg = fixture.installed.join("sg");
+    let output = fixture.command(&sg).arg("update").output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!fixture.installed.join("simgit").exists());
+    assert_eq!(fixture.version_of(&sg), format!("simgit {LATEST}"));
 }

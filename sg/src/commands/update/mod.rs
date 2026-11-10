@@ -209,16 +209,18 @@ fn install(latest: Version) -> Result<PathBuf> {
         bail!("the release's simgit and sg binaries differ; nothing was replaced");
     }
 
-    // Replace what is installed: `sg` and `simgit` where present, and the
-    // running binary whatever its name.
+    // Replace the running binary, whatever its name, and the `sg` or `simgit`
+    // beside it only when it is this same binary: an `sg` from ast-grep or
+    // shadow-utils is not simgit's to replace.
+    let own = fs::read(&exe).context("read the running simgit")?;
     let mut names: Vec<std::ffi::OsString> = ["sg", "simgit"]
         .into_iter()
-        .filter(|name| dir.join(name).exists())
+        .filter(|name| fs::read(dir.join(name)).is_ok_and(|bytes| bytes == own))
         .map(Into::into)
         .collect();
-    if let Some(own) = exe.file_name() {
-        if !names.iter().any(|name| name == own) {
-            names.push(own.to_owned());
+    if let Some(own_name) = exe.file_name() {
+        if !names.iter().any(|name| name == own_name) {
+            names.push(own_name.to_owned());
         }
     }
     let mut staged = Vec::new();
@@ -246,8 +248,9 @@ fn install(latest: Version) -> Result<PathBuf> {
 
 /// Fetch `url` into `path` and return its bytes.
 fn download(url: &str, path: &Path) -> Result<Vec<u8>> {
+    // A download that stalls below 1 KiB/s for 30 s is abandoned.
     let output = curl()
-        .arg("-L")
+        .args(["--speed-limit", "1024", "--speed-time", "30", "-L"])
         .arg("-o")
         .arg(path)
         .arg(url)
