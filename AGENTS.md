@@ -32,6 +32,8 @@ Linux and in CI; do not treat them as gates on macOS.
   (`run`), `maintenance.rs` (`gc`, `prune`, `repair`), `locks.rs` (`unlock`)
   and `doctor.rs`. `repo.rs` holds repository discovery and the `git` helpers,
   `mod.rs` the shared types, and `{cow,overlay,index}.rs` the backends.
+- `update` and its notice live in `sg/src/commands/update/`: `mod.rs` (the
+  command), `release.rs` (versions, checksums, signatures) and `notice.rs`.
 - Unit tests sit at the bottom of the file they test; their shared fixtures
   are in `sg/src/commands/worktree/test_support.rs`.
 - `simgit hook` (the Claude Code adapter) lives in
@@ -40,7 +42,7 @@ Linux and in CI; do not treat them as gates on macOS.
 ### Command surface invariants
 
 - The surface is flat:
-  `simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair|hook`.
+  `simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair|hook|update`.
   There is no `worktree` namespace.
 - `--json` is global only; never add a per-subcommand `--json`. `hook` rejects
   it, like `run`, because the harness fixes the output.
@@ -117,6 +119,12 @@ Linux and in CI; do not treat them as gates on macOS.
   because `--commit` commits only what the worktree still holds. On a dirty
   detached worktree `--commit` refuses before committing, naming
   `git switch -c` first, since its commit would be one no ref reaches.
+- `update` replaces only a binary simgit installed (never Homebrew's or
+  cargo's), and only after the release's signature against `sg/minisign.pub`,
+  its checksum and its own `--version` all agree; `update --check` changes
+  nothing. The update notice never appears under `--json`, `run`, `update`
+  or a worktree hook, under `CI`, or when stderr is not a terminal; the
+  Claude Code `SessionStart` hook returns it as a `systemMessage` instead.
 - A `--json` failure emits no JSON: nonzero exit, empty stdout, one line of
   diagnostic text on stderr.
 
@@ -144,10 +152,13 @@ this as a compatibility contract rather than a description:
   work, and simgit's own temporary files and fetch refs once the process that
   wrote them is gone, `repair` only remounts, and `unlock`
   refuses a live owner with no override. Gates classify `doctor`, `list`,
-  `unlock`, `prune`, `repair`, flagless `add`/`remove`/`gc`/`hook`, and `add --attach`
-  (which checks out an existing branch without moving or deleting it) as
-  automatic on that basis; a change that breaks it silently turns an approved
-  command destructive.
+  `unlock`, `prune`, `repair`, `update --check`, flagless
+  `add`/`remove`/`gc`/`hook`, and `add --attach` (which checks out an existing
+  branch without moving or deleting it) as automatic on that basis; a change
+  that breaks it silently turns an approved command destructive.
+- `update` without `--check` destroys no work, but it replaces the simgit
+  executable with downloaded code, so gates require approval for it every
+  time.
 - `run` is the exception by design: it executes caller-supplied argv after
   `--`, so the argv, not the `run` invocation, is what a gate must judge.
 - Destructiveness is decidable from argv alone. Never make it depend on

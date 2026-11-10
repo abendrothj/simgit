@@ -1,7 +1,7 @@
 # simgit reference
 
 Detailed semantics for the flat command surface
-(`simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair|hook`).
+(`simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair|hook|update`).
 [README.md](../README.md) is the overview; this file is the contract each
 command actually implements. `simgit` is the canonical executable and `sg` is an
 equivalent alias; examples use `simgit`.
@@ -143,7 +143,7 @@ switching, renaming or detaching its branch inside it changes nothing for
 | `WorktreeCreate` | Under the branch claim: reuse the name's worktree, else the worktree on `simgit/<name>` wherever it is, else attach the branch if it exists, else create it from the base. Never returns the main checkout, and refuses a locked worktree; when the simgit process that locked it, a `run` or an allocation, is gone, the error names `simgit unlock <path>`. A worktree an allocation never finished populating is refused, naming `simgit remove <path> --discard-dirty`. A worktree deleted by hand is created again at its path, on the branch or detached HEAD it had, as `run` does; one whose registration is locked, holds uncommitted work (staged changes, an operation in progress, submodule repositories or refs of its own), or is detached at a commit no ref reaches is kept, and the create fails. | the path only | 1 with one stderr line on failure |
 | `WorktreeRemove` | Only a name's worktree or a worktree on a `simgit/*` branch; others are refused. Removes it (refusing a dirty one without `--discard-dirty`, and a detached one at a commit no ref reaches even with it), then drops its `simgit/*` branch, the one it is on or else the one it was allocated for, if no commit on it is unreached by another ref. No other branch is ever dropped. A path that no longer exists succeeds; if Git still registers it, that one registration is dropped and the branch by the same rule, unless the registration is locked, holds uncommitted work as for `remove`, or is detached at a commit no ref reaches: then both are kept and the hook exits 1, even with `--discard-dirty`. The hook takes no `--commit`, so a refusal names the command that works from a shell: `simgit remove <path> --commit` or `simgit remove <path> --discard-dirty` for uncommitted work, after `git -C <path> switch -c <name>` on a detached worktree, `simgit remove <path>` after keeping a detached commit, and only `--discard-dirty` for a worktree never populated. Each is spelled `cd <main checkout> && simgit ...`, so it works from any directory: simgit finds the repository from the one it runs in, and the hook's worktrees lie outside it. | nothing | 1 when refused or failed |
 | `SubagentStop` | Removes the `simgit/agent-<agent_id>` worktree and branch when it is clean, unlocked and holds no unreached commit. Otherwise keeps it. A worktree deleted by hand has its own registration dropped, and no other, and its branch dropped by the same rule; a registration that is locked or holds uncommitted work as for `remove` is kept, and the stop reports why on one line. It does nothing when the branch is not checked out in a worktree, and does nothing silently when the payload has no `agent_id` or no directory at or above the project has a `.git`. A `.git` that Git refuses is reported on one line. | nothing | always 0 |
-| `SessionStart` | Nothing; the plugin uses it to check the version. | nothing | 0 |
+| `SessionStart` | Shows the [update notice](#update-notice) when a newer release is out, and starts the daily check; the plugin also uses it to check the version. | `{"systemMessage": …}` when a newer release is out, else nothing | 0 |
 | any other | Nothing. | nothing | 0 |
 
 A branch is dropped by `hook` only when `git rev-list --single-worktree
@@ -449,7 +449,7 @@ work.
 ## Machine-readable output
 
 The global `--json` flag gives orchestrators structured output from `doctor`,
-`add`, `remove`, `list`, `unlock`, `gc`, `prune` and `repair`; it is accepted
+`add`, `remove`, `list`, `unlock`, `gc`, `prune`, `repair` and `update`; it is accepted
 before or after the command, and `run` and `hook` are the commands that reject it. A
 `--json` failure, including an argument-parsing error, emits no JSON: nonzero
 exit, empty stdout, one line of diagnostic text on stderr. That line replaces
@@ -486,6 +486,8 @@ form would imply one exists.
 | `gc` | `reaped` (paths), `skipped` (array of `{worktree, reason}`, reasons under [GC](#gc)), `deleted_branches`, `retained_branches`, `dry_run` |
 | `prune` | `pruned`, `pruned_registrations`, `kept_registrations`, `retained`, `retained_bytes`, `cache_busy` |
 | `repair` | `repaired` and `healthy` (paths of overlay worktrees), `failed` (array of `{worktree, error}`; any entry makes the command exit 1) |
+| `update --check` | `current`, `latest`, `update_available`, `install_method` (`self`, `homebrew`, `cargo` or `source`), `command` |
+| `update` | `updated`, `current`; when `updated` is `true`, also `previous` and `path` (the directory the binaries were replaced in) |
 
 `doctor` exits 0 outside a Git worktree: identity, version and filesystem are
 always reported, and every repository-dependent field is `null` rather than an
@@ -604,6 +606,74 @@ checkout does not hold `prune` off.
 Compare the retained baseline cost directly with the marginal cost of each
 additional worktree; the savings depend on repository shape, not a fixed
 multiplier.
+
+## `update`
+
+`simgit update --check` reports the running version, the latest release and
+the command that updates this install. It changes nothing. "Latest" is what
+that command can install now, read from where it installs from: GitHub's
+latest release for `simgit update`, the `abendrothj/homebrew-tap` formula for
+`brew upgrade`, and crates.io's index (newest version not yanked) for
+`cargo install`. So a Homebrew or cargo install never hears of a release its
+command cannot install yet.
+
+`simgit update` installs the latest release in place, but only where simgit
+installed itself: a release binary placed by `install.sh` or by hand. It
+refuses the rest without downloading anything, and names their command:
+`brew upgrade simgit` under a Homebrew `Cellar`, and
+`cargo install simgit-cli --locked` under `$CARGO_HOME/bin` (cargo-binstall
+included) or for a binary built from source. The install method comes from
+the running binary's resolved path, so a symlink to it is followed and the
+file it names is replaced.
+
+A newer release is trusted only once every check passes:
+
+1. `SHA256SUMS` verifies against `SHA256SUMS.minisig` with the release key
+   (`sg/minisign.pub`, built into the binary).
+2. The platform's `sg-<target>.tar.gz` matches its `SHA256SUMS` record.
+3. The archive's `simgit` and `sg` are identical, and report
+   `simgit <latest>` when run with `--version`.
+
+Then the running binary, and an `sg` or `simgit` beside it that is the same
+binary, are replaced by an atomic rename; an `sg` from another program is
+left alone, and running processes keep the old binary. Any failed check
+replaces nothing. `update` never moves to an older release, nor to a
+pre-release. It needs `curl` and `tar`, and refuses with a message naming
+whichever is missing. Downloads use HTTPS with TLS 1.2 or later only, ignore
+your `.curlrc`, and give up on a server that does not answer within 10
+seconds or a download that stalls.
+
+### Update notice
+
+After a command succeeds, simgit prints one line on stderr when a newer
+release is out, naming the command that updates this install. It does so
+only when stderr is a terminal, never under `--json`, `run`, `hook` or
+`update`, and never when `CI` or `SIMGIT_NO_UPDATE_CHECK` is set.
+
+The answer from this install's source (above) is cached in
+`$XDG_CACHE_HOME/simgit/` (default `~/.cache/simgit/`), in `latest`,
+`latest-homebrew` or `latest-crates`. When the cache is missing or a day
+old, simgit starts `curl` without waiting for it, so the check never delays a
+command. That is one request a day at most, to github.com,
+raw.githubusercontent.com or index.crates.io; set
+`SIMGIT_NO_UPDATE_CHECK=1` to make none.
+
+In Claude Code, where the plugin runs simgit only through hooks, the
+`SessionStart` hook shows the same notice as a session message, under the
+same switches. No other hook shows it.
+
+### Release signatures
+
+Every release since 0.5.0 signs its `SHA256SUMS` with minisign. To check a
+download by hand:
+
+```sh
+minisign -V -P RWTT6Elk+LYVr8TQtSOys9pS3bchCSi2iMkZCe+CkHLywqsls/rQxiNB -m SHA256SUMS
+```
+
+`install.sh` runs the same check when `minisign` is installed, and otherwise
+says it verified the checksum only. Set `SIMGIT_REQUIRE_SIGNATURE=1` to make
+it refuse to install without the signature check.
 
 ## Repository layout
 

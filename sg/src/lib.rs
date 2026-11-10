@@ -99,6 +99,8 @@ enum Commands {
     Prune(commands::worktree::WorktreePrune),
     /// Remount overlay-backed worktrees after a reboot or interrupted mount.
     Repair,
+    /// Check for, or install, a newer simgit release.
+    Update(commands::update::Update),
 }
 
 // The libc signal and session calls used across the crate, declared once. A
@@ -204,6 +206,11 @@ fn run() -> Result<()> {
     let json = cli.json;
     // The harness shows a failed hook's stderr to the person: one line, too.
     let one_line_errors = json || matches!(cli.command, Commands::Hook(_));
+    // A program reads what `run` and `hook` print, and `update` reports itself.
+    let quiet = matches!(
+        cli.command,
+        Commands::Run(_) | Commands::Hook(_) | Commands::Update(_)
+    );
     let result = match cli.command {
         Commands::Doctor => commands::worktree::doctor(json),
         Commands::Add(args) => commands::worktree::add(args, json),
@@ -215,7 +222,11 @@ fn run() -> Result<()> {
         Commands::Gc(args) => commands::worktree::gc(args, json),
         Commands::Prune(args) => commands::worktree::prune(args, json),
         Commands::Repair => commands::worktree::repair(json),
+        Commands::Update(args) => commands::update::update(args, json),
     };
+    if result.is_ok() {
+        commands::update::notice::after_command(json, quiet);
+    }
     if one_line_errors {
         result.map_err(|error| anyhow::anyhow!(one_line(&format!("{error:#}"))))
     } else {

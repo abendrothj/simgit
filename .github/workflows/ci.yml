@@ -31,6 +31,18 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # The release workflow signs SHA256SUMS only on a tag; run the same
+      # commands with a throwaway key on every push so they cannot rot.
+      - name: Exercise release signing
+        run: |
+          sudo apt-get update && sudo apt-get install -y minisign
+          cd "$RUNNER_TEMP"
+          minisign -G -W -p throwaway.pub -s throwaway.key
+          printf '%064d  sg-x86_64-unknown-linux-gnu.tar.gz\n' 0 > SHA256SUMS
+          minisign -S -s throwaway.key -m SHA256SUMS -t "simgit test"
+          minisign -V -p throwaway.pub -m SHA256SUMS
+          test "$(wc -l < "$GITHUB_WORKSPACE/sg/minisign.pub")" -eq 2
+          sed -n 2p "$GITHUB_WORKSPACE/sg/minisign.pub" | grep -Eq '^RW[A-Za-z0-9+/]{54}$'
 
   test:
     strategy:

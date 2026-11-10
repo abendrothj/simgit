@@ -104,6 +104,9 @@ jobs:
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          # Marks the binary as a release build, the only kind `simgit update`
+          # replaces with a newer release.
+          SIMGIT_RELEASE_BUILD: "1"
         run: cargo build --release --locked --target ${{ matrix.target }} -p simgit-cli
       - name: Package
         run: |
@@ -159,6 +162,19 @@ jobs:
             sg-x86_64-unknown-linux-gnu.tar.gz \
             > SHA256SUMS
           test "$(wc -l < SHA256SUMS)" -eq 4
+      # Every simgit since 0.5.0 trusts only this key, so a release that
+      # cannot be signed with it, or verified by sg/minisign.pub, stops here.
+      - name: Sign the checksum manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          test -n "$MINISIGN_SECRET_KEY" || { echo "MINISIGN_SECRET_KEY is not set" >&2; exit 1; }
+          sudo apt-get update && sudo apt-get install -y minisign
+          key="$RUNNER_TEMP/minisign.key"
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key")
+          minisign -S -s "$key" -m dist/SHA256SUMS -t "simgit $GITHUB_REF_NAME"
+          rm -f "$key"
+          minisign -V -p sg/minisign.pub -m dist/SHA256SUMS
       # Stage everything on a draft and check what GitHub now serves before
       # anyone can see it; only then publish.
       - name: Stage the release as a draft
@@ -180,6 +196,7 @@ jobs:
             dist/sg-aarch64-unknown-linux-gnu.tar.gz \
             dist/sg-x86_64-unknown-linux-gnu.tar.gz \
             dist/SHA256SUMS \
+            dist/SHA256SUMS.minisig \
             --clobber
       - name: Check the staged assets against the checksum manifest
         env:
@@ -188,7 +205,8 @@ jobs:
           staged="$(mktemp -d)"
           gh release download "$GITHUB_REF_NAME" --dir "$staged"
           cd "$staged"
-          test "$(find . -type f | wc -l)" -eq 5
+          test "$(find . -type f | wc -l)" -eq 6
+          minisign -V -p "$GITHUB_WORKSPACE/sg/minisign.pub" -m SHA256SUMS
           sha256sum -c SHA256SUMS
       - name: Publish the release
         env:

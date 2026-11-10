@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -73,6 +74,8 @@ impl HookFixture {
         let mut child = isolated(env!("CARGO_BIN_EXE_simgit"))
             .current_dir(&self.root)
             .env("HOME", &self.root)
+            // No test here may reach GitHub; the update check has its own.
+            .env("SIMGIT_NO_UPDATE_CHECK", "1")
             .envs(env.iter().copied())
             .env("CLAUDE_PROJECT_DIR", project)
             .env("SIMGIT_POPULATE", "checkout")
@@ -2365,3 +2368,155 @@ fn hook_keeps_its_git_calls() {
 const HOOK_CREATE_GIT_CALLS: usize = 16;
 const HOOK_REUSE_GIT_CALLS: usize = 4;
 const HOOK_REMOVE_GIT_CALLS: usize = 11;
+
+/// The test binary is a source build, so it learns of releases from
+/// crates.io's index.
+const NEWER_RELEASE: &str = r#"{"name":"simgit-cli","vers":"9.9.9","yanked":false}"#;
+
+impl HookFixture {
+    /// The cache `SessionStart` reads the latest release from.
+    fn update_cache(&self) -> PathBuf {
+        self.root.join(".cache/simgit/latest-crates")
+    }
+
+    /// `SessionStart` with the update check on and `curl` replaced by one that
+    /// answers with `NEWER_RELEASE` after `delay` seconds.
+    fn session_start(&self, delay: &str, env: &[(&str, &str)]) -> Output {
+        let bin = self.root.join("fake-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let curl = bin.join("curl");
+        fs::write(
+            &curl,
+            format!("#!/bin/sh\nsleep {delay}\nprintf '%s' '{NEWER_RELEASE}'\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = isolated(env!("CARGO_BIN_EXE_simgit"))
+            .current_dir(&self.root)
+            .env("HOME", &self.root)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env_remove("CI")
+            .env_remove("SIMGIT_NO_UPDATE_CHECK")
+            .env_remove("XDG_CACHE_HOME")
+            .envs(env.iter().copied())
+            .args(["hook", "claude-code", "--requires", "0.0.0"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn simgit");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(
+                json!({ "hook_event_name": "SessionStart", "cwd": self.repo })
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    fn cache_release(&self, url: &str) {
+        fs::create_dir_all(self.update_cache().parent().unwrap()).unwrap();
+        fs::write(self.update_cache(), url).unwrap();
+    }
+}
+
+/// Plugin users never type a simgit command, so session start is where they
+/// hear of a newer release.
+#[test]
+fn session_start_shows_a_newer_release_to_the_person() {
+    let fixture = HookFixture::new();
+    fixture.cache_release(NEWER_RELEASE);
+    let output = fixture.session_start("0", &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = shown["systemMessage"].as_str().unwrap();
+    assert!(
+        message.starts_with(&format!(
+            "simgit 9.9.9 is available (you have {}); update with: ",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{message}"
+    );
+}
+
+#[test]
+fn session_start_says_nothing_when_current_in_ci_or_switched_off() {
+    let fixture = HookFixture::new();
+    fixture.cache_release(r#"{"name":"simgit-cli","vers":"0.0.1","yanked":false}"#);
+    let current = fixture.session_start("0", &[]);
+    assert_eq!(current.status.code(), Some(0), "{}", stderr(&current));
+    assert!(
+        current.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&current.stdout)
+    );
+    fixture.cache_release(NEWER_RELEASE);
+    for env in [("CI", "true"), ("SIMGIT_NO_UPDATE_CHECK", "1")] {
+        let output = fixture.session_start("0", &[env]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{env:?}: {}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty(), "{env:?}");
+    }
+}
+
+#[test]
+fn session_start_refreshes_a_stale_cache_without_waiting() {
+    let fixture = HookFixture::new();
+    let started = std::time::Instant::now();
+    // The check takes six seconds; the session must not wait for it.
+    let output = fixture.session_start("6", &[]);
+    let took = started.elapsed();
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(took < std::time::Duration::from_secs(3), "waited {took:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while fs::read_to_string(fixture.update_cache()).unwrap_or_default() != NEWER_RELEASE {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the cache was never refreshed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// The plugin's `SessionStart` command must pass the hook's message through,
+/// and still name the upgrade when simgit is missing or too old.
+#[test]
+fn session_start_hook_passes_its_message_through() {
+    let hooks = read_json(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../integrations/claude-code/hooks.json"
+    ));
+    let command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("SessionStart command");
+    let fixture = HookFixture::new();
+    let bin = fixture.root.join("stub-bin");
+    fs::create_dir_all(&bin).unwrap();
+    for (script, expected) in [
+        (
+            "#!/bin/sh\ncat >/dev/null\nprintf '{\"systemMessage\": \"newer\"}'\n",
+            "\"newer\"",
+        ),
+        ("#!/bin/sh\nexit 2\n", "needs simgit 0.5.0 or newer"),
+    ] {
+        let stub = bin.join("simgit");
+        fs::write(&stub, script).unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new("sh")
+            .args(["-c", command])
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&output.stdout);
+        assert!(said.contains(expected), "{script:?} → {said:?}");
+    }
+}

@@ -179,3 +179,4 @@ Installation is a separate, approval-gated action:
 3. On macOS, prefer an available Homebrew installation for that pinned release.
 4. Otherwise download the pinned release's installer to a temporary file, inspect it and its release/checksum inputs, then execute that local file only after approval. With `SIMGIT_VERSION=vX.Y.Z`, the installer verifies that the staged binary reports exactly `simgit X.Y.Z` before installing. Never automatically execute a curl-pipe-shell command.
 5. After installation, repeat executable discovery and require `doctor --json` to report the canonical `simgit` identity before use.
+6. Upgrading is the same approval-gated action. `simgit --json update --check` only reports (its `command` field names how this install updates) and needs no approval; never run `simgit update`, `brew upgrade simgit` or a reinstall without the user's approval.

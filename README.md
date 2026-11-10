@@ -87,13 +87,20 @@ path (e.g. `apt-get install fuse-overlayfs`); otherwise simgit falls back to a
 plain checkout. Prefer it as a Git subcommand? `git config --global alias.wt
 '!simgit'`, then `git wt add feat/x`.
 
+To update, run the command for how you installed: `brew upgrade simgit`,
+`cargo install simgit-cli --locked`, or `simgit update` for a release binary
+installed by `install.sh`. simgit names the right one, once a day at most,
+when a newer release is out. Releases are signed: `simgit update` and
+`install.sh` check the signature, and you can too
+([details](docs/reference.md#release-signatures)).
+
 Pinned-tag installs with the checksum-verified `install.sh`, approval gating,
 and version pinning are operator and agent policy:
 [docs/agent-integration.md](docs/agent-integration.md#installation-and-skill-discovery).
 
 ## Commands
 
-The surface is flat — ten verbs, no `worktree` namespace. `--json` is a global
+The surface is flat — eleven verbs, no `worktree` namespace. `--json` is a global
 flag accepted before or after the command; `run` and `hook` reject it, because
 `run` owns the child's stdout and the harness fixes `hook`'s. Location is always
 `--path`.
@@ -110,6 +117,7 @@ flag accepted before or after the command; `run` and `hook` reject it, because
 | `simgit prune` | Drop stale Git registrations, and cached baselines that are expired or that no ref reaches any more, never one an allocation is using; `--all` reclaims every baseline now. |
 | `simgit repair` | Remount overlay-backed worktrees after a reboot or interrupted mount (Linux). |
 | `simgit hook claude-code --requires <v>` | Store Claude Code's worktrees with simgit. Run by the Claude Code plugin, not by hand; rejects `--json`. |
+| `simgit update` | Install the latest signed release over a release binary; for Homebrew and cargo installs, name their command instead. `--check` only reports. |
 
 To use simgit as Claude Code's worktree storage, install the plugin: see [Claude Code](docs/agent-integration.md#claude-code). The same plugin brings the skill to Codex: see [Codex](docs/agent-integration.md#codex).
 

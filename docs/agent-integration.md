@@ -548,7 +548,8 @@ The plugin registers `simgit hook claude-code` for `WorktreeCreate`,
 timeout in place of Claude Code's 600-second default, so building the first
 baseline of a large repository is not killed mid-allocation. `SessionStart`
 shows one message naming the install or upgrade command when simgit is missing
-or too old. The `SubagentStop` hook runs in shell form with `|| exit 0`
+or too old, and, once a day at most, the
+[update notice](reference.md#update-notice) when a newer release is out. The `SubagentStop` hook runs in shell form with `|| exit 0`
 because exit 2 there stops the subagent from finishing, and an older simgit
 without `hook` exits 2.
 Remove any hand-written worktree hook when you install the plugin. Claude Code
@@ -655,8 +656,10 @@ check would keep, but only when no commit on it becomes unreachable. Flagless
 `hook` is automatic. Everything else is safe to auto-approve without them,
 except `run`, whose
 argv after `--` is the command a guard must judge — including a nested
-`simgit` there. Nothing in configuration or the environment makes a command
-destructive.
+`simgit` there, and `update`, which replaces the simgit executable with a
+downloaded release: it destroys no work, but always needs approval.
+`update --check` only reports and is automatic. Nothing in configuration or
+the environment makes a command destructive.
 
 Matching is exact-word: the executable's basename is `simgit` or `sg`, the
 subcommand is its first non-option word (the only global option is `--json`),
