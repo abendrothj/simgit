@@ -1,7 +1,7 @@
 # simgit reference
 
 Detailed semantics for the flat command surface
-(`simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair|hook`).
+(`simgit [--json] doctor|add|list|remove|run|unlock|gc|prune|repair|hook|update`).
 [README.md](../README.md) is the overview; this file is the contract each
 command actually implements. `simgit` is the canonical executable and `sg` is an
 equivalent alias; examples use `simgit`.
@@ -449,7 +449,7 @@ work.
 ## Machine-readable output
 
 The global `--json` flag gives orchestrators structured output from `doctor`,
-`add`, `remove`, `list`, `unlock`, `gc`, `prune` and `repair`; it is accepted
+`add`, `remove`, `list`, `unlock`, `gc`, `prune`, `repair` and `update`; it is accepted
 before or after the command, and `run` and `hook` are the commands that reject it. A
 `--json` failure, including an argument-parsing error, emits no JSON: nonzero
 exit, empty stdout, one line of diagnostic text on stderr. That line replaces
@@ -486,6 +486,8 @@ form would imply one exists.
 | `gc` | `reaped` (paths), `skipped` (array of `{worktree, reason}`, reasons under [GC](#gc)), `deleted_branches`, `retained_branches`, `dry_run` |
 | `prune` | `pruned`, `pruned_registrations`, `kept_registrations`, `retained`, `retained_bytes`, `cache_busy` |
 | `repair` | `repaired` and `healthy` (paths of overlay worktrees), `failed` (array of `{worktree, error}`; any entry makes the command exit 1) |
+| `update --check` | `current`, `latest`, `update_available`, `install_method` (`self`, `homebrew`, `cargo` or `source`), `command` |
+| `update` | `updated`, `current`; when `updated` is `true`, also `previous` and `path` (the directory the binaries were replaced in) |
 
 `doctor` exits 0 outside a Git worktree: identity, version and filesystem are
 always reported, and every repository-dependent field is `null` rather than an
@@ -604,6 +606,61 @@ checkout does not hold `prune` off.
 Compare the retained baseline cost directly with the marginal cost of each
 additional worktree; the savings depend on repository shape, not a fixed
 multiplier.
+
+## `update`
+
+`simgit update --check` reports the running version, the latest release and
+the command that updates this install. It changes nothing.
+
+`simgit update` installs the latest release in place, but only where simgit
+installed itself: a release binary placed by `install.sh` or by hand. It
+refuses the rest without downloading anything, and names their command:
+`brew upgrade simgit` under a Homebrew `Cellar`, and
+`cargo install simgit-cli --locked` under `$CARGO_HOME/bin` (cargo-binstall
+included) or for a binary built from source. The install method comes from
+the running binary's resolved path, so a symlink to it is followed and the
+file it names is replaced.
+
+A newer release is trusted only once every check passes:
+
+1. `SHA256SUMS` verifies against `SHA256SUMS.minisig` with the release key
+   (`sg/minisign.pub`, built into the binary).
+2. The platform's `sg-<target>.tar.gz` matches its `SHA256SUMS` record.
+3. The archive's `simgit` and `sg` are identical, and report
+   `simgit <latest>` when run with `--version`.
+
+Then each of `sg` and `simgit` present in the binary's directory, and the
+running binary itself, is replaced by an atomic rename; running processes
+keep the old binary. Any failure replaces nothing. `update` never moves to an
+older release, nor to a pre-release. It needs `curl` and `tar`, and refuses
+with a message naming whichever is missing. Downloads use HTTPS with TLS 1.2
+or later only.
+
+### Update notice
+
+After a command succeeds, simgit prints one line on stderr when a newer
+release is out, naming the command that updates this install. It does so
+only when stderr is a terminal, never under `--json`, `run`, `hook` or
+`update`, and never when `CI` or `SIMGIT_NO_UPDATE_CHECK` is set.
+
+The latest release is cached in `$XDG_CACHE_HOME/simgit/latest` (default
+`~/.cache/simgit/latest`). When the cache is missing or a day old, simgit
+starts `curl` without waiting for it, so the check never delays a command.
+That is one request to github.com a day at most; set
+`SIMGIT_NO_UPDATE_CHECK=1` to make none.
+
+### Release signatures
+
+Every release since 0.5.0 signs its `SHA256SUMS` with minisign. To check a
+download by hand:
+
+```sh
+minisign -V -P RWTT6Elk+LYVr8TQtSOys9pS3bchCSi2iMkZCe+CkHLywqsls/rQxiNB -m SHA256SUMS
+```
+
+`install.sh` runs the same check when `minisign` is installed, and otherwise
+says it verified the checksum only. Set `SIMGIT_REQUIRE_SIGNATURE=1` to make
+it refuse to install without the signature check.
 
 ## Repository layout
 

@@ -20,7 +20,7 @@ You'll need:
 
 ```
 simgit/
-├── sg/               the CLI — `simgit doctor|add|list|remove|run|unlock|gc|prune|repair|hook`
+├── sg/               the CLI — `simgit doctor|add|list|remove|run|unlock|gc|prune|repair|hook|update`
 │   ├── src/lib.rs                 CLI surface (`run_cli`), parser and dispatch
 │   ├── src/bin/simgit.rs          canonical binary — one-line wrapper
 │   ├── src/bin/sg.rs              `sg` alias — same code, one-line wrapper
@@ -28,6 +28,7 @@ simgit/
 │   │                              remove, registry for list, launch for run, maintenance,
 │   │                              locks, doctor), repo discovery, CoW/overlay/index backends,
 │   │                              `hook.rs` (Claude Code adapter)
+│   ├── src/commands/update/       `simgit update`, release verification, the update notice
 │   └── tests/                     CLI workflow, installer, and `claude_code_hook.rs` tests
 ├── skills/           `simgit-worktrees` agent skill
 ├── .claude-plugin/   Claude Code and Codex plugin manifest and marketplace entry
@@ -120,6 +121,16 @@ section and Git history.)
 
 Published as `simgit-cli` on crates.io. The crate ships two binaries: `simgit`
 (canonical) and `sg`, an equivalent alias built from the same code.
+
+Releases are signed. The release workflow signs `SHA256SUMS` with the
+minisign secret key in the Actions secret `MINISIGN_SECRET_KEY`, and refuses
+to publish unless the signature verifies against `sg/minisign.pub`, the key
+every simgit since 0.5.0 trusts. Keep an offline backup of the secret key:
+without it no installed simgit can verify a new release, and every
+`simgit update` user must reinstall by hand. To change keys, first release a
+version that trusts both the old and new key while still signing with the
+old one, then switch the secret. Release builds set `SIMGIT_RELEASE_BUILD`,
+which is how `simgit update` tells a release binary from a source build.
 
 1. Bump `version` in the workspace `Cargo.toml`, `cargo build` to refresh the lockfile, commit.
    If `skills/simgit-worktrees/SKILL.md` now relies on behavior new in this
