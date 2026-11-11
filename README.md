@@ -61,6 +61,28 @@ one `clonefile(2)` call and the worktree adopts the baseline's index.
 Method and full results:
 [docs/scaling_benchmark.md](docs/scaling_benchmark.md).
 
+## How a worktree lives
+
+```mermaid
+flowchart TD
+    subgraph allocate ["Allocate"]
+        direction LR
+        A["<b>Request</b><br/>add · run ·<br/>WorktreeCreate hook"]
+        B["<b>Baseline</b><br/>one cached checkout<br/>per commit, reused"]
+        C["<b>Register</b><br/>a real linked worktree:<br/>own branch, index, HEAD"]
+        D["<b>Populate</b><br/>clonefile · reflink ·<br/>fuse-overlayfs, else a<br/>plain checkout"]
+        A --> B --> C --> D
+    end
+    E["<b>Work</b><br/>ordinary Git; run holds a lock so gc can't reap it"]
+    subgraph teardown ["Tear down"]
+        direction LR
+        F["<b>Clean up</b><br/>remove · gc · hooks keep dirty<br/>or unreached work unless<br/>--discard-dirty / --delete-unmerged"]
+        G["<b>Reclaim</b><br/>prune drops baselines<br/>no ref reaches,<br/>never one in use"]
+        F --> G
+    end
+    allocate --> E --> teardown
+```
+
 ## Install
 
 simgit needs Git 2.39 or newer, and building it from source needs Rust 1.89
