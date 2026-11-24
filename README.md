@@ -114,7 +114,9 @@ To update, run the command for how you installed: `brew upgrade simgit`,
 installed by `install.sh`. simgit names the right one, once a day at most,
 when a newer release is out. Releases are signed: `simgit update` and
 `install.sh` check the signature, and you can too
-([details](docs/reference.md#release-signatures)).
+([details](docs/reference.md#release-signatures)). Updating the binary leaves
+the agent skill as it was:
+[keep it current](docs/agent-integration.md#installation-and-skill-discovery).
 
 Pinned-tag installs with the checksum-verified `install.sh`, approval gating,
 and version pinning are operator and agent policy:
