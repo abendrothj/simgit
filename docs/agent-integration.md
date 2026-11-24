@@ -155,9 +155,10 @@ cp -R skills/simgit-worktrees "$HOME/.agents/skills/"
 `npx skills use abendrothj/simgit@simgit-worktrees` installs nothing and always
 reads the current default branch.
 
-A Claude-specific installation may instead use
-`$HOME/.claude/skills/simgit-worktrees/SKILL.md`. Follow the harness's documented
-skill root if it differs. Do not make either user-level change without approval.
+Claude Code gets the skill from the [plugin](#claude-code) instead, which
+keeps it in step with the plugin's release; do not also install it under
+`$HOME/.claude/skills`. Follow other harnesses' documented skill root if it
+differs. Do not make a user-level change without approval.
 
 A skill teaches an agent how to use a tool; it cannot replace an allocator or
 provider hook. A capable harness must run preflight, allocate the worktree,
@@ -552,6 +553,12 @@ Remove any hand-written worktree hook when you install the plugin. Claude Code
 caches plugins by version, so the plugin's version is simgit's. Worktrees
 Claude Code created before the plugin (branches `worktree-<name>`) are refused
 by its remove hook; remove them with `git worktree remove` or `simgit remove`.
+
+The plugin also brings the `simgit-worktrees` skill, listed as
+`simgit:simgit-worktrees`. It updates with the plugin, not with the binary:
+after `brew upgrade simgit`, run `claude plugin update simgit@simgit` and
+restart Claude Code. Delete any copy under `~/.claude/skills`, or Claude Code
+loads both, and that copy does not update with the plugin.
 
 With the plugin active the harness allocates and removes worktrees, so the
 agent must not run simgit for its own infrastructure. Behaviour, observed with
