@@ -8,6 +8,8 @@
 **Running a handful of coding agents on one repository means a handful of full
 copies of it on disk. simgit removes the copies and keeps the isolation.**
 
+![simgit add on microsoft/vscode: a plain git worktree adds about 567 MiB on disk, the first simgit add about the same while it caches a baseline, and each later simgit add about 10 MiB](assets/demo.gif)
+
 Each agent gets its own real, separate Git working tree — its own branch, index
 and checkout — but unchanged files share physical disk instead of being
 duplicated, so an extra `microsoft/vscode` worktree costs **10 MiB instead of
